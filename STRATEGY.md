@@ -2951,3 +2951,72 @@ difficult.
 Not committed: `ast-Ansible.json` has never been a tracked artifact, and adding a 5,547
 -function corpus to the repository is a separate decision from fixing the exporter.
 
+## 53. I reported a failing gate as green for most of a session
+
+`check_render` exits 1 when a module is not the render of its AST. It had been exiting 1,
+and every gate summary I wrote said it passed, because I ran it as
+
+    python3 scripts/check_render.py 2>&1 | tail -1
+
+and the last line was `OK V8Numbers`. Three modules were mismatched above it.
+
+This is the failure this project exists to catch -- a check reporting success without having
+verified anything -- committed in the REPORTING rather than in the code, while the commits
+themselves were about oracles that fail closed. The gate worked. I truncated its output.
+
+Scope, established rather than assumed:
+
+* `Cachetools` was tracked and genuinely needed attention: I had changed its AST deliberately
+  and never re-recorded it. I would have missed that.
+* `Ansible`, `LinuxCrypto`, `LinuxLib` are gitignored build products whose ASTs are also
+  untracked, with manifest hints pointing at stale `/tmp` files. They do not exist in a fresh
+  clone, so CI and the repository were never wrong. Local workspace only.
+
+All four now pass; the three untracked corpora were re-exported with the current exporter,
+re-rendered and re-recorded rather than deleted. **Gates are verified by EXIT CODE from here.**
+
+### Two real defects the exit code was hiding
+
+1. `tests/test_json_contract.py` loads every `ast-*.json` with plain `json.load` and walks it
+   with a recursive generator. Adding the real corpora made 15 tests error with
+   `RecursionError` -- the limit `differential.py` and `render_lean.py` already solve with a
+   big-stack thread. The suite says it tests "every committed AST"; it was testing the ones
+   that fit. Now uses the same big-stack loader and an iterative `walk`.
+
+2. With the large corpora finally visible, `test_big_ints_render_without_loss` failed. It
+   compared `lean_int(v).strip("()")` against `v.lstrip("-")`, which strips the sign from the
+   expected side only, so it demanded that `-6` render as `6`. `lean_int` was right all along
+   -- it emits `(-6)`, parenthesised because Lean needs it in argument position. The test
+   passed for as long as every string-encoded integer in the tree happened to be a large
+   positive one. It now asserts the VALUE round-trips.
+
+Both were latent for as long as the suite could not see a large corpus. Neither would have
+been found by making the tests stricter; they were found by giving them more to look at.
+
+## 54. The V8 fix is measured and NOT landed
+
+`expr:CONTROL_STRUCTURE:DO` is V8's largest hole at 138 sites, and it was one label over four
+different constructs:
+
+    CHECK*                          100   assertion -- eliding ASSUMES it passes
+    UNREACHABLE / IMMEDIATE_CRASH    20   ABORTS -- eliding continues past a point the
+                                          program guarantees it does not reach
+    GET_HIGH_WORD / EXTRACT_WORDS     5   write through out-params: they COMPUTE
+    USE(x)                           13   defined as `(void)x` -- exactly a no-op
+
+Only `USE` is closed, counted by `useElided`, on the same exactness argument as the elided
+uncontended locks. The other three keep holes whose names say which remedy applies. Measured:
+V8 hole-free 1,472 -> 1,479, holes 972 -> 959.
+
+It is NOT in the tree. `check_specs_fresh` refused it -- `RE-GENERATE the specs; do not
+re-record the hash` -- because the 285 V8 theorems were generated from the old corpus. The
+build had already re-verified every one of them against the new module, so they are not
+false; the gate's objection is that laws generated from one corpus must not be re-pinned to
+another, and that is its rule to enforce, not mine to argue around.
+
+So `ast-V8Base.json` was restored to its prior state, verified by its render hash returning to
+`bf6b2e1ef9f6`. Landing the fix requires `scripts/synth_specs.py` to regenerate the V8 spec
+suite, which needs a clean tree and real compute. The exporter improvement is committed and
+will apply to the next V8 export; the tracked artifact is unchanged until the specs are
+regenerated. That is the whole state of it.
+

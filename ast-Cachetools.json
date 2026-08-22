@@ -1240,7 +1240,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"The maximum size of the cache.\"\""
+     "v": "The maximum size of the cache."
     }
    },
    "b": {
@@ -1266,7 +1266,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"The current size of the cache.\"\""
+     "v": "The current size of the cache."
     }
    },
    "b": {
@@ -1294,7 +1294,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Return the size of a cache element's value.\"\""
+     "v": "Return the size of a cache element's value."
     }
    },
    "b": {
@@ -1517,7 +1517,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Remove and return the `(key, value)` pair first inserted.\"\""
+     "v": "Remove and return the `(key, value)` pair first inserted."
     }
    },
    "b": {
@@ -2591,7 +2591,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Remove and return the `(key, value)` pair least frequently used.\"\""
+     "v": "Remove and return the `(key, value)` pair least frequently used."
     }
    },
    "b": {
@@ -2917,7 +2917,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Increment use count\"\""
+     "v": "Increment use count"
     }
    },
    "b": {
@@ -3566,7 +3566,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Remove and return the `(key, value)` pair least recently used.\"\""
+     "v": "Remove and return the `(key, value)` pair least recently used."
     }
    },
    "b": {
@@ -3797,7 +3797,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Mark as recently used\"\""
+     "v": "Mark as recently used"
     }
    },
    "b": {
@@ -3974,7 +3974,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"The `choice` function used by the cache.\"\""
+     "v": "The `choice` function used by the cache."
     }
    },
    "b": {
@@ -4358,7 +4358,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Remove and return a random `(key, value)` pair.\"\""
+     "v": "Remove and return a random `(key, value)` pair."
     }
    },
    "b": {
@@ -5450,7 +5450,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"The timer function used by the cache.\"\""
+     "v": "The timer function used by the cache."
     }
    },
    "b": {
@@ -7796,7 +7796,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"The time-to-live value of the cache's items.\"\""
+     "v": "The time-to-live value of the cache's items."
     }
    },
    "b": {
@@ -7824,7 +7824,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Remove expired items from the cache and return an iterable of the\n        expired `(key, value)` pairs.\n\n        \"\""
+     "v": "Remove expired items from the cache and return an iterable of the\n        expired `(key, value)` pairs.\n\n        "
     }
    },
    "b": {
@@ -8163,7 +8163,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Remove and return the `(key, value)` pair least recently used that\n        has not already expired.\n\n        \"\""
+     "v": "Remove and return the `(key, value)` pair least recently used that\n        has not already expired.\n\n        "
     }
    },
    "b": {
@@ -9992,7 +9992,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"The local time-to-use function used by the cache.\"\""
+     "v": "The local time-to-use function used by the cache."
     }
    },
    "b": {
@@ -10020,7 +10020,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Remove expired items from the cache and return an iterable of the\n        expired `(key, value)` pairs.\n\n        \"\""
+     "v": "Remove expired items from the cache and return an iterable of the\n        expired `(key, value)` pairs.\n\n        "
     }
    },
    "b": {
@@ -10556,7 +10556,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Remove and return the `(key, value)` pair least recently used that\n        has not already expired.\n\n        \"\""
+     "v": "Remove and return the `(key, value)` pair least recently used that\n        has not already expired.\n\n        "
     }
    },
    "b": {
@@ -11123,7 +11123,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Decorator to wrap a function with a memoizing callable that saves\n    results in a cache.\n\n    \"\""
+     "v": "Decorator to wrap a function with a memoizing callable that saves\n    results in a cache.\n\n    "
     }
    },
    "b": {
@@ -11590,7 +11590,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Decorator to wrap a method with a memoizing callable that saves\n    results in a cache.\n\n    \"\""
+     "v": "Decorator to wrap a method with a memoizing callable that saves\n    results in a cache.\n\n    "
     }
    },
    "b": {
@@ -24293,7 +24293,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a First In First Out (FIFO)\n    algorithm.\n\n    \"\""
+     "v": "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a First In First Out (FIFO)\n    algorithm.\n\n    "
     }
    },
    "b": {
@@ -24416,7 +24416,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Frequently Used (LFU)\n    algorithm.\n\n    \"\""
+     "v": "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Frequently Used (LFU)\n    algorithm.\n\n    "
     }
    },
    "b": {
@@ -24539,7 +24539,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Recently Used (LRU)\n    algorithm.\n\n    \"\""
+     "v": "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Recently Used (LRU)\n    algorithm.\n\n    "
     }
    },
    "b": {
@@ -24663,7 +24663,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Random Replacement (RR)\n    algorithm.\n\n    \"\""
+     "v": "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Random Replacement (RR)\n    algorithm.\n\n    "
     }
    },
    "b": {
@@ -24792,7 +24792,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Recently Used (LRU)\n    algorithm with a per-item time-to-live (TTL) value.\n\n    \"\""
+     "v": "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Recently Used (LRU)\n    algorithm with a per-item time-to-live (TTL) value.\n\n    "
     }
    },
    "b": {
@@ -25137,7 +25137,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Return a cache key for the specified hashable arguments.\"\""
+     "v": "Return a cache key for the specified hashable arguments."
     }
    },
    "b": {
@@ -25248,7 +25248,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Return a cache key for use with cached methods.\"\""
+     "v": "Return a cache key for use with cached methods."
     }
    },
    "b": {
@@ -25297,7 +25297,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Return a typed cache key for the specified hashable arguments.\"\""
+     "v": "Return a typed cache key for the specified hashable arguments."
     }
    },
    "b": {
@@ -25529,7 +25529,7 @@
     "k": "exprS",
     "e": {
      "k": "str",
-     "v": "\"\"Return a typed cache key for use with cached methods.\"\""
+     "v": "Return a typed cache key for use with cached methods."
     }
    },
    "b": {
@@ -26508,7 +26508,7 @@
                  "k": "exprS",
                  "e": {
                   "k": "str",
-                  "v": "\"\"Extensible memoizing collections and decorators.\"\""
+                  "v": "Extensible memoizing collections and decorators."
                  }
                 },
                 "b": {
@@ -27178,7 +27178,7 @@
      "k": "exprS",
      "e": {
       "k": "str",
-      "v": "\"\"Function decorator helpers.\"\""
+      "v": "Function decorator helpers."
      }
     },
     "b": {
@@ -27446,7 +27446,7 @@
          "k": "exprS",
          "e": {
           "k": "str",
-          "v": "\"\"Method decorator helpers.\"\""
+          "v": "Method decorator helpers."
          }
         },
         "b": {
@@ -27862,7 +27862,7 @@
       "k": "exprS",
       "e": {
        "k": "str",
-       "v": "\"\"`functools.lru_cache` compatible memoizing function decorators.\"\""
+       "v": "`functools.lru_cache` compatible memoizing function decorators."
       }
      },
      "b": {
@@ -28288,7 +28288,7 @@
         "k": "exprS",
         "e": {
          "k": "str",
-         "v": "\"\"Key functions for memoizing decorators.\"\""
+         "v": "Key functions for memoizing decorators."
         }
        },
        "b": {

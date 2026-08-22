@@ -290,7 +290,7 @@ def f_cachetools___init___py__module__Cache_maxsize : Func :=
   { name := "cachetools/__init__.py:<module>.Cache.maxsize"
   , params := []
   , body := (.seq
-            (.expr (.lit (.str "\"\"The maximum size of the cache.\"\"")))
+            (.expr (.lit (.str "The maximum size of the cache.")))
             (.ret (.field (.name "self") "_Cache__maxsize"))) }
 
 /-- `cachetools/__init__.py:<module>.Cache.currsize`  (from `cachetools/__init__.py`) -/
@@ -298,7 +298,7 @@ def f_cachetools___init___py__module__Cache_currsize : Func :=
   { name := "cachetools/__init__.py:<module>.Cache.currsize"
   , params := []
   , body := (.seq
-            (.expr (.lit (.str "\"\"The current size of the cache.\"\"")))
+            (.expr (.lit (.str "The current size of the cache.")))
             (.ret (.field (.name "self") "_Cache__currsize"))) }
 
 /-- `cachetools/__init__.py:<module>.Cache.getsizeof`  (from `cachetools/__init__.py`) -/
@@ -306,7 +306,7 @@ def f_cachetools___init___py__module__Cache_getsizeof : Func :=
   { name := "cachetools/__init__.py:<module>.Cache.getsizeof"
   , params := ["value"]
   , body := (.seq
-            (.expr (.lit (.str "\"\"Return the size of a cache element's value.\"\"")))
+            (.expr (.lit (.str "Return the size of a cache element's value.")))
             (.ret (.lit (.int 1)))) }
 
 /-- `cachetools/__init__.py:<module>.FIFOCache.__init__`  (from `cachetools/__init__.py`) -/
@@ -351,8 +351,7 @@ def f_cachetools___init___py__module__FIFOCache_popitem : Func :=
   { name := "cachetools/__init__.py:<module>.FIFOCache.popitem"
   , params := []
   , body := (.seq
-            (.expr
-              (.lit (.str "\"\"Remove and return the `(key, value)` pair first inserted.\"\"")))
+            (.expr (.lit (.str "Remove and return the `(key, value)` pair first inserted.")))
             (.seq
               .skip
               (.seq
@@ -547,9 +546,7 @@ def f_cachetools___init___py__module__LFUCache_popitem : Func :=
   { name := "cachetools/__init__.py:<module>.LFUCache.popitem"
   , params := []
   , body := (.seq
-            (.expr
-              (.lit
-                (.str "\"\"Remove and return the `(key, value)` pair least frequently used.\"\"")))
+            (.expr (.lit (.str "Remove and return the `(key, value)` pair least frequently used.")))
             (.seq
               .skip
               (.seq
@@ -616,7 +613,7 @@ def f_cachetools___init___py__module__LFUCache__LFUCache__touch : Func :=
   { name := "cachetools/__init__.py:<module>.LFUCache._LFUCache__touch"
   , params := ["key"]
   , body := (.seq
-            (.expr (.lit (.str "\"\"Increment use count\"\"")))
+            (.expr (.lit (.str "Increment use count")))
             (.seq
               .skip
               (.seq
@@ -742,8 +739,7 @@ def f_cachetools___init___py__module__LRUCache_popitem : Func :=
   { name := "cachetools/__init__.py:<module>.LRUCache.popitem"
   , params := []
   , body := (.seq
-            (.expr
-              (.lit (.str "\"\"Remove and return the `(key, value)` pair least recently used.\"\"")))
+            (.expr (.lit (.str "Remove and return the `(key, value)` pair least recently used.")))
             (.seq
               .skip
               (.seq
@@ -790,7 +786,7 @@ def f_cachetools___init___py__module__LRUCache__LRUCache__touch : Func :=
   { name := "cachetools/__init__.py:<module>.LRUCache._LRUCache__touch"
   , params := ["key"]
   , body := (.seq
-            (.expr (.lit (.str "\"\"Mark as recently used\"\"")))
+            (.expr (.lit (.str "Mark as recently used")))
             (.seq
               .skip
               (.tryCatch
@@ -823,7 +819,7 @@ def f_cachetools___init___py__module__RRCache_choice : Func :=
   { name := "cachetools/__init__.py:<module>.RRCache.choice"
   , params := []
   , body := (.seq
-            (.expr (.lit (.str "\"\"The `choice` function used by the cache.\"\"")))
+            (.expr (.lit (.str "The `choice` function used by the cache.")))
             (.ret (.field (.name "self") "_RRCache__choice"))) }
 
 /-- `cachetools/__init__.py:<module>.RRCache.__setitem__`  (from `cachetools/__init__.py`) -/
@@ -900,7 +896,7 @@ def f_cachetools___init___py__module__RRCache_popitem : Func :=
   { name := "cachetools/__init__.py:<module>.RRCache.popitem"
   , params := []
   , body := (.seq
-            (.expr (.lit (.str "\"\"Remove and return a random `(key, value)` pair.\"\"")))
+            (.expr (.lit (.str "Remove and return a random `(key, value)` pair.")))
             (.seq
               .skip
               (.seq
@@ -1101,7 +1097,7 @@ def f_cachetools___init___py__module___TimedCache_timer : Func :=
   { name := "cachetools/__init__.py:<module>._TimedCache.timer"
   , params := []
   , body := (.seq
-            (.expr (.lit (.str "\"\"The timer function used by the cache.\"\"")))
+            (.expr (.lit (.str "The timer function used by the cache.")))
             (.ret (.field (.name "self") "_TimedCache__timer"))) }
 
 /-- `cachetools/__init__.py:<module>._TimedCache.get`  (from `cachetools/__init__.py`) -/
@@ -1520,7 +1516,7 @@ def f_cachetools___init___py__module__TTLCache_ttl : Func :=
   { name := "cachetools/__init__.py:<module>.TTLCache.ttl"
   , params := []
   , body := (.seq
-            (.expr (.lit (.str "\"\"The time-to-live value of the cache's items.\"\"")))
+            (.expr (.lit (.str "The time-to-live value of the cache's items.")))
             (.ret (.field (.name "self") "_TTLCache__ttl"))) }
 
 /-- `cachetools/__init__.py:<module>.TTLCache.expire`  (from `cachetools/__init__.py`) -/
@@ -1530,7 +1526,7 @@ def f_cachetools___init___py__module__TTLCache_expire : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Remove expired items from the cache and return an iterable of the\n        expired `(key, value)` pairs.\n\n        \"\"")))
+                (.str "Remove expired items from the cache and return an iterable of the\n        expired `(key, value)` pairs.\n\n        ")))
             (.seq
               .skip
               (.seq
@@ -1610,7 +1606,7 @@ def f_cachetools___init___py__module__TTLCache_popitem : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Remove and return the `(key, value)` pair least recently used that\n        has not already expired.\n\n        \"\"")))
+                (.str "Remove and return the `(key, value)` pair least recently used that\n        has not already expired.\n\n        ")))
             (.seq
               .skip
               (.seq
@@ -1943,7 +1939,7 @@ def f_cachetools___init___py__module__TLRUCache_ttu : Func :=
   { name := "cachetools/__init__.py:<module>.TLRUCache.ttu"
   , params := []
   , body := (.seq
-            (.expr (.lit (.str "\"\"The local time-to-use function used by the cache.\"\"")))
+            (.expr (.lit (.str "The local time-to-use function used by the cache.")))
             (.ret (.field (.name "self") "_TLRUCache__ttu"))) }
 
 /-- `cachetools/__init__.py:<module>.TLRUCache.expire`  (from `cachetools/__init__.py`) -/
@@ -1953,7 +1949,7 @@ def f_cachetools___init___py__module__TLRUCache_expire : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Remove expired items from the cache and return an iterable of the\n        expired `(key, value)` pairs.\n\n        \"\"")))
+                (.str "Remove expired items from the cache and return an iterable of the\n        expired `(key, value)` pairs.\n\n        ")))
             (.seq
               .skip
               (.seq
@@ -2070,7 +2066,7 @@ def f_cachetools___init___py__module__TLRUCache_popitem : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Remove and return the `(key, value)` pair least recently used that\n        has not already expired.\n\n        \"\"")))
+                (.str "Remove and return the `(key, value)` pair least recently used that\n        has not already expired.\n\n        ")))
             (.seq
               .skip
               (.seq
@@ -2180,7 +2176,7 @@ def f_cachetools___init___py__module__cached : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Decorator to wrap a function with a memoizing callable that saves\n    results in a cache.\n\n    \"\"")))
+                (.str "Decorator to wrap a function with a memoizing callable that saves\n    results in a cache.\n\n    ")))
             (.seq
               (.assign "_wrapper" (.fnref "cachetools/_cached.py:<module>._wrapper"))
               (.seq
@@ -2292,7 +2288,7 @@ def f_cachetools___init___py__module__cachedmethod : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Decorator to wrap a method with a memoizing callable that saves\n    results in a cache.\n\n    \"\"")))
+                (.str "Decorator to wrap a method with a memoizing callable that saves\n    results in a cache.\n\n    ")))
             (.seq
               (.assign "_wrapper" (.fnref "cachetools/_cachedmethod.py:<module>._wrapper"))
               (.seq
@@ -4858,7 +4854,7 @@ def f_cachetools_func_py__module__fifo_cache : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a First In First Out (FIFO)\n    algorithm.\n\n    \"\"")))
+                (.str "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a First In First Out (FIFO)\n    algorithm.\n\n    ")))
             (.seq
               .skip
               (.seq
@@ -4886,7 +4882,7 @@ def f_cachetools_func_py__module__lfu_cache : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Frequently Used (LFU)\n    algorithm.\n\n    \"\"")))
+                (.str "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Frequently Used (LFU)\n    algorithm.\n\n    ")))
             (.seq
               .skip
               (.seq
@@ -4914,7 +4910,7 @@ def f_cachetools_func_py__module__lru_cache : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Recently Used (LRU)\n    algorithm.\n\n    \"\"")))
+                (.str "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Recently Used (LRU)\n    algorithm.\n\n    ")))
             (.seq
               .skip
               (.seq
@@ -4942,7 +4938,7 @@ def f_cachetools_func_py__module__rr_cache : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Random Replacement (RR)\n    algorithm.\n\n    \"\"")))
+                (.str "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Random Replacement (RR)\n    algorithm.\n\n    ")))
             (.seq
               .skip
               (.seq
@@ -4970,7 +4966,7 @@ def f_cachetools_func_py__module__ttl_cache : Func :=
   , body := (.seq
             (.expr
               (.lit
-                (.str "\"\"Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Recently Used (LRU)\n    algorithm with a per-item time-to-live (TTL) value.\n\n    \"\"")))
+                (.str "Decorator to wrap a function with a memoizing callable that saves\n    up to `maxsize` results based on a Least Recently Used (LRU)\n    algorithm with a per-item time-to-live (TTL) value.\n\n    ")))
             (.seq
               .skip
               (.seq
@@ -5041,7 +5037,7 @@ def f_cachetools_keys_py__module__hashkey : Func :=
   , vararg := some "args"
   , kwarg := some "kwargs"
   , body := (.seq
-            (.expr (.lit (.str "\"\"Return a cache key for the specified hashable arguments.\"\"")))
+            (.expr (.lit (.str "Return a cache key for the specified hashable arguments.")))
             (.seq
               .skip
               (.seq
@@ -5064,7 +5060,7 @@ def f_cachetools_keys_py__module__methodkey : Func :=
   , vararg := some "args"
   , kwarg := some "kwargs"
   , body := (.seq
-            (.expr (.lit (.str "\"\"Return a cache key for use with cached methods.\"\"")))
+            (.expr (.lit (.str "Return a cache key for use with cached methods.")))
             (.seq
               .skip
               (.ret
@@ -5079,8 +5075,7 @@ def f_cachetools_keys_py__module__typedkey : Func :=
   , vararg := some "args"
   , kwarg := some "kwargs"
   , body := (.seq
-            (.expr
-              (.lit (.str "\"\"Return a typed cache key for the specified hashable arguments.\"\"")))
+            (.expr (.lit (.str "Return a typed cache key for the specified hashable arguments.")))
             (.seq
               .skip
               (.seq
@@ -5128,7 +5123,7 @@ def f_cachetools_keys_py__module__typedmethodkey : Func :=
   , vararg := some "args"
   , kwarg := some "kwargs"
   , body := (.seq
-            (.expr (.lit (.str "\"\"Return a typed cache key for use with cached methods.\"\"")))
+            (.expr (.lit (.str "Return a typed cache key for use with cached methods.")))
             (.seq
               .skip
               (.ret
@@ -5447,7 +5442,7 @@ def f_cachetools___init___py__module_ : Func :=
                                     (.seq
                                       (.expr
                                         (.lit
-                                        (.str "\"\"Extensible memoizing collections and decorators.\"\"")))
+                                        (.str "Extensible memoizing collections and decorators.")))
                                       (.seq
                                         (.setGlobal
                                         "__all__"
@@ -5649,7 +5644,7 @@ def f_cachetools__cached_py__module_ : Func :=
   , body := (.seq
             (.setGlobal "set" (.fnref "__builtin.set<meta>"))
             (.seq
-              (.expr (.lit (.str "\"\"Function decorator helpers.\"\"")))
+              (.expr (.lit (.str "Function decorator helpers.")))
               (.seq
                 (.setGlobal "__all__" (.tupleE []))
                 (.seq
@@ -5725,7 +5720,7 @@ def f_cachetools__cachedmethod_py__module_ : Func :=
                   (.seq
                     (.setGlobal "type" (.fnref "__builtin.type<meta>"))
                     (.seq
-                      (.expr (.lit (.str "\"\"Method decorator helpers.\"\"")))
+                      (.expr (.lit (.str "Method decorator helpers.")))
                       (.seq
                         (.setGlobal "__all__" (.tupleE []))
                         (.seq
@@ -5860,8 +5855,7 @@ def f_cachetools_func_py__module_ : Func :=
               (.setGlobal "property" (.fnref "__builtin.property<meta>"))
               (.seq
                 (.expr
-                  (.lit
-                    (.str "\"\"`functools.lru_cache` compatible memoizing function decorators.\"\"")))
+                  (.lit (.str "`functools.lru_cache` compatible memoizing function decorators.")))
                 (.seq
                   (.setGlobal
                     "__all__"
@@ -5983,7 +5977,7 @@ def f_cachetools_keys_py__module_ : Func :=
                 (.seq
                   (.setGlobal "type" (.fnref "__builtin.type<meta>"))
                   (.seq
-                    (.expr (.lit (.str "\"\"Key functions for memoizing decorators.\"\"")))
+                    (.expr (.lit (.str "Key functions for memoizing decorators.")))
                     (.seq
                       (.setGlobal
                         "__all__"

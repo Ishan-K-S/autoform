@@ -209,6 +209,7 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     * because its result is a value the program branches on. */
   var syncElided: Int = 0
   var metaElided: Int = 0
+  var useElided: Int = 0
 
   /** Kernel declaration macros that emit METADATA, not code.
     *
@@ -1346,6 +1347,16 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     * unbound name, which is the vacuous outcome: an `Expr.field` on `unit`, holing at run
     * time for a reason that had nothing to do with pointers. The rename is what makes the
     * `indirectFieldAccess` mapping actually reach a heap object. */
+  /** The text of a Python string literal, allowing an `r`/`u` prefix and triple quotes.
+    * `None` when the code is not a string literal at all. Deliberately does NOT accept a
+    * `b` prefix: bytes are a type Core does not have and must stay a hole. */
+  def pyStringLit(c: String): Option[String] = {
+    val re = "(?is)^([ruRU]{0,2})(\"\"\"|'''|\"|')(.*)\\2$".r
+    c match {
+      case re(_, _, body) => Some(body)
+      case _              => None
+    }
+  }
   def localName(n: String): String = if (cppFile && n == "this") "self" else n
 
   // ---- expressions ----------------------------------------------------------
@@ -1444,6 +1455,22 @@ import io.shiftleft.codepropertygraph.generated.nodes._
           // source contains, and counting it as an unparsed one overstated the literal
           // problem roughly tenfold on V8.
           else if (c == "<global>") hole("lit:joern-synthetic")
+          // A PREFIXED or TRIPLE-QUOTED Python string. r"\d+" is an ordinary `str`: the
+          // prefix only suppresses escape processing at parse time, and `unquoted` does no
+          // escape processing anyway -- so a raw string is precisely the case the existing
+          // path was already correct for, and it was refused only because it does not
+          // start with a quote. 404 `lit:unquoted` holes on Ansible were these, mostly
+          // regexes.
+          //
+          // Triple quotes are fixed here too: `unquoted` dropped ONE character from each
+          // end, so a triple-quoted string kept two stray quotes at each end. That is a
+          // wrong VALUE rather than a hole -- the silent kind.
+          //
+          // `b`/`rb`/`br` cannot match (the prefix class is `[ruRU]`), so bytes still
+          // reach `lit:bytes`; `f"..."` cannot match either, because after an empty
+          // prefix the next character must be a quote.
+          else if (pyFile && pyStringLit(c).isDefined)
+            ujson.Obj("k" -> "str", "v" -> pyStringLit(c).get)
           else if (c.headOption.exists(ch => ch == '"' || ch == '\''))
             ujson.Obj("k" -> "str", "v" -> unquoted)
           else if (c.isEmpty) ujson.Obj("k" -> "unit")
@@ -1484,8 +1511,43 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     // nothing to translate — but *which* statement it was decides whether the remedy is a
     // frontend fix (`DO`, a macro body) or a real language feature Core lacks, so the
     // label carries it instead of merging them all under one count.
-    case cs: ControlStructure => hole("expr:CONTROL_STRUCTURE:" + cs.controlStructureType)
+    case cs: ControlStructure => controlStructureExpr(cs)
     case other                => hole("expr:" + other.label)
+  }
+
+  /** A control structure in EXPRESSION position, which on V8 is always macro fallout.
+    *
+    * 326 of these in `base.cpg`, and they were one undifferentiated label. They are four
+    * different things with four different remedies, and eliding them uniformly would be
+    * silently wrong for all but one:
+    *
+    *   - `USE(x)` is defined as `(void)x`. It is EXACTLY a no-op, the same argument as an
+    *     elided uncontended lock, so it becomes `unit` and is counted.
+    *   - `UNREACHABLE()` and `IMMEDIATE_CRASH()` ABORT. Translating them to `unit` would
+    *     let control continue past a point the program guarantees it does not reach --
+    *     the one direction that turns a missing feature into a wrong answer. They keep a
+    *     hole, now named, so the count is attributable to "Core has no abort".
+    *   - `CHECK*` is an assertion. Eliding it ASSUMES it passes, which is a real
+    *     assumption rather than an exactness argument, so it stays a hole and says so.
+    *   - `GET_HIGH_WORD`/`EXTRACT_WORDS` write through out-parameters: they COMPUTE. An
+    *     elision would drop the computation, which is the silent-wrong class.
+    */
+  def controlStructureExpr(cs: ControlStructure): ujson.Obj = {
+    val code  = cs.code.trim
+    val macro_ = "^([A-Z_][A-Z0-9_]*)\\s*\\(".r.findFirstMatchIn(code).map(_.group(1))
+    macro_ match {
+      case Some("USE") =>
+        useElided += 1
+        ujson.Obj("k" -> "unit")
+      case Some(n) if n == "UNREACHABLE" || n == "IMMEDIATE_CRASH" =>
+        hole("expr:abort:" + n)
+      case Some(n) if n.startsWith("CHECK") || n.startsWith("DCHECK") =>
+        hole("expr:assert:" + n)
+      case Some(n) =>
+        hole("expr:macro:" + n)
+      case None =>
+        hole("expr:CONTROL_STRUCTURE:" + cs.controlStructureType)
+    }
   }
 
   def exprs(ns: List[AstNode]): ujson.Arr = ujson.Arr.from(ns.map(expr))
@@ -2860,6 +2922,7 @@ import io.shiftleft.codepropertygraph.generated.nodes._
         + (if (modelInts.isEmpty) " (UNKNOWN -- `long`/`size_t` casts are holes)" else ""))
   if (metaElided > 0) println(s"elided $metaElided kernel metadata declaration(s)")
   if (syncElided > 0) println(s"elided $syncElided sequentially-unobservable synchronisation call(s)")
+  if (useElided > 0) println(s"elided $useElided USE(x) no-op macro(s)")
   println(s"exported ${funcs.size} functions + ${inits.size} module initializers to $out "
         + s"(${countKind(doc, "closure")} closures, ${countKind(doc, "setGlobal")} global writes)")
 }

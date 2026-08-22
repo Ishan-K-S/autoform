@@ -14,6 +14,8 @@ import glob
 import json
 import os
 import re
+import sys
+import threading
 
 import pytest
 
@@ -33,17 +35,48 @@ def corpora():
         pytest.fail("no ast-*.json in %s — this suite inspected nothing, which is a "
                     "failure, not a pass. Re-run the exporter or point ROOT at the "
                     "repository." % ROOT)
-    return {os.path.basename(p): json.load(open(p)) for p in paths}
+    return _load_on_a_big_stack(paths)
+
+
+def _load_on_a_big_stack(paths):
+    """`json.load` recurses once per nesting level, and a translated function body nests
+    as deeply as the source did. CPython's default 1000-frame limit is reached by the
+    real corpora -- Ansible and LinuxLib both blow it -- so the decode runs on a thread
+    with a large stack, exactly as `differential.py` and `render_lean.py` already do.
+
+    This suite was passing only because those ASTs are gitignored build products and were
+    absent from the tree. A test that inspects the small corpora and errors on the large
+    ones is not testing "every committed AST"; it is testing the ones that fit."""
+    out, err = {}, []
+
+    def main():
+        try:
+            for path in paths:
+                out[os.path.basename(path)] = json.load(open(path))
+        except Exception as exc:                            # noqa: BLE001
+            err.append(exc)
+
+    sys.setrecursionlimit(300_000)
+    threading.stack_size(512 * 1024 * 1024)
+    thread = threading.Thread(target=main)
+    thread.start()
+    thread.join()
+    if err:
+        raise err[0]
+    return out
 
 
 def walk(node):
-    if isinstance(node, dict):
-        yield node
-        for v in node.values():
-            yield from walk(v)
-    elif isinstance(node, list):
-        for v in node:
-            yield from walk(v)
+    """Every dict in the tree. ITERATIVE: `yield from` recursion costs a frame per level
+    and per element, which the large corpora exceed even with a raised limit."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            yield cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +154,18 @@ class TestLiteralContract:
                         "%s: %s is small enough to be a JSON number" % (name, n["v"]))
 
     def test_big_ints_render_without_loss(self, corpora, render_lean):
+        """The VALUE must round-trip, sign included.
+
+        This compared `lean_int(v).strip("()")` against `v.lstrip("-")`, which strips the
+        sign from the expected side only -- so it demanded that `-6` render as `6`. It
+        passed for as long as every string-encoded integer in the tree happened to be a
+        large positive one, and failed the moment a corpus containing a negative one was
+        inspected. `lean_int` was right all along: it emits `(-6)`, parenthesised because
+        Lean needs it in argument position."""
         bigs = [n["v"] for fs in corpora.values() for n in walk(fs)
                 if n.get("k") == "int" and isinstance(n["v"], str)]
         for v in bigs:
-            assert render_lean.lean_int(v).strip("()") == v.lstrip("-")
+            assert int(render_lean.lean_int(v).strip("()")) == int(v)
 
     def test_hex_and_suffixed_literals_did_not_become_holes(self, corpora):
         """`0xFFFFFFFF`, `1ULL`, `0b10000`, `0x0010'0000'0000'0000` all used to fall
