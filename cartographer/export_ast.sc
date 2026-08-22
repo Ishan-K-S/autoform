@@ -1207,9 +1207,25 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     if (path.split('/').lastOption.contains("__future__") ||
         path.split('/').headOption.contains("__future__"))
                                    ujson.Obj("k" -> "unit")
-    else if (relative)             hole("import:absent:relative")
-    else if (prefixInCpg(path))    hole("import:absent:prefix-in-cpg")
-    else                           hole("import:absent:external")
+    /* An absent module is bound to an OPAQUE MARKER, not to a hole.
+     *
+     * A hole here is a hole in the VALUE, and `execStmt` stops at it -- so one
+     * `import time` aborted the whole module initialiser, and every `class` statement
+     * after it never ran. In cachetools that left `Cache`, `LRUCache` and every other
+     * class unbound in globals, which is why all six subclass constructors reported
+     * `mcall:__init__:non-object`: the receiver was not a class value, it was nothing.
+     *
+     * The name IS bound in Python, to a module object we cannot model. Binding it to an
+     * opaque value says exactly that: the binding exists, and every USE of it -- an
+     * attribute read, a call -- holes LOCALLY, which is the same information the old hole
+     * carried, delivered without destroying the rest of the file. The marker is a name no
+     * source language can produce, so it can never be confused with a real function. */
+    else if (relative)             externalModule(path, "relative")
+    else if (prefixInCpg(path))    externalModule(path, "prefix-in-cpg")
+    else                           externalModule(path, "external")
+
+  def externalModule(path: String, why: String): ujson.Obj =
+    ujson.Obj("k" -> "fnref", "v" -> s"<absent:$why>$path")
 
   /** A resolved module, as a value — but only if it is a Python module with an object.
     * A `<global>` C file scope is not a value and must not be handed out as one. */

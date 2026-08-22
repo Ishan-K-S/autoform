@@ -2866,3 +2866,52 @@ Kept rather than reverted -- unlike section 48a, which cost a compared function 
 nothing -- because it costs nothing measured and it stops six functions being blamed on the
 wrong component. The capability pays off when those holes close, not before.
 
+## 52. One unmodelled import destroyed a module's entire global scope
+
+Ranking the report by HOLE LABEL rather than by bucket put `set` fifth. First was
+`field:__enter__:non-object` at 9 functions, second `mcall:__init__:non-object` at 6 -- every
+subclass constructor in the corpus. Neither is a container problem.
+
+`LRUCache.__init__` starts `Cache.__init__(self, maxsize, getsizeof)`: an unbound method
+reached through the CLASS, where Python passes the receiver as an ordinary first positional.
+That is the same rule as section 46, never applied to `Expr.mcall`. Adding it did NOT fix the
+6 functions, and the failure is what found the real bug: a direct probe of the harness
+globals showed `Cache bound: false`, 42 fields, all of them from `keys.py`. The receiver was
+not a class value. It was nothing.
+
+The exporter binds an absent module to a HOLE VALUE. `execStmt` stops at a hole, so one
+`import time` aborted `cachetools/__init__.py`'s initialiser and every `class` statement
+after it never ran. `__version__` and `__all__` were bound because they precede the imports;
+everything after was lost.
+
+A hole in a value should be LOCAL, not fatal. The name really is bound in Python -- to a
+module object Core cannot model -- so it is now bound to an opaque marker that no source
+language can spell. Every USE of it still holes, carrying the same information, without
+destroying the rest of the file.
+
+    AST functions changed      4   (only the module initialisers)
+    holes in ast-Cachetools   40 -> 26
+    globals fields            42 -> 102
+    hole-free functions      180 -> 184
+    COMPARED                  38 -> 41 of 184 (21% -> 22%)
+    cases                    189 -> 204, still 0 divergences
+
+Two judgements inside this worth keeping:
+
+* The class-value dispatch uses `classDefines`, NOT `resolveMethod`. The latter falls back to
+  any free function of the same name, and with opaque modules now reachable, `time.monotonic`
+  would have invented a method out of an unrelated global.
+* `classNameOfValue` is a named Core function rather than an inline expression, because the
+  inline version was unmanageable in `FuelMono`. Code a proof cannot talk about is code that
+  resists checking.
+
+### An inconsistency this leaves behind, stated rather than hidden
+
+The exporter changed, but only cachetools was re-exported -- it is the CPG on this machine.
+V8, Linux and Ansible still carry the old `import:absent:*` holes and are now inconsistent
+with the exporter that produced them. NO GATE CATCHES THIS: `check_render` verifies
+render(AST) against the module, and `check_specs_fresh` pins specs to an AST hash; neither
+compares an AST to the source it came from. Ansible alone has ~2,400 absent-module holes, and
+518 of them were already known to be `__future__`. Re-exporting the other corpora is
+outstanding work, not a completed claim.
+

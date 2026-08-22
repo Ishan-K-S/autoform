@@ -143,7 +143,7 @@ Every link is mechanically checked, and each check is a different kind of oracle
 | specifications constrain behaviour | source-level mutation gate | **78/88 (88.6%)** on the translated module; 10 survivors, all analysed |
 | proofs depend on no unsound axiom | axiom sweep over every declaration | clean, 1,696 decls |
 | `.olean`s match a kernel replay | `leanchecker --fresh` | VERIFIED |
-| untranslated code is declared | hole counting + SACM assumptions | 40 holes, all named |
+| untranslated code is declared | hole counting + SACM assumptions | 26 holes, all named |
 
 The second row used to read "100%, HAS TEETH". That number was an artifact of the gate,
 not a property of the specifications: `scripts/mutate.py`'s `error_lines` regex matched

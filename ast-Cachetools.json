@@ -26574,8 +26574,8 @@
                     "k": "setGlobal",
                     "x": "collections",
                     "e": {
-                     "k": "hole",
-                     "label": "import:absent:external"
+                     "k": "fnref",
+                     "v": "<absent:external>collections"
                     }
                    },
                    "b": {
@@ -26584,8 +26584,8 @@
                      "k": "setGlobal",
                      "x": "collections",
                      "e": {
-                      "k": "hole",
-                      "label": "import:absent:external"
+                      "k": "fnref",
+                      "v": "<absent:external>collections"
                      }
                     },
                     "b": {
@@ -26594,8 +26594,8 @@
                       "k": "setGlobal",
                       "x": "functools",
                       "e": {
-                       "k": "hole",
-                       "label": "import:absent:external"
+                       "k": "fnref",
+                       "v": "<absent:external>functools"
                       }
                      },
                      "b": {
@@ -26604,8 +26604,8 @@
                        "k": "setGlobal",
                        "x": "heapq",
                        "e": {
-                        "k": "hole",
-                        "label": "import:absent:external"
+                        "k": "fnref",
+                        "v": "<absent:external>heapq"
                        }
                       },
                       "b": {
@@ -26614,8 +26614,8 @@
                         "k": "setGlobal",
                         "x": "random",
                         "e": {
-                         "k": "hole",
-                         "label": "import:absent:external"
+                         "k": "fnref",
+                         "v": "<absent:external>random"
                         }
                        },
                        "b": {
@@ -26624,8 +26624,8 @@
                          "k": "setGlobal",
                          "x": "time",
                          "e": {
-                          "k": "hole",
-                          "label": "import:absent:external"
+                          "k": "fnref",
+                          "v": "<absent:external>time"
                          }
                         },
                         "b": {
@@ -27197,8 +27197,8 @@
        "k": "setGlobal",
        "x": "functools",
        "e": {
-        "k": "hole",
-        "label": "import:absent:external"
+        "k": "fnref",
+        "v": "<absent:external>functools"
        }
       },
       "b": {
@@ -27465,8 +27465,8 @@
            "k": "setGlobal",
            "x": "functools",
            "e": {
-            "k": "hole",
-            "label": "import:absent:external"
+            "k": "fnref",
+            "v": "<absent:external>functools"
            }
           },
           "b": {
@@ -27475,8 +27475,8 @@
             "k": "setGlobal",
             "x": "warnings",
             "e": {
-             "k": "hole",
-             "label": "import:absent:external"
+             "k": "fnref",
+             "v": "<absent:external>warnings"
             }
            },
            "b": {
@@ -27485,8 +27485,8 @@
              "k": "setGlobal",
              "x": "weakref",
              "e": {
-              "k": "hole",
-              "label": "import:absent:external"
+              "k": "fnref",
+              "v": "<absent:external>weakref"
              }
             },
             "b": {
@@ -27902,8 +27902,8 @@
         "k": "setGlobal",
         "x": "math",
         "e": {
-         "k": "hole",
-         "label": "import:absent:external"
+         "k": "fnref",
+         "v": "<absent:external>math"
         }
        },
        "b": {
@@ -27912,8 +27912,8 @@
          "k": "setGlobal",
          "x": "random",
          "e": {
-          "k": "hole",
-          "label": "import:absent:external"
+          "k": "fnref",
+          "v": "<absent:external>random"
          }
         },
         "b": {
@@ -27922,8 +27922,8 @@
           "k": "setGlobal",
           "x": "time",
           "e": {
-           "k": "hole",
-           "label": "import:absent:external"
+           "k": "fnref",
+           "v": "<absent:external>time"
           }
          },
          "b": {
@@ -27932,8 +27932,8 @@
            "k": "setGlobal",
            "x": "Condition",
            "e": {
-            "k": "hole",
-            "label": "import:absent:external"
+            "k": "fnref",
+            "v": "<absent:external>threading"
            }
           },
           "b": {

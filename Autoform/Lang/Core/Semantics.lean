@@ -654,6 +654,17 @@ which `fn` it is about. -/
       (params.zip vs).foldl (fun (e : Env) (x, v) => Env.set e x v) base :=
   bindParams_plain base vs rfl rfl
 
+/-- The short class name behind a class VALUE.
+
+The exporter marks a class value by suffixing `<meta>` to the qualified name, and
+`resolveMethod`/`classDefines` want the short name -- the last dotted segment. This cannot
+split the whole name, because the FILE part contains dots
+(`cachetools/__init__.py:<module>.Cache<meta>`). Named rather than inlined so that proofs
+about the `mcall` case have a term to talk about. -/
+def classNameOfValue (g : String) : String :=
+  let base := if g.endsWith "<meta>" then g.dropRight 6 else g
+  (base.splitOn ".").getLastD base
+
 /-- Resolve a method on a class: prefer `Cls.meth`, else any `.meth`. -/
 def Ctx.resolveMethod (ctx : Ctx) (cls meth : String) : Option Func :=
   match ctx.table.filter (fun p => p.1.endsWith ("." ++ cls ++ "." ++ meth)) with
@@ -1006,6 +1017,33 @@ def evalExpr (ctx : Ctx) : Nat → Heap → Env → Expr → Heap × EResult
             | some fn =>
               if o.captured.isEmpty then applyFunc ctx n h₂ fn (some (.ref r)) vs kws
               else applyClosure ctx n h₂ fn (("self", .ref r) :: o.captured) vs kws
+      | (h₁, .val (.fn g)) =>
+        match evalList ctx n h₁ ρ args with
+        | (h₂, .inl e)  => (h₂, e)
+        | (h₂, .inr (vs, kws)) =>
+          -- `Cache.__init__(self, maxsize, getsizeof)`: an UNBOUND method reached through
+          -- the CLASS, which is how every subclass in cachetools calls its base
+          -- constructor. Python passes the receiver as an ordinary first positional here;
+          -- `applyFunc` binds receivers separately, so it has to be split off. Same rule
+          -- as the `.fn` case in `Expr.call`, and it was worth six functions -- every
+          -- `__init__` in the corpus was `mcall:__init__:non-object`.
+          --
+          -- The class value's name is the exporter's `<meta>` marker on the qualified
+          -- name; `resolveMethod` wants the short class name, which is its last dotted
+          -- segment (the FILE part contains dots, so this cannot split on the whole name).
+          let short := classNameOfValue g
+          -- `classDefines`, NOT `resolveMethod`: the latter falls back to any free
+          -- function of that name, which for an opaque external module (`time.monotonic`)
+          -- would invent a method out of an unrelated global. A hole is the right answer
+          -- there; a plausible wrong one is not.
+          if ctx.classDefines short m then
+            match ctx.resolveMethod short m with
+            | some fn =>
+                match vs with
+                | recv :: rest => applyFunc ctx n h₂ fn (some recv) rest kws
+                | []           => (h₂, .hole s!"mcall:{short}.{m}:no-receiver")
+            | none => (h₂, .hole s!"mcall:{m}:non-object")
+          else (h₂, .hole s!"mcall:{short}.{m}:not-a-class-method")
       | (h₁, .val (.bobj bcls pay)) =>
         match evalList ctx n h₁ ρ args with
         | (h₂, .inl e)  => (h₂, e)

@@ -5464,17 +5464,23 @@ def f_cachetools___init___py__module_ : Func :=
                                         (.seq
                                         (.setGlobal "__version__" (.lit (.str "7.1.7")))
                                         (.seq
-                                        (.setGlobal "collections" (.hole "import:absent:external"))
+                                        (.setGlobal
+                                        "collections"
+                                        (.fnref "<absent:external>collections"))
                                         (.seq
-                                        (.setGlobal "collections" (.hole "import:absent:external"))
+                                        (.setGlobal
+                                        "collections"
+                                        (.fnref "<absent:external>collections"))
                                         (.seq
-                                        (.setGlobal "functools" (.hole "import:absent:external"))
+                                        (.setGlobal
+                                        "functools"
+                                        (.fnref "<absent:external>functools"))
                                         (.seq
-                                        (.setGlobal "heapq" (.hole "import:absent:external"))
+                                        (.setGlobal "heapq" (.fnref "<absent:external>heapq"))
                                         (.seq
-                                        (.setGlobal "random" (.hole "import:absent:external"))
+                                        (.setGlobal "random" (.fnref "<absent:external>random"))
                                         (.seq
-                                        (.setGlobal "time" (.hole "import:absent:external"))
+                                        (.setGlobal "time" (.fnref "<absent:external>time"))
                                         (.seq
                                         (.setGlobal "keys" (.name "<module>cachetools/keys.py"))
                                         (.seq
@@ -5647,7 +5653,7 @@ def f_cachetools__cached_py__module_ : Func :=
               (.seq
                 (.setGlobal "__all__" (.tupleE []))
                 (.seq
-                  (.setGlobal "functools" (.hole "import:absent:external"))
+                  (.setGlobal "functools" (.fnref "<absent:external>functools"))
                   (.seq
                     (.setGlobal
                       "_condition_info"
@@ -5723,11 +5729,11 @@ def f_cachetools__cachedmethod_py__module_ : Func :=
                       (.seq
                         (.setGlobal "__all__" (.tupleE []))
                         (.seq
-                          (.setGlobal "functools" (.hole "import:absent:external"))
+                          (.setGlobal "functools" (.fnref "<absent:external>functools"))
                           (.seq
-                            (.setGlobal "warnings" (.hole "import:absent:external"))
+                            (.setGlobal "warnings" (.fnref "<absent:external>warnings"))
                             (.seq
-                              (.setGlobal "weakref" (.hole "import:absent:external"))
+                              (.setGlobal "weakref" (.fnref "<absent:external>weakref"))
                               (.seq
                                 (.setGlobal
                                   "_warn_classmethod"
@@ -5866,13 +5872,13 @@ def f_cachetools_func_py__module_ : Func :=
                       , (.lit (.str "rr_cache"))
                       , (.lit (.str "ttl_cache")) ]))
                   (.seq
-                    (.setGlobal "math" (.hole "import:absent:external"))
+                    (.setGlobal "math" (.fnref "<absent:external>math"))
                     (.seq
-                      (.setGlobal "random" (.hole "import:absent:external"))
+                      (.setGlobal "random" (.fnref "<absent:external>random"))
                       (.seq
-                        (.setGlobal "time" (.hole "import:absent:external"))
+                        (.setGlobal "time" (.fnref "<absent:external>time"))
                         (.seq
-                          (.setGlobal "Condition" (.hole "import:absent:external"))
+                          (.setGlobal "Condition" (.fnref "<absent:external>threading"))
                           (.seq
                             (.seq
                               (.setGlobal

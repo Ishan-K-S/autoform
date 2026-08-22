@@ -330,6 +330,36 @@ private theorem fuelStep : ∀ k, FuelStep k := by
             | val v =>
                 rw [ihE _ hctx _ _ _ _ _ hA (by simp)]
                 cases v
+                case fn g =>
+                    -- A CLASS value receiver (`Cache.__init__(self, ...)`) now dispatches
+                    -- to the class's method with the first positional split off as the
+                    -- receiver, so this case recurses where it used to be inert.
+                    dsimp only at hy ⊢
+                    rcases hB : evalList ctx k h₁ ρ args with ⟨h₂, s⟩
+                    rw [hB] at hy
+                    cases s with
+                    | inl e' =>
+                        cases e' <;> first
+                          | (cases hy; exact absurd rfl hne)
+                          | (rw [ihL _ hctx _ _ _ _ _ hB (by simp)]; exact hy)
+                    | inr vs =>
+                        rw [ihL _ hctx _ _ _ _ _ hB (by simp)]
+                        dsimp only at hy ⊢
+                        -- three nested branches now: the `classDefines` guard, the
+                        -- method lookup, and splitting the receiver off the positionals.
+                        cases hcd : Ctx.classDefines ctx (classNameOfValue g) m with
+                        | false => simp only [hcd, Bool.false_eq_true, if_false] at hy ⊢; exact hy
+                        | true =>
+                            simp only [hcd, if_true] at hy ⊢
+                            cases hrm : Ctx.resolveMethod ctx (classNameOfValue g) m with
+                            | none => simp only [hrm] at hy ⊢; exact hy
+                            | some fn2 =>
+                                simp only [hrm] at hy ⊢
+                                cases hvs : vs.1 with
+                                | nil => simp only [hvs] at hy ⊢; exact hy
+                                | cons recv rest =>
+                                    simp only [hvs] at hy ⊢
+                                    exact ihF _ hctx _ _ (hctx.2 _ _ _ hrm) _ _ _ _ _ hy hne
                 case ref rr =>
                     dsimp only at hy ⊢
                     rcases hB : evalList ctx k h₁ ρ args with ⟨h₂, s⟩
