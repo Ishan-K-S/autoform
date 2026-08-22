@@ -2905,13 +2905,49 @@ Two judgements inside this worth keeping:
   inline version was unmanageable in `FuelMono`. Code a proof cannot talk about is code that
   resists checking.
 
-### An inconsistency this leaves behind, stated rather than hidden
+### A caveat I raised and then had to withdraw
 
-The exporter changed, but only cachetools was re-exported -- it is the CPG on this machine.
-V8, Linux and Ansible still carry the old `import:absent:*` holes and are now inconsistent
-with the exporter that produced them. NO GATE CATCHES THIS: `check_render` verifies
-render(AST) against the module, and `check_specs_fresh` pins specs to an AST hash; neither
-compares an AST to the source it came from. Ansible alone has ~2,400 absent-module holes, and
-518 of them were already known to be `__future__`. Re-exporting the other corpora is
-outstanding work, not a completed claim.
+I recorded that V8, Linux and Ansible were left carrying the old `import:absent:*` holes and
+were now inconsistent with the exporter. **That was wrong, and checking took one command:**
+
+    for f in ast-*.json; do grep -c "import:absent" $f; done   # every one: 0
+
+No committed AST contains an absent-import hole. `import` is a PYTHON construct; V8 and Linux
+are C and C++, and the `Lang*` corpora are Java, Go, JS, TS and C. The only Python corpus with
+a committed AST is cachetools, which was re-exported. Ansible's AST is not committed at all --
+the ~2,400 figure comes from a measurement run whose artifact was never checked in.
+
+Recorded because the failure mode is the project's own, pointed the other way. The rule here
+has been that a metric computed from the artifact it describes will flatter itself, so claims
+get checked against the artifact. A CAVEAT is a claim too. Stating an unverified one is not
+the safe direction -- it is the same error with the sign flipped, and it sends the next person
+to re-export three corpora that never needed it.
+
+The real outstanding item is narrower: Ansible is a Python corpus where this fix should help,
+and it has never had a committed AST. That is new measurement, not a repair.
+
+### 52a. The same fix, measured on Ansible
+
+Ansible is the largest Python corpus and the one where absent imports were worst. Re-exported
+with the fix, from the CPG already in `workspace/`:
+
+    functions            5,547
+    holes            5,101 -> 3,131   (-39%)
+    absent-import holes  1,970 -> 0
+    hole-free        3,753 -> 4,017   (68% -> 72%)
+    functions recovered    264
+
+The 1,970 figure is exact rather than inferred: every opaque marker in the new AST is one
+hole that the old exporter emitted in that position, so the two are countable against each
+other in the same artifact.
+
+264 functions became hole-free because their ONLY hole was an import. Those were not hard
+constructs, and nothing about them was ever unanalysable -- the module they lived in simply
+stopped executing at its first `import`. This is the same shape as the 571 Linux functions in
+section 43, which were absent from the corpus rather than untranslatable: the biggest wins so
+far have come from finding out that something was never reached, not from modelling something
+difficult.
+
+Not committed: `ast-Ansible.json` has never been a tracked artifact, and adding a 5,547
+-function corpus to the repository is a separate decision from fixing the exporter.
 
