@@ -108,11 +108,16 @@ def core_names(module: str):
     """The call-closed core, straight from `Program.callClosed` — the Lean definition is
     the authority on which functions are analysable, so it is asked rather than
     re-implemented here."""
-    src = ("import Autoform.Ledger\nimport Autoform.Generated.%s\n"
+    # Per-corpus namespaces (`Autoform.Generated.<M>`) landed in the generated modules but
+    # never here, so every reference below was to `Autoform.Generated.program`, which has
+    # not existed since. The generator could not query ANY corpus -- and because
+    # `check_specs_fresh` demands regeneration rather than re-recording, that silently made
+    # every AST change unlandable.
+    src = ("import Autoform.Ledger\nimport Autoform.Generated.{m}\n"
            "open Autoform.Core in\n#eval do\n"
-           "  let p : Program := Autoform.Generated.program\n"
+           "  let p : Program := Autoform.Generated.{m}.program\n"
            "  IO.println (String.intercalate \"\\n\" "
-           "(p.callClosed.map (fun f : Func => f.name)))\n" % module)
+           "(p.callClosed.map (fun f : Func => f.name)))\n").format(m=module)
     rc, out, err, _ = lean_run(src, "core")
     if rc != 0:
         print("could not query the call-closed core:\n%s" % (err or out)[:400])
@@ -130,12 +135,13 @@ def globals_literal(module: str):
     would re-run every initialiser once per case. Evaluating it once here and emitting the
     resulting heap as a literal keeps the proofs affordable, and the literal is Lean's own
     `Repr` output for the value, not a reconstruction of it."""
-    src = ("import Autoform.Generated.%s\n"
-           "open Autoform.Core Autoform.Generated\n"
+    src = ("import Autoform.Generated.{m}\n"
+           "open Autoform.Core Autoform.Generated.{m}\n"
            "#eval do\n"
-           "  let gp := initGlobals program %d Autoform.Generated.moduleInits\n"
+           "  let gp := initGlobals Autoform.Generated.{m}.program {f} "
+           "Autoform.Generated.{m}.moduleInits\n"
            "  IO.println (\"@@\" ++ ((repr gp.1).pretty (width := 100000000)))\n"
-           "  IO.println (\"##\" ++ toString gp.2)\n" % (module, INIT_FUEL))
+           "  IO.println (\"##\" ++ toString gp.2)\n").format(m=module, f=INIT_FUEL)
     rc, out, err, _ = lean_run(src, "globals")
     heap = gref = None
     for line in out.splitlines():
@@ -798,7 +804,7 @@ open Autoform.Core Autoform.Refine Autoform.SpecsGen
 set_option maxRecDepth 20000
 set_option maxHeartbeats 1000000
 
-abbrev P : Program := Autoform.Generated.program
+abbrev P : Program := Autoform.Generated.%s.program
 
 /-- The module-initialiser heap, evaluated once by `initGlobals P %d moduleInits` and
 frozen into this literal so that the kernel does not re-run the initialisers for every
@@ -810,7 +816,7 @@ def gref : Ref := %s
 def base : Nat := h0.length
 def C : Ctx := { dialect := P.dialect, table := P.table, globals := gref }
 def FUEL : Nat := %d
-open Autoform.Generated
+open Autoform.Generated.%s
 
 /-- Every function body reachable in this program is `tryFinally`-free, so
 `Autoform/FuelMono.lean`'s monotonicity theorems apply to this context. Checked by
@@ -840,7 +846,8 @@ def refute(cands, module, chunk=120):
     live = [c for c in cands if c.kind == "law"]
     for i in range(0, len(live), chunk):
         part = live[i:i + chunk]
-        src = [HEADER % (module, module, INIT_FUEL, GLOBALS[0], GLOBALS[1], FUEL)]
+        src = [HEADER % (module, module, module, INIT_FUEL, GLOBALS[0], GLOBALS[1],
+                         FUEL, module)]
         for c in part:
             src.append(domain_defs(c))
             src.append('#eval IO.println ("@@%s@@" ++ toString '
@@ -905,7 +912,8 @@ def guard_pass(cands, module, chunk=120):
     todo = [c for c in live if "fuel_mono" not in c.extra]
     for i in range(0, len(todo), chunk):
         part = todo[i:i + chunk]
-        src = [HEADER % (module, module, INIT_FUEL, GLOBALS[0], GLOBALS[1], FUEL)]
+        src = [HEADER % (module, module, module, INIT_FUEL, GLOBALS[0], GLOBALS[1],
+                         FUEL, module)]
         for c in part:
             g = GUARD[c.family]
             arg = "x.case" if c.dom_kind == "obs" else "x"
@@ -990,7 +998,8 @@ def characterize(cands, module, chunk=60):
     out = []
     for i in range(0, len(todo), chunk):
         part = todo[i:i + chunk]
-        src = [HEADER % (module, module, INIT_FUEL, GLOBALS[0], GLOBALS[1], FUEL)]
+        src = [HEADER % (module, module, module, INIT_FUEL, GLOBALS[0], GLOBALS[1],
+                         FUEL, module)]
         for c in part:
             src.append(domain_defs(c))
             src.append('#eval IO.println ("@@%s@@" ++ String.intercalate "@|@" '
@@ -1182,7 +1191,8 @@ def emit(cands, module, obligations_extra, ns=None):
     share a namespace also share declaration names, and importing both would clash."""
     ns = ns or module
     survivors = [c for c in cands if c.status in ("candidate", "proved")]
-    out = [HEADER % (module, ns, INIT_FUEL, GLOBALS[0], GLOBALS[1], FUEL)]
+    out = [HEADER % (module, ns, module, INIT_FUEL, GLOBALS[0], GLOBALS[1],
+                     FUEL, module)]
     out.insert(1, DOC % {"module": module})
     obs = []
     thms = []

@@ -10,6 +10,21 @@ question it asks is answerable from tracked bytes:
                    has a record, or is named in the unattributed baseline.  A new
                    artifact with no record fails.  An artifact that quietly appears is
                    the failure mode this catches.
+
+                   "tracked" is asked of git, not assumed from the glob.  The large
+                   corpora (`ast-Ansible.json`, `ast-LinuxLib.json`, `ast-LinuxCrypto.json`,
+                   `ast-V8Base.json`) and `formalization-graph.json` are named in
+                   `.gitignore`: they are local build products that a fresh clone does not
+                   have at all, so demanding a *committed* provenance record for them was
+                   asking the repository to attribute bytes it does not contain.  They are
+                   now reported as LOCAL, by name, on every run -- never silently -- and
+                   they do not make the gate red.  This is narrower, not looser: the
+                   excused set is exactly what a committed `.gitignore` rule excludes, so
+                   it is identical in a fresh clone (where the files are simply absent),
+                   an artifact that is untracked but NOT ignored is still judged as
+                   tracked (the "quietly appeared" case), a LOCAL artifact that DOES carry
+                   a record still has that record checked in full, and if git cannot be
+                   consulted every artifact is judged as tracked.
   2. INTEGRITY     the record's `artifact_sha256` is the artifact's actual digest.  An
                    artifact regenerated without re-recording fails here.
   3. PIN           the record's `joern_version` equals `joern-version`.  The front end
@@ -45,6 +60,7 @@ import argparse
 import glob
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -59,6 +75,39 @@ def load_json(p: Path):
         return json.loads(p.read_text())
     except (OSError, json.JSONDecodeError) as e:
         return e
+
+
+def git_classify(root: Path, names: list[str]) -> dict[str, str]:
+    """tracked / ignored / untracked, per path, from git.
+
+    Fail-closed: any doubt -- not a checkout, no git, a path git will not speak about --
+    is reported as "tracked", i.e. judged by the full rules.  Only an explicit
+    `git check-ignore` hit on a path git also does not track earns the LOCAL treatment,
+    because that is the one condition a fresh clone reproduces exactly.
+    """
+    out = {n: "tracked" for n in names}
+    try:
+        ls = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--"] + names,
+                            capture_output=True, timeout=60)
+        if ls.returncode != 0:
+            return out
+        tracked = {n for n in ls.stdout.decode().split("\0") if n}
+        ci = subprocess.run(["git", "-C", str(root), "check-ignore", "--stdin"],
+                            input="\n".join(names), capture_output=True, text=True,
+                            timeout=60)
+        # check-ignore exits 0 (some ignored), 1 (none ignored) or 128 (error).
+        ignored = ({l.strip() for l in ci.stdout.splitlines() if l.strip()}
+                   if ci.returncode in (0, 1) else set())
+    except (OSError, subprocess.SubprocessError):
+        return out
+    for n in names:
+        if n in tracked:
+            out[n] = "tracked"
+        elif n in ignored:
+            out[n] = "ignored"
+        else:
+            out[n] = "untracked"
+    return out
 
 
 def main() -> int:
@@ -111,12 +160,24 @@ def main() -> int:
     seen_records = set()
     attributed = 0
     baselined: list[str] = []
+    local: list[str] = []
+
+    kind = git_classify(root, [str(a.relative_to(root)) for a in artifacts])
 
     for art in artifacts:
         rel = art.name
+        is_local = kind.get(str(art.relative_to(root))) == "ignored"
         rp = prov_dir / (rel + ".prov.json")
         actual = P.sha256_file(art)
         if not rp.exists():
+            if is_local:
+                # Gitignored and untracked: this file does not exist in a fresh clone, so
+                # the repository is not wrong about it and CI cannot be. Named, not hidden.
+                local.append(f"{rel}: gitignored build product, untracked, no record. Not a "
+                             f"repository defect -- a fresh clone has no such file. If you "
+                             f"regenerate it locally, scripts/export_with_provenance.sh "
+                             f"records provenance beside it.")
+                continue
             entry = baseline.get(rel)
             if entry is None:
                 fail.append(
@@ -193,15 +254,17 @@ def main() -> int:
     # --- report ------------------------------------------------------------ #
     for n in notes:
         print(f"note   {n}")
+    for l in local:
+        print(f"LOCAL  {l}", file=sys.stderr)
     for b in baselined:
         print(f"UNATTRIBUTED  {b}", file=sys.stderr)
     for f in fail:
         print(f"FAIL   {f}", file=sys.stderr)
 
-    total = len(artifacts)
-    print(f"\ncheck_provenance: {attributed}/{total} artifacts fully attributed to "
-          f"Joern {pin}; {len(baselined)} unattributed (baselined); "
-          f"{len(fail)} violation(s).")
+    total = len(artifacts) - len(local)
+    print(f"\ncheck_provenance: {attributed}/{total} in-repository artifacts fully "
+          f"attributed to Joern {pin}; {len(baselined)} unattributed (baselined); "
+          f"{len(local)} local-only (gitignored, not judged); {len(fail)} violation(s).")
     if baselined and a.strict:
         print("check_provenance: --strict, so the baseline is not accepted.",
               file=sys.stderr)

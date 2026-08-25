@@ -13,7 +13,14 @@
   "would have made a false claim look like a green check.",
   "",
   "source_hint paths are per-session scratch directories. They are a lead for whoever",
-  "regenerates these, not a stable location, and check_provenance.py does not read them."
+  "regenerates these, not a stable location, and check_provenance.py does not read them.",
+  "",
+  "The two *Sample entries are a different kind of gap from the rest, and say so: they",
+  "are not stale exports, they are EXTRACTIONS. Each is a byte-identical subset of an",
+  "untracked corpus AST (verified entry-by-entry against ast-LinuxLib.json and",
+  "ast-V8Base.json), and no extraction script is committed, so there is no `command`",
+  "that regenerates them and a record naming export_ast.sc + a source tree would be",
+  "false. Committing the extractor is what closes these, not a re-export."
  ],
  "artifacts": {
   "ast-CMath.json": {
@@ -72,6 +79,13 @@
    "reproduction_attempted": false,
    "reproduced": false
   },
+  "ast-LinuxLibSample.json": {
+   "artifact_sha256": "12abfcf63d6c09966be623a407b6e9165f6240cb90e049f27847aa837e26d57f",
+   "source_hint": "extracted from ast-LinuxLib.json (untracked; .gitignore names it a local build product)",
+   "reason": "Not a Joern export: an EXTRACTION. All 7 entries were verified byte-identical to their (name, file) counterparts in ast-LinuxLib.json, which is gitignored and local-only. Commit 5fd17ae describes it as the call-closure of the functions Autoform/SpecsGen/LinuxLibSample.lean names. No extraction script is committed, so there is no exact command to record, and naming cartographer/export_ast.sc plus a Linux source tree would claim a regeneration path that does not produce this file. Attribution requires committing the extractor (and recording the parent AST it selects from).",
+   "reproduction_attempted": true,
+   "reproduced": false
+  },
   "ast-Sample.json": {
    "artifact_sha256": "06f5f57332569103002a35b05d60949c9606ecf1aca1aaef28a3a234082b95f7",
    "source_hint": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/sample",
@@ -83,6 +97,13 @@
    "artifact_sha256": "ab50e9b0e8537b8b26ce1b0dc6e5635ade809addc03145296b61a7cf765409f6",
    "source_hint": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/stress",
    "reason": "scripts/reproduce_ast.py, Joern 4.0.606, committed export_ast.sc: DIFFERS. Fresh export has 8 entries to the committed 6; the extra two are the module initializers `ops.py:<module>` and `<module-objects>:<module>`.",
+   "reproduction_attempted": true,
+   "reproduced": false
+  },
+  "ast-V8BaseSample.json": {
+   "artifact_sha256": "154b11bf3d86784dac0497d1cc30aecb47aa92f856dfd21fd9167048921e44d8",
+   "source_hint": "extracted from ast-V8Base.json (untracked; .gitignore names it a local build product)",
+   "reason": "Not a Joern export: an EXTRACTION. All 4 entries were verified byte-identical to their (name, file) counterparts in ast-V8Base.json, which is gitignored and local-only. Commit 5fd17ae describes it as the call-closure of the functions Autoform/SpecsGen/V8BaseSample.lean names. No extraction script is committed, so there is no exact command to record, and naming cartographer/export_ast.sc plus a V8 source tree would claim a regeneration path that does not produce this file. Attribution requires committing the extractor (and recording the parent AST it selects from).",
    "reproduction_attempted": true,
    "reproduced": false
   },

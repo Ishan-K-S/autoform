@@ -4,7 +4,7 @@
       "ast_bytes": 136620489,
       "ast_hint": "/tmp/final-Ansible.json",
       "ast_sha256": "f9d015520c6531f5d53bd5a14dc94e57ae7bcc3f82f6188110034bd4abb9d1f6",
-      "ast_tracked": true,
+      "ast_tracked": false,
       "provenance": "AST /tmp/final-Ansible.json is too large to track in git; re-export with cartographer/export_ast.sc from the corpus CPG.",
       "render_bytes": 22878485,
       "render_sha256": "3a19a6b11619ae4d448f65e822e07d28f21e714c6bd3239c6de726b653bcf4e3"
@@ -69,7 +69,7 @@
       "ast_bytes": 18888160,
       "ast_hint": "/tmp/final-LinuxCrypto.json",
       "ast_sha256": "98d3a13e5175fff069d4f5ce861ea7845875b3f38e26a0e5faff4708400af84e",
-      "ast_tracked": true,
+      "ast_tracked": false,
       "provenance": "AST /tmp/final-LinuxCrypto.json is too large to track in git; re-export with cartographer/export_ast.sc from the corpus CPG.",
       "render_bytes": 5253853,
       "render_sha256": "7b9a8e810423152e90e516a2af8c4c32be154551f6844dddaea4587258263020"
@@ -78,7 +78,7 @@
       "ast_bytes": 22263110,
       "ast_hint": "/tmp/final-LinuxLib.json",
       "ast_sha256": "f841b6a0453ec5c8022676295acd924b766401fb4514cff1c6d64cb255d3077f",
-      "ast_tracked": true,
+      "ast_tracked": false,
       "provenance": "AST /tmp/final-LinuxLib.json is too large to track in git; re-export with cartographer/export_ast.sc from the corpus CPG.",
       "render_bytes": 6622880,
       "render_sha256": "1cef8ef56df2f4936d2932a2c106816b8eb60d13037ce007afbd6018d2fdfcad"
@@ -109,7 +109,7 @@
       "ast_hint": "/tmp/final-V8Base.json",
       "ast_sha256": "3aee4390e0208ce78eefb22bb3899ea928eee5fc80783264991b18d88d9fac29",
       "ast_tracked": true,
-      "provenance": "AST /tmp/final-V8Base.json is too large to track in git; re-export with cartographer/export_ast.sc from the corpus CPG.",
+      "provenance": "AST tracked in git (3.2 MB). The 74 spec files under Autoform/SpecsGen/V8Base/ are pinned to it, so a fresh clone can verify them; see STRATEGY 55.",
       "render_bytes": 1818414,
       "render_sha256": "bf6b2e1ef9f656ef3f11c0ffb59cb75b8dc66d32928fbe5e179eb6fbc46f5763"
     },

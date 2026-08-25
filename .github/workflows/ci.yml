@@ -112,6 +112,11 @@ jobs:
       # stayed green because nothing tied a spec to the corpus version it was generated
       # against. This binds them by AST hash. A mismatch means re-generate the specs; it
       # does NOT mean re-record the hash, which would make the gate agree with anything.
+      #
+      # It exits 3 when a spec module is TRACKED but its corpus cannot be hashed from the
+      # tree. That case used to exit 0: the corpus digest fell back to the manifest's own
+      # `ast_sha256`, which is the same file the pin lives in, so the gate agreed with
+      # itself and said nothing about the 74 tracked V8Base spec files. See STRATEGY.md 55.
       - name: check_specs_fresh — specs describe the corpus in the tree
         run: python3 scripts/check_specs_fresh.py
 

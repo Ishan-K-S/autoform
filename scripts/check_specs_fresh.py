@@ -31,11 +31,30 @@ Re-recording without re-generating is the failure mode to avoid: it makes the ch
 with whatever is there, which is a rubber stamp rather than a gate. `--record` therefore
 prints what it is overwriting.
 
+## Silence is not success
+
+The check above needs a corpus hash it can *recompute from the tree*. It used to accept
+three sources: the tracked `ast-<M>.json`, an `ast_hint` path, and — when both were absent
+— `artifact-manifest.json`'s own `ast_sha256` field. That third source made the gate
+vacuous. `corpus_ast_sha256` is also a manifest field, so on a fresh clone of the four
+untracked corpora the gate compared the manifest against itself, agreed with itself, and
+exited 0 without saying anything about the 74 tracked `SpecsGen/V8Base` spec files it was
+supposed to be guarding. It was dark in CI in exactly the sense of §44.
+
+The fallback is gone. A corpus hash now comes only from bytes on disk. When a spec module
+is **tracked in git** and its corpus cannot be hashed from the tree, that is reported as
+UNVERIFIABLE and exits 3 — the same verdict and the same exit code `check_render.py` uses
+for the same situation. An untracked spec module with an absent corpus is a local build
+product that legitimately does not exist in a fresh clone; it is reported as SKIPPED and
+does not fail. Tracked theorems pinned to a corpus nobody can see is a different thing,
+and it now has its own name.
+
 Usage:  scripts/check_specs_fresh.py [--record]
-Exit:   0 all specs current; 1 at least one stale; 2 nothing checkable.
+Exit:   0 all specs current; 1 at least one stale; 2 nothing checkable;
+        3 all checkable specs current, but a tracked spec module has no verifiable corpus.
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, sys
+import argparse, hashlib, json, os, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST = os.path.join(ROOT, "artifact-manifest.json")
@@ -63,15 +82,35 @@ def sha(path: str) -> str | None:
 
 
 def corpus_hash(man: dict, corpus: str) -> tuple[str | None, str]:
-    """Hash of the AST the corpus module is rendered from, and where it came from."""
+    """Hash of the AST the corpus module is rendered from, and where it came from.
+
+    Only bytes on disk count. The manifest's own `ast_sha256` is deliberately NOT a
+    fallback: `corpus_ast_sha256` lives in the same file, so accepting it would compare
+    the manifest against itself and pass whatever is recorded.
+    """
     ent = man.get("modules", {}).get(corpus, {})
     tracked = os.path.join(ROOT, f"ast-{corpus}.json")
-    if os.path.exists(tracked):
+    if os.path.isfile(tracked):
         return sha(tracked), f"ast-{corpus}.json"
     hint = ent.get("ast_hint")
-    if hint and os.path.exists(hint):
+    if hint and os.path.isfile(hint):
         return sha(hint), hint
-    return ent.get("ast_sha256"), "artifact-manifest.json (AST absent)"
+    where = f"ast-{corpus}.json"
+    if ent.get("ast_hint"):
+        where += f" nor {ent['ast_hint']}"
+    return None, f"no AST on disk ({where})"
+
+
+def git_tracked(rel: str) -> bool | None:
+    """Is anything under `rel` tracked in git? None if git cannot answer."""
+    try:
+        p = subprocess.run(["git", "ls-files", "-z", "--", rel], cwd=ROOT,
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return bool(p.stdout.strip("\0").strip())
 
 
 def main() -> int:
@@ -81,7 +120,7 @@ def main() -> int:
     a = ap.parse_args()
     man = json.load(open(MANIFEST))
     specs = man.setdefault("specs", {})
-    stale, unchecked, ok = [], [], 0
+    stale, unchecked, unverifiable, skipped, ok = [], [], [], [], 0
 
     for spec, corpus in SPECS.items():
         if not os.path.exists(os.path.join(ROOT, "Autoform", spec + ".lean")) and \
@@ -89,7 +128,26 @@ def main() -> int:
             continue
         cur, src = corpus_hash(man, corpus)
         if cur is None:
-            unchecked.append(f"{spec}: corpus {corpus} has no AST and no recorded hash")
+            # The corpus cannot be hashed from the tree. Whether that is acceptable
+            # depends on whether the SPECS are tracked: a tracked theorem pinned to an
+            # invisible corpus is unverifiable and must not pass; an untracked spec
+            # module is a local build product and legitimately absent in a fresh clone.
+            answers = [git_tracked(f"Autoform/{spec}.lean"),
+                       git_tracked(f"Autoform/{spec}")]
+            tracked = True if True in answers else (
+                None if None in answers else False)
+            rec = specs.get(spec, {}).get("corpus_ast_sha256")
+            if tracked is False:
+                skipped.append(f"{spec}: corpus {corpus} — {src}; spec module is not "
+                               f"tracked in git, so nothing in the repository depends on it")
+            else:
+                how = "tracked in git" if tracked else "of unknown git status"
+                unverifiable.append(
+                    f"{spec}: {how}, pinned to corpus {corpus} @ "
+                    f"{(rec or 'never pinned')[:12]}, but {src}.\n"
+                    f"    The corpus cannot be recomputed from this tree, so the pin "
+                    f"cannot be checked by anything. Re-export the corpus AST, or stop "
+                    f"tracking specs whose corpus is not tracked.")
             continue
         rec = specs.get(spec, {}).get("corpus_ast_sha256")
         if a.record:
@@ -112,17 +170,28 @@ def main() -> int:
         json.dump(man, open(MANIFEST, "w"), indent=1, sort_keys=True)
         print(f"check_specs_fresh: pinned {ok} spec module(s)")
         return 0
+    for k in skipped:
+        print(f"SKIPPED  {k}")
     for u in unchecked:
         print(f"UNPINNED {u}", file=sys.stderr)
+    for u in unverifiable:
+        print(f"UNVERIFIABLE {u}", file=sys.stderr)
     for s in stale:
         print(f"STALE    {s}", file=sys.stderr)
     if stale:
         print(f"\ncheck_specs_fresh: {len(stale)} spec module(s) describe a corpus that has "
               f"changed under them.", file=sys.stderr)
         return 1
-    if not ok and unchecked:
+    if not ok and (unchecked or unverifiable):
+        print("\ncheck_specs_fresh: nothing could be checked.", file=sys.stderr)
         return 2
-    print(f"check_specs_fresh: {ok} spec module(s) match the corpus they were generated from")
+    if unverifiable:
+        print(f"\ncheck_specs_fresh: {ok} spec module(s) match their corpus, but "
+              f"{len(unverifiable)} tracked spec module(s) are pinned to a corpus this tree "
+              f"cannot produce. This check does not speak for them.", file=sys.stderr)
+        return 3
+    print(f"check_specs_fresh: {ok} spec module(s) match the corpus they were generated from"
+          + (f"; {len(skipped)} untracked spec module(s) skipped" if skipped else ""))
     return 0
 
 

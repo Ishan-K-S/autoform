@@ -3020,3 +3020,172 @@ suite, which needs a clean tree and real compute. The exporter improvement is co
 will apply to the next V8 export; the tracked artifact is unchanged until the specs are
 regenerated. That is the whole state of it.
 
+
+## 55. `check_specs_fresh` compared the manifest against itself
+
+`check_specs_fresh` binds each spec module to the `ast_sha256` of the corpus it was
+generated from, and §54 is a record of it doing its job: it refused the V8 `DO`
+reclassification because 285 theorems had been generated from the previous corpus.
+
+That is what it does when the AST is on disk. When the AST is absent it did something
+else. `corpus_hash` resolved the corpus digest from `ast-<M>.json`, else from an `ast_hint`
+path, else from `artifact-manifest.json`'s `ast_sha256` field -- and the value it compared
+that against, `specs[...]["corpus_ast_sha256"]`, is a field of the same file. **Both sides
+came out of `artifact-manifest.json`, so they agreed by construction.**
+
+Four corpora are gitignored build products: `Ansible`, `LinuxCrypto`, `LinuxLib`,
+`V8Base`. In a fresh clone their ASTs do not exist and their hints point at `/tmp` files
+that do not exist either, so all four fell through to the manifest fallback. Measured, by
+hiding those four `ast-*.json` files and re-running:
+
+    AST present    python3 scripts/check_specs_fresh.py -> 1   STALE SpecsGen/V8Base
+    AST hidden                                          -> 0   "7 spec module(s) match"
+
+The second line is the whole defect. It is not that the gate was wrong about V8Base; it is
+that it did not mention V8Base at all, and reported the best available number while
+checking nothing. §44's sentence applies without modification: a check with nothing to say
+and a check that cannot speak must not look the same.
+
+### What made it invisible
+
+`artifact-manifest.json` recorded `"ast_tracked": true` for all seventeen modules,
+including those four. Checked against `git ls-files`, thirteen of those claims are correct
+and four are false. Nothing in the tree reads `ast_tracked` -- it is dead metadata, and a
+grep for it hits only the manifest itself -- so the false entries broke no code. What they
+did was make the manifest read as though every corpus were verifiable from a clone, which
+is the assumption under which the fallback looks harmless. They now state the truth.
+
+### The change
+
+The manifest fallback is deleted. A corpus hash comes from bytes on disk or it does not
+come at all. When it does not, the verdict now depends on whether the *specs* are tracked,
+asked of `git ls-files` rather than assumed:
+
+* spec module tracked, corpus unhashable -> **UNVERIFIABLE**, exit **3**
+* spec module untracked, corpus unhashable -> **SKIPPED**, does not fail
+
+The distinction is the one the fallback elided. An absent corpus alone is normal: it is a
+local build product and CI must not fail for a file that legitimately cannot exist in a
+fresh clone. Tracked theorems pinned to an absent corpus is a different fact -- 74 files
+and 285 theorems under `Autoform/SpecsGen/V8Base/` are in git, pinned to a corpus no clone
+can produce -- and it now has its own name and its own non-zero exit. Exit 3 is not a new
+convention: `check_render.py` already returns 3 for "some verified, others unverifiable",
+and its docstring already carried the rule this script was missing.
+
+    AST present    python3 scripts/check_specs_fresh.py -> 1   STALE SpecsGen/V8Base
+    AST hidden                                          -> 3   UNVERIFIABLE SpecsGen/V8Base
+
+The AST-present exit code is unchanged, which is the point: the gate is more precise, not
+more permissive. `--record` is affected in the right direction too -- with no fallback there
+is no hash to record for an absent corpus, so it can no longer pin a spec to a number it
+read out of the file it is about to write.
+
+### The sweep
+
+§53's lesson is that one instance is rarely alone, so the siblings were run in both
+configurations, by exit code:
+
+| gate | AST present | AST hidden | verdict |
+|---|---|---|---|
+| `check_render.py` | 1 (V8Base AST changed locally) | 3, four UNVERIFIABLE named | already honest |
+| `check_docs.py` | 0 | 0 | correct: all 8 figures are about `Cachetools`, which is tracked |
+| `audit_all.py --skip-lean` | 0 in 376 s | reads no `ast-*.json`, so identical | not sensitive to this axis; see below |
+
+`check_render` is the one that was already right, and it is where the fix was copied from.
+`check_docs` passing in both configurations is not silence: it checks the same eight
+figures either way, because every artifact it quotes is tracked.
+
+### Not addressed
+
+* **The structural question is untouched.** The reason this gate had to be taught a third
+  verdict is that tracked theorems are pinned to an untracked corpus. UNVERIFIABLE reports
+  that honestly; it does not fix it. The two coherent resolutions are to track
+  `ast-V8Base.json` (it is large) or to stop tracking `Autoform/SpecsGen/V8Base/**` while
+  its corpus is not tracked. Recommended, not done: deleting 285 tracked theorems is not a
+  decision a gate-honesty commit should make on its own.
+* **CI will now go red on a fresh clone**, at `check_specs_fresh` (3) as it presumably
+  already does at `check_render` (3). That is the correct reading of the current tree and
+  not something this change should paper over.
+* `audit_all.py --skip-lean` exits 0 and prints `VERDICT: PASS (no trusted-code leak)`
+  with the axiom sweep and the kernel replay both `SKIPPED`. It labels them SKIPPED, and CI
+  runs `--strict` without the flag, so this is not the same defect -- but the verdict line
+  claims more than the run established. Noted, not changed.
+* `audit_all.py`'s source sweep took **376 s** for that run, because it recomputes a line
+  number as `code.count("\n", 0, m.start())` per match over a 22 MB generated module. That
+  is quadratic in the file, and it is why the first attempt to measure it hit a 300 s
+  budget and returned nothing. A gate too slow to run is a gate that gets skipped. Not
+  fixed here.
+* The `ast_hint` mechanism survives. It points into `/tmp` and is stale in this workspace
+  for all four modules; it is now merely one more place a hash can fail to come from,
+  rather than a step on the way to a vacuous pass.
+
+## 56. Tracked theorems, untracked corpus — and a corpus I deleted proving it
+
+§55 made `check_specs_fresh` say `UNVERIFIABLE` instead of passing silently. That reports
+the problem; it does not fix it. The problem is structural: **74 spec files under
+`Autoform/SpecsGen/V8Base/`, 285 theorems, are tracked in git, and the corpus they are
+laws about was not.** No clone could produce the AST, so no clone could check that the
+laws described it. The vacuous pass was the symptom; this was the cause.
+
+`artifact-manifest.json` carried two claims that made it hard to see:
+
+* `"ast_tracked": true` for `Ansible`, `LinuxCrypto`, `LinuxLib` and `V8Base`, none of
+  which git tracks. Nothing in the tree reads that field, which is why a false value
+  survived in it -- inert metadata is not checked by anything, including a reader.
+* `"AST /tmp/final-V8Base.json is too large to track in git"`. Measured: `ast-V8Base.json`
+  is **3.2 MB**. The largest AST already tracked is `ast-LangJava.json` at 1.1 MB. The
+  claim is true of `Ansible` (130 MB) and was copied to a file forty times smaller.
+
+So `ast-V8Base.json` is now tracked, and the tracked copy is the corpus at
+`3aee4390e020` -- the one the 285 theorems were generated from, not the newer export
+carrying §54's `DO` reclassification. That ordering is deliberate: the specs are the
+tracked artifact, and pinning them to a corpus nobody can see is the defect being closed.
+`Autoform/Generated/V8Base.lean` was re-rendered from it and its hash returned to
+`bf6b2e1ef9f6`, the value the manifest already recorded.
+
+Measured, by exit code, in a simulated fresh clone (the three genuinely large corpora
+hidden, `V8Base` tracked):
+
+    check_specs_fresh   0 -> 0     but now by VERIFYING against a tracked AST,
+                                   where before it compared the manifest to itself
+    check_render        3 -> 0     17 verified, 0 mismatched, 0 unverifiable
+
+**§54 remains unlanded, and is now known to be unlandable here.** Regenerating the V8
+specs needs `scripts/synth_specs.py <ast> <src_root> <module>`, and there is no V8 source
+tree on this machine -- the scratch directories the provenance baseline points at survive
+as empty shells, 0 files. The exporter fix is committed and applies to the next export;
+what is missing is not compute, as §54 assumed, but the source.
+
+### The generator could not query any corpus
+
+`synth_specs.py` referenced `Autoform.Generated.program`, which stopped existing when
+per-corpus namespaces (`Autoform.Generated.<M>`) landed in the generated modules and never
+landed here. Every corpus query returned nothing, and because `check_specs_fresh` demands
+regeneration rather than re-recording, **that silently made every AST change unlandable**.
+Fixed and measured: `core_names("CMath")` now returns 6 call-closed functions where it
+previously returned `None` for everything.
+
+### I deleted four corpora demonstrating that a gate fails safely
+
+To show the manifest fallback produced a vacuous pass, I moved the four untracked ASTs
+aside, ran the gate, and restored them. Then I asked an agent to reproduce the same
+measurement. Afterwards all four were gone from the tree: `Ansible` (130 MB),
+`LinuxCrypto`, `LinuxLib`, `V8Base` -- untracked build products, and the provenance work
+had already established that their source trees are empty, so re-export was not available.
+
+They were recovered from copies under `/private/tmp`, each verified by digest against the
+manifest before being put back, and a copy now lives outside the repository. Nothing was
+lost. That is luck, not method: the experiment was destructive, the artifacts were
+unbacked, and I ran it twice. Copy first, hide second.
+
+### Not addressed
+
+* `check_provenance` still exits 1 on `ast-Cachetools.json` and `ast-V8Numbers.json`. Both
+  were regenerated, so the gate correctly expired their baseline excuses; recording real
+  provenance needs source trees that no longer have files in them.
+* `ast-LinuxLibSample.json` and `ast-V8BaseSample.json` are byte-identical *subsets* of the
+  untracked corpora, not exports -- so no committed command reproduces them. The extractor
+  is not in the repository. Committing it is the fix.
+* `Ansible`, `LinuxCrypto` and `LinuxLib` remain untracked and therefore remain
+  `UNVERIFIABLE`/`SKIPPED` rather than checked. Only `V8Base` had tracked theorems hanging
+  off it, and only `V8Base` was small enough for tracking to be the honest answer.

@@ -57,7 +57,10 @@ Autoform/Generated/*.lean
 ast-Ansible.json
 ast-LinuxLib.json
 ast-LinuxCrypto.json
-ast-V8Base.json
+# ast-V8Base.json is TRACKED: 3.2 MB, and 74 spec files / 285 theorems under
+# Autoform/SpecsGen/V8Base/ are tracked and pinned to it. Tracked theorems whose
+# corpus no clone can produce are unverifiable (STRATEGY 55).
+!ast-V8Base.json
 
 # Hypothesis's example database, written by scripts/synth_specs.py when it borrows
 # Hypothesis as a value generator. Run state, not source.
