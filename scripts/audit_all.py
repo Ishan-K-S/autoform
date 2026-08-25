@@ -259,6 +259,13 @@ def source_sweep() -> dict:
         rel = path.relative_to(REPO).as_posix()
         if rel.startswith(".lake/") or "/.lake/" in rel:
             continue
+        # `.claude/worktrees/<id>/` holds agent worktrees -- full checkouts of this
+        # repository. Without this the sweep walked 18 copies of every module, so a
+        # finding was reported at a path that is not the project, and `scanned` counted
+        # the same file many times. A gate that reports findings against copies of
+        # itself is noise, and noise is what a real finding hides in.
+        if rel.startswith(".claude/") or "/.claude/" in rel:
+            continue
         scanned += 1
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")

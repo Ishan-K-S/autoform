@@ -3189,3 +3189,20 @@ unbacked, and I ran it twice. Copy first, hide second.
 * `Ansible`, `LinuxCrypto` and `LinuxLib` remain untracked and therefore remain
   `UNVERIFIABLE`/`SKIPPED` rather than checked. Only `V8Base` had tracked theorems hanging
   off it, and only `V8Base` was small enough for tracking to be the honest answer.
+
+### 85% of the trust audit was reading copies of itself
+
+`audit_all.py`'s source sweep excluded `.lake/` and nothing else. Agent worktrees live at
+`.claude/worktrees/<id>/` and are full checkouts of this repository, so the sweep walked 18
+copies of every module: **811 files scanned, of which 688 -- 85% -- were worktree copies,
+leaving 123 real ones.** Every finding it printed from those paths named a file that is not
+the project, and `scanned` counted the same module many times.
+
+It never produced a wrong verdict; the Core claim is scoped to `Autoform/Lang/Core` and no
+worktree path is under it. But a gate whose output is 85% noise is a gate whose real
+finding has somewhere to hide, and the count it reports is not a count of anything. Now
+excluded, measured after: 0 lines from worktree paths, `VERDICT: PASS` unchanged.
+
+The worktrees are mine, created during this session's work. The contamination was
+self-inflicted and the fix belongs in the gate regardless -- a checkout of the repository
+inside the repository is a thing that will happen again.
