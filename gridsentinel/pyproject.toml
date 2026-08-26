@@ -1,0 +1,118 @@
+# GridSentinel packaging.
+#
+# The repository is a study, not a shipping product: read docs/PROOF.md and
+# docs/THREATMODEL.md before treating any claim here as a guarantee.  The
+# headline safety claim was falsified by a false-data-injection adversary
+# holding the local merging unit's key; the SPARK mirror in spark/ has never
+# been run through gnatprove; and the Z3 proofs are over the reals except for
+# the small layer-0 IEEE-754 fragment.
+#
+# macOS: run everything as `arch -arm64 .venv/bin/python ...` and never under
+# `timeout`.  See CONTRIBUTING.md.
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridsentinel"
+version = "0.4.0"
+description = "A substation protection appliance study: an untrusted ML plane proposes actuations, a small verified reference monitor gates every one."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+authors = [{ name = "GridSentinel study" }]
+keywords = ["protection-relay", "reference-monitor", "formal-verification",
+            "z3", "ics-security", "pandapower"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering",
+  "Topic :: Security",
+  "Private :: Do Not Upload",
+]
+
+# Ranges track requirements.txt (the floors) and add upper bounds at the next
+# major version, because every one of these has broken us across a major
+# before.  Versions actually exercised, on CPython 3.9.6 / macOS arm64:
+#   z3-solver 5.1.0.0, scikit-learn 1.6.1, hypothesis 6.141.1,
+#   pandapower 3.2.2, matplotlib 3.9.4, joblib 1.5.3, numpy 2.0.2.
+dependencies = [
+  "z3-solver>=4.13,<6",
+  "scikit-learn>=1.6,<2",
+  "pandapower>=3.2,<4",
+  "matplotlib>=3.7,<4",
+  "joblib>=1.3,<2",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0,<9",
+  "hypothesis>=6.100,<7",
+]
+lint = [
+  "ruff>=0.5",
+]
+dev = [
+  "pytest>=8.0,<9",
+  "hypothesis>=6.100,<7",
+  "ruff>=0.5",
+]
+
+[project.scripts]
+# Thin wrappers in gs/__main__.py.  They exist because run.py and
+# gs.verify.main() return result dictionaries rather than exit statuses, and
+# CI needs a process that fails.  gridsentinel-verify additionally gates on
+# the proof results: a regressed layer exits non-zero.
+gridsentinel-experiment = "gs.__main__:experiment_main"
+gridsentinel-attacks    = "gs.__main__:attacks_main"
+gridsentinel-verify     = "gs.__main__:verify_main"
+gridsentinel-report     = "gs.__main__:report_main"
+
+[tool.setuptools]
+packages = ["gs"]
+# The two harnesses live at the repository root and are owned by the harness
+# author; they are packaged as top-level modules rather than moved.
+py-modules = ["run", "run_v2"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q --strict-markers --strict-config"
+filterwarnings = [
+  "default",
+  # pandapower/numpy 2.x deprecation noise; not ours, and not silenced
+  # anywhere else so that it stays visible in the log rather than vanishing.
+  "ignore::DeprecationWarning:pandapower.*",
+]
+markers = [
+  "slow: episodes that solve a load flow per millisecond (the property tests)",
+]
+
+# ---------------------------------------------------------------------------
+# ruff (optional; `make lint` degrades to pyflakes, then to a syntax check)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py39"
+line-length = 79
+extend-exclude = [".venv", "out", "models", "spark"]
+
+[tool.ruff.lint]
+# Deliberately narrow.  gs/shield.py and gs/monitor.py are spec artifacts
+# written for readability by a reviewer, not for a style bot; a linter must
+# not be a reason to reformat a frozen proof target.
+select = ["E", "F", "W"]
+ignore = [
+  "E501",  # long lines: the comments in the spec artifacts carry the argument
+  "E741",  # `l` reads fine as a line index in the power-system code
+]
+
+[tool.ruff.format]
+quote-style = "preserve"

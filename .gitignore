@@ -73,3 +73,7 @@ ast-LinuxCrypto.json
 !Autoform/Generated/V8BaseSample.lean
 !Autoform/Generated/LinuxLibSample.lean
 !Autoform/Generated/CMath.lean
+
+# Agent worktrees: full checkouts of this repository (12 GB). Never tracked;
+# also excluded from audit_all.py's source sweep, see STRATEGY.md 56.
+.claude/
