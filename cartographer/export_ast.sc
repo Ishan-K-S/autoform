@@ -21,10 +21,21 @@
 // Run: joern --script cartographer/export_ast.sc --param cpgPath=... --param out=ast.json
 
 import io.shiftleft.codepropertygraph.generated.nodes._
+import scala.annotation.tailrec
 
 @main def exec(cpgPath: String, out: String = "ast.json", maxMethods: Int = 100000,
                dataModel: String = "lp64") = {
   importCpg(cpgPath)
+
+  // `seqOf` and `moduleObjectsInit` (below) both fold a flat statement list into a
+  // right-nested `"seq"` chain; `maxSeqChainLen` tracks the longest one either producer
+  // has built so far. Declared here (rather than next to `writeJson`, which uses it) so
+  // every use -- including `moduleObjectsInit`'s, which appears earlier in this file --
+  // is a backward, not forward, reference; Scala's forward-reference check otherwise
+  // rejects a `def` defined before this `var` reading it. See `writeJson`'s own comment
+  // (search "seqChainCompactThreshold") for what this threshold is actually for.
+  var maxSeqChainLen = 0
+  val seqChainCompactThreshold = 1000
 
   // CPG operator name -> Core binary operator.
   //
@@ -210,6 +221,9 @@ import io.shiftleft.codepropertygraph.generated.nodes._
   var syncElided: Int = 0
   var metaElided: Int = 0
   var useElided: Int = 0
+  // `006-reduce-remaining-holes`, Story 3: counter for `freshExprVTemp`'s
+  // never-collides synthetic name (a postfix increment/decrement used as a value).
+  var exprVTempCounter: Int = 0
 
   /** Kernel declaration macros that emit METADATA, not code.
     *
@@ -254,6 +268,17 @@ import io.shiftleft.codepropertygraph.generated.nodes._
 
 
   def kidsOf(n: AstNode): List[AstNode] = n.astChildren.collect { case a: AstNode => a }.l
+
+  /** A block's source text with its braces and any comments stripped, leaving only
+    * what would actually execute. Distinguishes a genuinely empty `{}` body (or a
+    * documented no-op like `{ /* NO-OP */ }`) from a body the C frontend failed to
+    * parse into any AST children despite the source showing real statements --
+    * confirmed against the SQLite CPG, where every zero-child block's stripped code
+    * is either empty or at least 7 characters, with nothing in between. */
+  def stripBlockCode(code: String): String = {
+    val braceless = code.trim.stripPrefix("{").stripSuffix("}").trim
+    braceless.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "").trim
+  }
 
   /** Joern's ARGUMENT index: -1 = the callee/receiver expression, 0 = the implicit
     * `self`/`this` the Python frontend threads through, >=1 = the real arguments. */
@@ -768,8 +793,20 @@ import io.shiftleft.codepropertygraph.generated.nodes._
         moduleMembers(m).map { case (f, v) =>
           ujson.Obj("k" -> "setField", "r" -> moduleRef(m), "f" -> f, "v" -> v)
         })
-      val body = (allocs ++ sets).foldRight(ujson.Obj("k" -> "skip"): ujson.Value)((s, acc) =>
-        ujson.Obj("k" -> "seq", "a" -> s, "b" -> acc))
+      // Same iterative right-to-left construction as `seqOf`, and the same reason: an
+      // O(1)-JVM-stack loop in place of `foldRight`, for this feature's second unbounded
+      // producer of the same "seq" shape (research.md item 2).
+      val body: ujson.Value = {
+        val xs = (allocs ++ sets).toArray
+        if (xs.length > maxSeqChainLen) maxSeqChainLen = xs.length
+        var acc: ujson.Value = ujson.Obj("k" -> "skip")
+        var i = xs.length - 1
+        while (i >= 0) {
+          acc = ujson.Obj("k" -> "seq", "a" -> xs(i), "b" -> acc)
+          i -= 1
+        }
+        acc
+      }
       // The `:<module>` suffix is what `render_lean.py` recognises as an initializer;
       // emitting this entry before the real ones puts it first in `moduleInits`, so every
       // module object exists before any module body runs.
@@ -835,6 +872,96 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     * cannot be defeated by a missing header. */
   var valueReceivers = Set.empty[String]
   var ptrReceivers   = Set.empty[String]
+
+  /** `003-box-address-taken-locals`: names of every local/parameter of the method
+    * being translated whose address is taken anywhere in its body, restricted to the
+    * "local" shape (see `addrShape`) and excluding the already-handled aggregate
+    * identity case -- see `boxableName` below for the exact eligibility predicate.
+    * Populated once per `emit(m, isModule)` call and reset after, matching every
+    * other per-method `var` in this file (`moduleScope`, `declaredGlobals`, etc.).
+    * A name in this set has every plain read/write/address-of reference to it,
+    * anywhere in the method, routed through a boxed heap cell instead of an ordinary
+    * binding (`expr`'s `Identifier`/`MethodParameterIn` cases, `assignTo`, `incrStmt`,
+    * and the `<operator>.addressOf` case in `callExpr`). */
+  var boxedLocals = Set.empty[String]
+
+  /** `003-box-address-taken-locals`: `pointerLocalName -> boxedLocalName`, for a
+    * pointer-typed local that is PROVABLY, syntactically, an alias of one specific
+    * boxed local for its entire lifetime in this method -- i.e. `p = &n` is the ONLY
+    * assignment to `p` anywhere in the method (mirroring this file's own
+    * `boundMethods` precedent: a name is trusted as "the" binding only when the
+    * function assigns it in exactly one place -- see `emit` for the computation).
+    *
+    * This is what makes `*p`/`*p = v` translatable without a general points-to
+    * analysis: `<operator>.indirection`'s operand is almost never the boxed name
+    * itself (`&n` is usually assigned to a separate pointer variable `p`, then
+    * dereferenced through `p`, not written as the redundant `*(&n)`), so the
+    * indirection sites (`callExpr`'s `<operator>.indirection` case, and the matching
+    * write case in `assignTo`) resolve through THIS map, not through `boxedLocals`
+    * directly. A `p` reassigned to anything else anywhere in the method -- including
+    * to a different boxed local's address -- is deliberately EXCLUDED (not merely
+    * approximated): the "exactly one assignment, and it is this shape" requirement is
+    * stronger than `boundMethods`'s own "exactly one ADDRESS-OF-shaped assignment"
+    * check, because a `p` that is later repointed elsewhere and then dereferenced
+    * must fall through to today's hole, not silently keep reading `n`'s box -- the
+    * exact silent-wrong failure mode Constitution Principle III forbids. */
+  var ptrAliases = Map.empty[String, String]
+
+  /** `003-box-address-taken-locals`, Increment B: names of parameters of THIS method
+    * that are dereferenced (`*p`/`*p = v`) and have been verified, across the WHOLE
+    * analyzed program, to satisfy FR-006's closed-call-site precondition
+    * (`closedOutParam` below) -- so `p` itself, not some OTHER name it aliases,
+    * already directly holds the caller's `Val.ref` and can be read/written through
+    * `Expr.field`/`Stmt.setField` with no `boxNew` prologue of its own (unlike a
+    * boxed local/parameter, `p`'s VALUE, not `p`'s identity, is the thing that was
+    * boxed -- by the CALLER's own boxing of the local whose address it passed).
+    * Disjoint from `boxedLocals` by construction (a parameter whose OWN address is
+    * taken within this method is Increment A's parameter-boxing case, not this one).
+    * Populated once per `emit` call and reset after, matching every other per-method
+    * `var` in this file. */
+  var closedOutParams = Set.empty[String]
+
+  /** `004-function-pointer-tracking`: `varName -> resolvedFunctionName`, for every
+    * local/parameter of THIS method that is assigned a known, non-capturing,
+    * in-program function or method value in exactly one place in the entire method
+    * (whole-function single-assignment, mirroring `003-box-address-taken-locals`'s
+    * own `ptrAliases` precedent exactly, applied to a different value shape -- a
+    * function reference instead of an address-of-a-local). `resolvedFunctionName` is
+    * already in the exact form `fnValue`/`mangledFullName` would use for a direct
+    * call, so a `pointerCall` resolved through this map renders byte-identical to
+    * what the exporter would already emit for a source-level direct call to that
+    * function. Populated once per `emit` call and reset after, matching every other
+    * per-method `var` in this file. */
+  var fnPtrVars = Map.empty[String, String]
+
+  /** `006-reduce-remaining-holes`, Story 5: array-typed locals of THIS method
+    * admitted under the scope boundary (research.md §5.3, generalising `003`'s
+    * Increment A from scalars to aggregates) -- `name -> element count`. A name
+    * here gets an unconditional `boxFields` allocation prologue (one field per
+    * element, decimal-string-keyed) and every `a[i]`/`&a[i]`/bare-`a`-as-pointer
+    * site is rewritten through it. Populated once per `emit` call and reset after,
+    * matching every other per-method `var` in this file. */
+  var boxedArrays = Map.empty[String, Int]
+
+  /** `006-reduce-remaining-holes`, Story 5: struct-typed locals of THIS method
+    * admitted under the same scope boundary -- `name -> member-name list`. Also
+    * closes research.md §5.1's latent gap (a plain struct local that looked
+    * hole-free but silently depended on a `setField` special case that did not
+    * cover it) for every struct this admits, as a structural consequence of the
+    * unconditional prologue. */
+  var boxedStructs = Map.empty[String, List[String]]
+
+  /** `006-reduce-remaining-holes`, Story 5: plain (unboxed) pointer-typed locals
+    * PROVABLY, for their whole lifetime in this method, holding an interior
+    * pointer VALUE -- `p = &a[i]`, `p = &s.f`, or `p = a` (array-to-pointer decay),
+    * as the ONLY assignment to `p` anywhere in the method (mirroring `ptrAliases`'s
+    * own whole-function single-assignment discipline). Unlike `ptrAliases`, no
+    * resolution target is needed: `p` itself already holds the `Val.iref` value
+    * directly (an interior pointer is a VALUE, not a box), so `*p`/`*p = v`/`p++`
+    * read/write/bump `p`'s own binding via `derefIref`/`setDerefIref`/ordinary
+    * `binop` arithmetic (`applyBinop`'s new `Val.iref` arms) -- no allocation of
+    * any kind for `p`. */
+  var ptrIrefNames = Set.empty[String]
 
   /** `(owning type, member name) -> member type`, for the whole program. */
   lazy val memberTypes: Map[(String, String), String] =
@@ -1034,6 +1161,63 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     res
   }
 
+  /** `005-sizeof-constant-folding`: byte count of a SCALAR type under the resolved
+    * data model -- `resolveIntType`'s width label (`"i32"`/`"u64"`/...) divided by
+    * 8, reused exactly as `<operator>.cast` already computes it, plus one
+    * `sizeof`-specific addition `resolveIntType` deliberately does not cover: bare
+    * `char`/`signed char`/`unsigned char` is unconditionally 1 byte, guaranteed by
+    * the C standard itself regardless of data model -- unlike `resolveIntType`'s
+    * OTHER exclusion of bare `char` (correct and load-bearing there: char's
+    * *signedness* is implementation-defined, which matters for a cast's wrapping
+    * behaviour and does not matter for a byte count). Deliberately NOT added to
+    * the shared `intTypeNames` table -- that would silently change
+    * `<operator>.cast`'s own, unrelated, already-correct behaviour for an
+    * unrequested reason. `None` for anything this cannot resolve (an aggregate, an
+    * opaque type, or a data-model-dependent type under an unspecified model). */
+  def scalarSizeofBytes(ty: String): Option[Int] =
+    if (Set("char", "signedchar", "unsignedchar").contains(bareType(ty))) Some(1)
+    else resolveIntType(ty).map(w => w.drop(1).toInt / 8)
+
+  /** `005-sizeof-constant-folding`: a pointer's `sizeof` is not a per-type fact at
+    * all -- it is definitionally the target data model's own pointer width, the
+    * same three `dataModel` values `dataModelTable` is already keyed by (LP64/
+    * LLP64 = Pointers are 64-bit; ILP32 = Pointers are 32-bit). `None` for an
+    * unspecified/unlisted model, mirroring `resolveIntType`'s own "guessing a
+    * width silently is exactly the defect this exists to prevent" rule. */
+  def pointerSizeofBytes: Option[Int] = dataModel.toLowerCase match {
+    case "lp64" | "llp64" => Some(8)
+    case "ilp32"          => Some(4)
+    case _                => None
+  }
+
+  /** `005-sizeof-constant-folding`: `<element>[<N>]`, matching the OUTERMOST
+    * dimension of a (possibly multi-dimensional) array's `typeFullName`.
+    * `sizeofBytes` below recurses on `<element>`, which naturally unwinds a
+    * multi-dimensional shape one dimension per call -- confirmed directly against
+    * a live CPG, not assumed: `int arr[4][8]` is `typeFullName = "int[4][8]"`
+    * (nested bracket suffixes, outermost last), so `sizeofBytes` on it correctly
+    * computes `4 (int) * 4 * 8 = 128`. Research.md's own Phase 0 pass originally
+    * scoped this to one dimension only because the multi-dimensional shape had not
+    * yet been checked against a live CPG at spec-writing time; verified during
+    * implementation and folded in here rather than left an unmeasured guess, per
+    * this project's own "measure, don't assume" standard applied to a scope
+    * decision made mid-implementation, not just at planning time. */
+  val arrayShape = """^(.+)\[(\d+)\]$""".r
+
+  /** `005-sizeof-constant-folding`: byte count of a `sizeof` operand's type, trying
+    * each resolvable shape in turn. The ARRAY check MUST run before the pointer
+    * check, not after: `isPointerType` (used elsewhere in this file for the
+    * genuinely correct reason that an array decays to a pointer in expression
+    * context) would otherwise classify `char[16]` as pointer-shaped and silently
+    * return the POINTER width instead of the array's actual size -- a wrong
+    * answer, not merely a missed case. Found and fixed before any code shipped, by
+    * reading `isPointerType`'s own definition rather than assuming shape checks
+    * commute. */
+  def sizeofBytes(ty: String): Option[Int] = bareType(ty) match {
+    case arrayShape(elem, n) => sizeofBytes(elem).map(_ * n.toInt)
+    case _                   => scalarSizeofBytes(ty).orElse(if (isPointerType(ty)) pointerSizeofBytes else None)
+  }
+
   /** Is the target of a cast a pointer or a reference?
     *
     * This cannot be decided from `typeFullName` alone, and the failure was live: for
@@ -1116,6 +1300,106 @@ import io.shiftleft.codepropertygraph.generated.nodes._
          aggregateNames.contains(b)
   }
 
+  // ---- `006-reduce-remaining-holes`, Story 4: struct/union `sizeof` ----------
+
+  /** Every `TypeDecl` of the program, by its bare (tag-stripped) name -- `cpg.typeDecl`
+    * itself, not `aggregateNames`, because layout resolution needs the member LIST,
+    * not merely a name to test membership against. */
+  lazy val typeDeclsByName: Map[String, List[TypeDecl]] = cpg.typeDecl.l.groupBy(td => bareType(td.fullName))
+
+  /** The `TypeDecl` actually carrying `ty`'s members, if this program has one --
+    * `.find(_.member.nonEmpty)` skips a forward-only declaration in favour of the
+    * real definition, mirroring `structTypeDeclOf`'s own callers' need for a member
+    * LIST, not merely a name. */
+  def structTypeDeclOf(ty: String): Option[TypeDecl] =
+    typeDeclsByName.get(bareType(ty)).flatMap(_.find(_.member.nonEmpty))
+
+  /** A bitfield member (research.md §4): `typeFullName` alone stays the plain base
+    * type (`int x : 3` has `typeFullName=int`), so the width survives only in the
+    * member's own surface text -- the same "read `.code` when the type alone does
+    * not carry the fact" pattern `castTargetIsPointer` already established. No
+    * attempt is made to sum bitfield widths into a byte count: C's own bit-to-byte
+    * packing for adjacent bitfields is itself platform/ABI-defined, and this
+    * project has no existing model for it. */
+  val bitfieldSuffix = """:\s*\d+\s*$""".r
+  def isBitfieldMember(m: Member): Boolean = bitfieldSuffix.findFirstIn(m.code).isDefined
+
+  /** A struct-level packing/alignment attribute, visible verbatim on `TypeDecl.code`
+    * (research.md §4). Disqualifies the whole struct unconditionally -- not
+    * narrowed to specifically `packed`/`aligned`, the same conservative-by-
+    * construction choice `005`'s own `modelDependentNames` gate already made,
+    * because distinguishing a layout-affecting attribute from an unrelated one
+    * (`__attribute__((deprecated))`) would need a hardcoded allowlist that could
+    * misclassify an attribute never tested against a live corpus. */
+  def hasPackingAttribute(td: TypeDecl): Boolean =
+    td.code.contains("__attribute__") || td.code.contains("#pragma pack")
+
+  /** A member's own size: `sizeofBytes` for a scalar/pointer/array-of-scalar member,
+    * recursing into `aggregateSizeofBytes` below for a member that is itself an
+    * aggregate (research.md §4's scope correction -- resolved HERE, statically,
+    * not deferred to Story 5's runtime heap model), and recursing through
+    * `sizeofBytes`'s own `arrayShape` one dimension at a time for an array of
+    * aggregates.
+    *
+    * A flexible array member is checked EXPLICITLY, first, rather than trusted to
+    * fall through: research.md §4 assumed `char[]` (a flexible array member's own
+    * `typeFullName`, confirmed live) already reaches `None` via `sizeofBytes`'s
+    * `arrayShape` regex requiring a digit, PLUS `isPointerType` rejecting it too --
+    * checked directly against a live fixture during implementation (not merely
+    * re-trusted from the citation) and found WRONG for the second half:
+    * `isPointerType`'s own `.*\[.*\]` regex matches EMPTY brackets as readily as
+    * a sized array, so `char[]` silently fell through to the POINTER width (8),
+    * not `None` -- exactly the "well-typed, hole-free, silently wrong" failure
+    * mode this whole project exists to catch, caught here before it shipped. */
+  def memberSizeofBytes(ty: String): Option[Int] = bareType(ty) match {
+    case t if t.endsWith("[]")  => None
+    case arrayShape(elem, n)    => memberSizeofBytes(elem).map(_ * n.toInt)
+    case _ => sizeofBytes(ty).orElse(if (isClassType(ty)) aggregateSizeofBytes(ty) else None)
+  }
+
+  /** `006-reduce-remaining-holes`, Story 4 (FR-009/FR-010): the byte size of a
+    * struct or union whose full layout is resolvable -- standard C aggregate
+    * layout, each member placed at the next offset that is a multiple of its own
+    * alignment (alignment == the member's own resolved size, consistent with this
+    * project's existing scalar-sizing convention), a union's members instead all
+    * overlapping at offset zero, and the whole aggregate's size rounded up to its
+    * own alignment (the max of its members'). `None` -- stays the existing
+    * `op:sizeOf:object` hole, unrelabelled, exactly as today -- when the struct
+    * itself carries a packing attribute, has no member list this program can see,
+    * or any one member is a bitfield or has its own unresolvable size. */
+  def aggregateSizeofBytes(ty: String): Option[Int] =
+    structTypeDeclOf(ty).flatMap { td =>
+      if (hasPackingAttribute(td)) None
+      else {
+        val members = td.member.l
+        if (members.isEmpty) None
+        else {
+          val isUnion = td.code.trim.startsWith("union")
+          var offset = 0
+          var maxSize = 0
+          var maxAlign = 1
+          var ok = true
+          members.foreach { m =>
+            if (ok) {
+              if (isBitfieldMember(m)) ok = false
+              else memberSizeofBytes(m.typeFullName) match {
+                case Some(sz) if sz > 0 =>
+                  if (sz > maxAlign) maxAlign = sz
+                  if (isUnion) { if (sz > maxSize) maxSize = sz }
+                  else { offset = ((offset + sz - 1) / sz) * sz; offset += sz }
+                case _ => ok = false
+              }
+            }
+          }
+          if (!ok) None
+          else {
+            val raw = if (isUnion) maxSize else offset
+            Some(((raw + maxAlign - 1) / maxAlign) * maxAlign)
+          }
+        }
+      }
+    }
+
   /** A hole label naming what kind of address defeated us, so the ledger separates
     * "pointer to a number" (which needs a location model) from "we could not tell"
     * (which needs better types). */
@@ -1150,6 +1434,228 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     // model — which is why it must not be filed under either of the other two.
     else                           "opaque-type"
   }
+
+  /** `003-box-address-taken-locals`: is `&n` (for `n` the sole operand of an
+    * `<operator>.addressOf` call) the pre-existing "identity" case -- an object whose
+    * own value already IS its address, needing no box? Extracted out of the
+    * `<operator>.addressOf` case in `callExpr` below so the boxing pre-scan
+    * (`boxableName`) and the translation itself can never drift apart: both must
+    * agree on exactly the same non-aggregate locals, or a name could be added to
+    * `boxedLocals` that the addressOf site still treats as an identity (or vice
+    * versa), either of which is a wrong translation, not a hole. */
+  def addressOfIsAggregate(n: AstNode): Boolean = {
+    val ty = staticTypeOf(n)
+    val nm = n match { case i: Identifier => Some(i.name); case _ => None }
+    isClassType(ty) ||
+    (addrKind(ty) == "unknown-type" &&
+     nm.exists(nn => valueReceivers.contains(nn) && !ptrReceivers.contains(nn)))
+  }
+
+  /** The declared (un-mapped) name of `n`, if `n` is a local variable or parameter
+    * reference -- `None` for anything else, in particular for a `this` reached as
+    * something other than a plain identifier. */
+  def rawLocalOrParamName(n: AstNode): Option[String] = n match {
+    case i: Identifier        => Some(i.name)
+    case p: MethodParameterIn => Some(p.name)
+    case _                    => None
+  }
+
+  /** `003-box-address-taken-locals`: if `n` (the sole operand of an `&`) is eligible
+    * to be boxed under this feature's scope, the name it is tracked under in
+    * `boxedLocals` (`localName`-mapped, matching every site that reads or writes it
+    * through `expr`/`assignTo`) -- `None` otherwise, meaning `&n` falls through to
+    * the existing hole path unchanged.
+    *
+    * Four conditions, each closing a real way this could go silently wrong rather
+    * than staying an honest hole:
+    *
+    *   - `addrShape(n) == "local"` (FR-001's scope: a plain local or parameter, not
+    *     an array element, struct field, or call result).
+    *   - not the pre-existing aggregate identity case (`addressOfIsAggregate`) --
+    *     that path already works and must not be disturbed (FR-007).
+    *   - `n`'s raw name is a key of `localTypes`, i.e. an ACTUAL local or parameter
+    *     `Local`/`MethodParameterIn` of the method being translated right now, not
+    *     merely an identifier that happens to resolve to a global at read time.
+    *   - not `moduleScope` (a `<module>` pseudo-method's identifiers are file-level
+    *     globals: every assignment there is `setGlobal`, not `assign`, and a boxed
+    *     local's write-rewrite assumes `assign`/`setField`, which would silently
+    *     create a phantom local invisible to every `setGlobal` read elsewhere), not a
+    *     name a `global` statement rebound (`declaredGlobals`, same reason), and not
+    *     `this` in a C++ method (`this`/`self` is bound by `applyFunc`'s receiver
+    *     mechanism, not through `bindParams`'s ordinary parameter list -- boxing it
+    *     would corrupt every method-call dispatch on `self` in the function, not just
+    *     the address-of site). */
+  /** The AST parent of a node, or `None` for a root. `astParent` throws on a root. */
+  def parentOf(n: AstNode): Option[AstNode] = scala.util.Try(n.astParent).toOption
+
+  def boxableName(n: AstNode): Option[String] =
+    if (moduleScope || addrShape(n) != "local" || addressOfIsAggregate(n)) None
+    else rawLocalOrParamName(n).filter(raw =>
+      localTypes.contains(raw) && !declaredGlobals.contains(raw) &&
+      !(cppFile && raw == "this")
+    ).map(localName)
+
+  /** `003-box-address-taken-locals`: does `&x` (the `addressOf` call `c`) feed
+    * directly into an argument position of a call to something OTHER than an
+    * in-program function -- an external/library call, e.g. `scanf("%d", &n)`?
+    *
+    * spec.md's own edge cases are explicit that this case "stays a hole, exactly as
+    * today... Core cannot know what an untranslated function does to the pointee" --
+    * and `SC-001` scopes its measured hole-count reduction to locals "passed only to
+    * in-program functions or dereferenced directly", not to every address-taken
+    * local unconditionally. `methodByName` (built from `cpg.method.isExternal(false)`)
+    * is the same "is this actually one of our own functions" evidence every other
+    * resolution in this file already uses.
+    *
+    * Deliberately DIRECT/syntactic only: `p = &n; scanf("%d", p);` (the address
+    * reaching an external call through an intermediate alias, not `&n` itself as the
+    * argument) is NOT traced here -- doing so would need the same general dataflow
+    * analysis this feature's whole design avoids. That gap does not risk a WRONG
+    * answer regardless (Core's hole propagation aborts the entire dynamic execution
+    * at the first hole reached, including the external call's own -- so a stale
+    * boxed value can never be observed after it), only a less precise hole label for
+    * an already-untranslated external call; closing it further is future work, not a
+    * soundness gap in what ships here. */
+  def addressOfFeedsExternalCall(c: Call): Boolean = parentOf(c) match {
+    case Some(p: Call) if !p.methodFullName.startsWith("<operator>") =>
+      !methodByName.contains(p.methodFullName)
+    case _ => false
+  }
+
+  // ---- `006-reduce-remaining-holes`, Story 5: interior pointers -------------
+
+  /** Does call-argument node `k` (`aidx(k) >= 1`) feed `nm`'s own value to the
+    * call -- either directly (a bare identifier/parameter reference, including
+    * array-to-pointer decay), or through exactly one layer of `&` (address-of),
+    * INCLUDING `&nm[i]`/`&nm.f` (the address of one ELEMENT/FIELD still lets the
+    * callee write into `nm`'s own storage from outside this function -- exactly
+    * the cross-function escape research.md §5.3's scope boundary excludes;
+    * confirmed live, this session, against `helper(&a[0])`, which this check
+    * originally missed by only recognizing a BARE name under `&`, not an index/
+    * field access rooted at one). Used to detect whether an array/struct local
+    * ESCAPES this function via a call argument, matching research.md §5.3's
+    * scope boundary ("never passed as an argument to any call, in-program or
+    * external, by value or by address"). Deliberately shallow, matching
+    * `addressOfFeedsExternalCall`'s own "direct/syntactic only" precedent: a
+    * name reaching a call through an intermediate alias is not traced here. */
+  def argFeedsName(k: AstNode, nm: String): Boolean = k match {
+    case i: Identifier        => localName(i.name) == nm
+    case p: MethodParameterIn => p.name == nm
+    case c: Call if c.methodFullName == "<operator>.addressOf" =>
+      kidsOf(c) match {
+        case List(x) =>
+          argFeedsName(x, nm) ||
+          asIndex(x).exists { case (r, _) => rawLocalOrParamName(r).map(localName).contains(nm) } ||
+          asField(x).exists { case (r, _) => rawLocalOrParamName(r).map(localName).contains(nm) }
+        case _ => false
+      }
+    case _ => false
+  }
+
+  /** `&a[i]`/`&s.f` once the receiver is a recognized boxed array/struct local
+    * -- the two shapes `<operator>.addressOf` rewrites to `Expr.irefIndex`/
+    * `Expr.irefField` instead of the existing aggregate-identity/hole paths. */
+  def boxedArrayIndexOperand(n: AstNode): Option[(String, AstNode)] =
+    asIndex(n).flatMap { case (recv, idx) =>
+      rawLocalOrParamName(recv).map(localName).filter(boxedArrays.contains).map(_ -> idx)
+    }
+  def boxedStructFieldOperand(n: AstNode): Option[(String, String)] =
+    asField(n).flatMap { case (recv, f) =>
+      rawLocalOrParamName(recv).map(localName).filter(boxedStructs.contains).map(_ -> f)
+    }
+
+  /** `003-box-address-taken-locals`, Increment B: every call site in the whole
+    * analyzed program, and every function used as a VALUE (`MethodRef` -- evidence
+    * its address was taken and it could be called indirectly), each computed once
+    * and reused by every `closedOutParam` check rather than re-querying `cpg` per
+    * candidate parameter. */
+  lazy val allCalls: List[Call] = cpg.call.l
+  // Joern's C frontend emits a `MethodRef` for EVERY function, as a per-file
+  // declaration/linking marker (`argumentIndex == -1`, its AST parent the file-level
+  // BLOCK) -- confirmed empirically against a two-function fixture where neither
+  // function's address was ever taken in source, yet both appeared in `cpg.methodRef`
+  // unfiltered. `stmt()`'s own pre-existing `case m: MethodRef => skip` (a nested
+  // `def`'s declaration marker) draws exactly this same distinction for the same
+  // reason. A GENUINE function-pointer use (`fp = helper;`) is instead an operand of
+  // a real expression -- its `argumentIndex` is not `-1` and its parent is not a bare
+  // block -- so filtering to `aidx(mr) != -1` recovers the true signal.
+  lazy val takenAsValueFns: Set[String] =
+    cpg.methodRef.l.filter(mr => aidx(mr) != -1).map(_.methodFullName).toSet
+
+  /** `003-box-address-taken-locals`, Increment B: FR-006's closed-call-site
+    * precondition. Is parameter position `paramIndex` (Joern's own `ARGUMENT_INDEX`/
+    * `MethodParameterIn.index` convention, so no separate off-by-one translation is
+    * needed against `aidx`) of function `fn` safe to treat as an out-parameter --
+    * does EVERY call site of `fn`, across the whole analyzed program, pass that
+    * position a direct `&x` for a non-aggregate name, AND is `fn`'s own address never
+    * taken anywhere (so it cannot be called indirectly, sidestepping this very
+    * check)?
+    *
+    * This exists because `Heap.getField`'s "missing field returns `unit`" behaviour
+    * would otherwise silently turn one bad caller into a wrong answer rather than a
+    * hole (research.md item 3) -- `fn`'s translation is a single, fixed
+    * interpretation shared by every caller, so this must hold for ALL of them, not
+    * just the one call site currently being translated.
+    *
+    * Deliberately more conservative than `boxableName`'s own aggregate check, for a
+    * reason specific to this whole-program setting: `boxableName`'s
+    * "unknown-type inferred from a sibling `.`/`->` in the SAME method" heuristic
+    * (`valueReceivers`/`ptrReceivers`) is per-CALLER-method state this function
+    * would have to recompute for every one of `fn`'s potentially-many, potentially-
+    * different callers to use correctly -- not impossible, but real additional work
+    * this feature does not attempt. Instead, an argument only qualifies when its
+    * OWN static type is definitely non-class and definitely not `unknown-type`; an
+    * unresolved type at a call site is treated as UNSAFE. This can only exclude
+    * MORE parameters than a fuller per-caller analysis would, never wrongly include
+    * one — the direction FR-006 requires ("MUST NOT receive this translation" unless
+    * provably safe), at the cost of leaving some real, safe cases as holes rather
+    * than guessing. */
+  def closedOutParam(fn: Method, paramIndex: Int): Boolean =
+    if (takenAsValueFns.contains(fn.fullName)) false
+    else {
+      val callSites = allCalls.filter(_.methodFullName == fn.fullName)
+      callSites.nonEmpty && callSites.forall { c =>
+        kidsOf(c).find(aidx(_) == paramIndex).exists {
+          case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+            kidsOf(addr) match {
+              case List(n) if addrShape(n) == "local" =>
+                val ty = staticTypeOf(n)
+                !isClassType(ty) && addrKind(ty) != "unknown-type"
+              case _ => false
+            }
+          case _ => false
+        }
+      }
+    }
+
+  /** `004-function-pointer-tracking`: the name of the variable a `pointerCall`'s
+    * callee (the child at `argumentIndex == -1`) reads, if it is one of the two
+    * shapes confirmed against the CPG (research.md §4) -- a bare
+    * `Identifier`/`MethodParameterIn` (implicit call syntax, `op(...)`), or an
+    * `<operator>.indirection` wrapping one (explicit-dereference syntax,
+    * `(*op)(...)`) -- unwrapping exactly the one optional indirection layer, no more.
+    * `None` for anything else (a struct-field/array-element callee, or any other
+    * shape), which is exactly the set of calls that must stay the existing hole. */
+  def pointerCallCalleeVar(c: Call): Option[String] = {
+    def nameOf(n: AstNode): Option[String] = n match {
+      case i: Identifier        => Some(localName(i.name))
+      case p: MethodParameterIn => Some(p.name)
+      case _                    => None
+    }
+    kidsOf(c).find(aidx(_) == -1).flatMap {
+      case ind: Call if ind.methodFullName == "<operator>.indirection" =>
+        kidsOf(ind) match { case List(n) => nameOf(n); case _ => None }
+      case n => nameOf(n)
+    }
+  }
+
+  /** `Expr.name nm` -- the box's own reference, e.g. what `&x` evaluates to once `x`
+    * is boxed, or what a boxed local's declared-type-preserving reference looks like. */
+  def boxRef(nm: String): ujson.Obj = ujson.Obj("k" -> "name", "v" -> nm)
+
+  /** `Expr.field (Expr.name nm) "v"` -- a read of a boxed local/parameter's one
+    * field, i.e. the value it stands for everywhere it is read as a plain name. */
+  def boxField(nm: String): ujson.Obj = ujson.Obj("k" -> "field", "a" -> boxRef(nm), "f" -> "v")
 
   /** `import p.q` / `from <prefix> import <name>`.
     *
@@ -1496,7 +2002,21 @@ import io.shiftleft.codepropertygraph.generated.nodes._
           // be inventing a value.
           else hole("lit:unquoted")
       }
+    // `003-box-address-taken-locals`: a plain read of a boxed local/parameter reads
+    // the box's one field instead of the name directly -- `x` itself now holds the
+    // `Val.ref`, not the value (see `boxedLocals`, `boxableName`).
+    case i: Identifier if boxedLocals.contains(localName(i.name)) => boxField(localName(i.name))
+    // `006-reduce-remaining-holes`, Story 5: array-to-pointer decay -- a boxed
+    // array read as a bare VALUE (an assignment RHS, a binop operand, ...) is,
+    // in C, the address of its first element; `&a[i]`/`a[i]` themselves are
+    // intercepted earlier (`callExpr`'s `addressOf`/`indexOps` cases), never
+    // reaching this generic identifier-read case, so this rule cannot fire on
+    // those and mistranslate an ordinary index into a decayed pointer.
+    case i: Identifier if boxedArrays.contains(localName(i.name)) =>
+      ujson.Obj("k" -> "irefIndex", "a" -> ujson.Obj("k" -> "name", "v" -> localName(i.name)),
+                "i" -> intLit(0))
     case i: Identifier        => ujson.Obj("k" -> "name", "v" -> localName(i.name))
+    case p: MethodParameterIn if boxedLocals.contains(p.name) => boxField(p.name)
     case p: MethodParameterIn => ujson.Obj("k" -> "name", "v" -> p.name)
     // A function/method or a class used as a value. Whether it needs to carry the
     // enclosing environment is decided by `capturesEnv`, above.
@@ -1869,6 +2389,16 @@ import io.shiftleft.codepropertygraph.generated.nodes._
       }
     else if (unops.contains(mfn) && kids.size == 1)
       ujson.Obj("k" -> "unop", "op" -> unops(mfn), "a" -> expr(kids(0)))
+    // `006-reduce-remaining-holes`, Story 5: `a[i]`, `a` a recognized boxed array
+    // -- reads through the box (`irefIndex`+`derefIref`) rather than the ordinary
+    // `Expr.index`/`Val.list` machinery, which a heap-boxed array does not use.
+    // Checked BEFORE the generic `indexOps` case just below, which still handles
+    // every other (unboxed) index expression unchanged.
+    else if (indexOps.contains(mfn) && kids.size == 2 &&
+             rawLocalOrParamName(kids(0)).map(localName).exists(boxedArrays.contains))
+      ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
+        "a" -> ujson.Obj("k" -> "name", "v" -> rawLocalOrParamName(kids(0)).map(localName).get),
+        "i" -> expr(kids(1))))
     else if (indexOps.contains(mfn) && kids.size == 2)
       ujson.Obj("k" -> "index", "a" -> expr(kids(0)), "b" -> expr(kids(1)))
     else if (fieldOps.contains(mfn))
@@ -1969,13 +2499,12 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     //     in Core. That is a pre-existing Core gap, recorded here rather than introduced.)
     //
     //   * `&n` where `n` is a local number, or `&p` where `p` is a local pointer, needs a
-    //     model of *the location of a variable*, which Core does not have. The standard
-    //     fix is to box address-taken locals into heap cells, and it is implementable
-    //     entirely in this file — but see `docs/pointers.md`: measured on this corpus,
-    //     every such local holds a `char*`, so the box would be faithful and its
-    //     *contents* would still be an address Core cannot represent. Boxing would buy a
-    //     well-typed program that computes nothing. It stays a hole, with the kind of
-    //     address named.
+    //     model of *the location of a variable*, which Core does not have. `003-box-
+    //     address-taken-locals` closes this for the measured majority shape (a plain
+    //     local/parameter, not an array or struct field): such an `n` is boxed into a
+    //     single-field heap cell (`boxableName`/`boxedLocals`), and `&n` becomes the
+    //     identity too, for exactly the same reason as the aggregate case just below --
+    //     `n`'s own binding already holds the `Val.ref` once boxed.
     else if (mfn == "<operator>.addressOf" && kids.size == 1) {
       val ty   = staticTypeOf(kids(0))
       val kind = addrKind(ty)
@@ -1987,7 +2516,44 @@ import io.shiftleft.codepropertygraph.generated.nodes._
         isClassType(ty) ||
         (kind == "unknown-type" &&
          nm.exists(n => valueReceivers.contains(n) && !ptrReceivers.contains(n)))
-      if (aggregate) expr(kids(0))
+      // Membership in the FINAL `boxedLocals`, not mere shape-eligibility: a name
+      // eligible in shape at THIS site can still be excluded overall because some
+      // OTHER address-of site of the same name feeds an external call.
+      val boxed = boxableName(kids(0)).filter(boxedLocals.contains)
+      // `004-function-pointer-tracking`: `&function` for an in-program function is
+      // ALSO an identity, for the same reason the aggregate case above is: Core's
+      // `Val.fn` has no notion of pointer depth distinguishing "the function" from
+      // "the address of the function" (a C function already decays to its own
+      // address for calling purposes), so `&add` is exactly what plain `add` already
+      // translates to (`expr()`'s existing `MethodRef` case, `fnValue`). Found
+      // necessary, not merely nice-to-have: without this, `op = &add;` still holes
+      // on `&add` ITSELF even once `op`'s later `pointerCall` sites correctly
+      // resolve (`fnPtrVars`) — and that hole aborts the function before any such
+      // call site is ever reached, per Core's own hole-propagation semantics.
+      // Restricted to an ACTUALLY in-program function (`methodByName`), matching
+      // `fnPtrVars`'s own external-function guard for the identical reason.
+      val fnIdentity = kids(0) match {
+        case mr: MethodRef if methodByName.contains(mr.methodFullName) => true
+        case _ => false
+      }
+      // `006-reduce-remaining-holes`, Story 5: `&a[i]`/`&s.f` once the receiver is
+      // a recognized boxed array/struct -- checked FIRST, since `kids(0)` here is
+      // an index/field access, not itself a `local`-shaped `addrShape`, so it
+      // would otherwise fall straight through every case below to the generic
+      // `op:addressOf:element`/`:field` hole.
+      val arrIref = boxedArrayIndexOperand(kids(0))
+      val structIref = boxedStructFieldOperand(kids(0))
+      if (arrIref.isDefined) {
+        val (arrName, idxNode) = arrIref.get
+        ujson.Obj("k" -> "irefIndex", "a" -> ujson.Obj("k" -> "name", "v" -> arrName),
+                  "i" -> expr(idxNode))
+      } else if (structIref.isDefined) {
+        val (structName, f) = structIref.get
+        ujson.Obj("k" -> "irefField", "a" -> ujson.Obj("k" -> "name", "v" -> structName), "f" -> f)
+      }
+      else if (aggregate) expr(kids(0))
+      else if (boxed.isDefined) boxRef(boxed.get)
+      else if (fnIdentity) expr(kids(0))
       else {
         val k = if (kind == "unknown-type" && nm.exists(ptrReceivers.contains)) "pointer"
                 else kind
@@ -1998,9 +2564,25 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     // already covered, because Joern spells `(*p).f` as `indirectFieldAccess` and `p[i]`
     // as `indirectIndexAccess`, both of which are now mapped. What reaches here is a
     // dereference whose result is a *number* (or another pointer), which is exactly the
-    // location model Core lacks.
-    else if (mfn == "<operator>.indirection" && kids.size == 1)
-      hole("op:indirection:" + addrKind(staticTypeOf(kids(0))))
+    // location model Core lacks -- UNLESS `p` is provably, for its whole lifetime in this
+    // method, an alias of one specific boxed local (`ptrAliases`: `p = &n` is the ONLY
+    // assignment to `p` anywhere in the method), in which case the dereference is exactly
+    // a read of that local's box -- OR (Increment B) `p` is itself a parameter verified
+    // closed (`closedOutParams`), in which case `p`'s own value already IS the caller's
+    // ref and no alias indirection is needed at all.
+    else if (mfn == "<operator>.indirection" && kids.size == 1) {
+      val nm = rawLocalOrParamName(kids(0)).map(localName)
+      // `006-reduce-remaining-holes`, Story 5: `*p`, `p` PROVABLY holding an
+      // interior pointer VALUE for its whole lifetime (`ptrIrefNames`) -- `p`
+      // itself is unboxed, so this reads straight through its own binding,
+      // unlike the `ptrAliases`/`closedOutParams` box-field reads just below.
+      if (nm.exists(ptrIrefNames.contains))
+        ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "name", "v" -> nm.get))
+      else {
+        val target = nm.flatMap(ptrAliases.get) orElse nm.filter(closedOutParams.contains)
+        target.map(boxField).getOrElse(hole("op:indirection:" + addrKind(staticTypeOf(kids(0)))))
+      }
+    }
     // `++x` / `x++` in **expression** position. In statement position these are
     // `x = x ± 1` and are translated as such (see `stmt`); as an expression they also
     // have a value, and for the postfix forms that value is the *old* one. Core has no
@@ -2056,6 +2638,47 @@ import io.shiftleft.codepropertygraph.generated.nodes._
       ujson.Obj("k" -> "unit")
     // f-strings. Python only — see `pyFile`.
     else if (mfn == "<operator>.formatString" && pyFile) fstring(kids)
+    // `004-function-pointer-tracking`: a call through a function-pointer-valued
+    // variable Joern itself could not statically resolve (`<operator>.pointerCall`,
+    // research.md §1). When the callee names a variable this method's own
+    // `fnPtrVars` has proven, by a bounded whole-function single-assignment check,
+    // holds exactly one known, non-capturing, in-program function -- rewrite the
+    // WHOLE call to an ordinary direct call to that function, reusing the same
+    // real-argument extraction (`aidx(_) >= 1`) every other call already uses. Any
+    // callee this cannot prove safe (ambiguous, external, a struct field, an array
+    // element, or the general shape) falls through to the unchanged generic hole
+    // just below, exactly as today.
+    else if (mfn == "<operator>.pointerCall")
+      pointerCallCalleeVar(c).flatMap(fnPtrVars.get) match {
+        case Some(target) =>
+          ujson.Obj("k" -> "call", "f" -> target, "args" -> exprs(kidsOf(c).filter(aidx(_) >= 1)))
+        case None => hole("op:" + opLabel(mfn))
+      }
+    // `005-sizeof-constant-folding`: `sizeof(expr)` and `sizeof(TypeName)` are
+    // indistinguishable at this point -- confirmed against the CPG directly
+    // (research.md §1): both produce a single child carrying the operand's type
+    // directly, which `staticTypeOf` already reads correctly for either shape (a
+    // bare type name like `"int"` is never also a real local's name, so the
+    // `localTypes` lookup harmlessly falls through to the node's own type). Folds
+    // to the literal byte count for a scalar, pointer, or (possibly
+    // multi-dimensional) fixed-size array operand; every other shape -- an
+    // aggregate, an opaque type, or a data-model-dependent type under an
+    // unspecified model -- falls through to a hole, labelled with the exact same
+    // taxonomy `<operator>.cast` already uses just above (research.md §5), not the
+    // single generic `op:sizeOf`.
+    else if (mfn == "<operator>.sizeOf" && kids.size == 1) {
+      val ty = staticTypeOf(kids(0))
+      // `006-reduce-remaining-holes`, Story 4: a struct/union operand additionally
+      // tries the aggregate layout resolver above; every other shape is unchanged
+      // from `005`, and an aggregate whose layout does not resolve falls through
+      // to the exact same `op:sizeOf:object` hole below it always has.
+      sizeofBytes(ty).orElse(if (isClassType(ty)) aggregateSizeofBytes(ty) else None) match {
+        case Some(n) => intLit(n)
+        case None =>
+          if (modelDependentNames.contains(bareType(ty))) hole("op:sizeOf:model-dependent")
+          else hole("op:sizeOf:" + addrKind(ty))
+      }
+    }
     else if (mfn.startsWith("<operator>"))
       hole("op:" + opLabel(mfn))
     // `import x` / `from p import x`: a binding, not a call. See `importValue`.
@@ -2143,9 +2766,128 @@ import io.shiftleft.codepropertygraph.generated.nodes._
   }
 
   // ---- statements -----------------------------------------------------------
-  def seqOf(xs: List[ujson.Obj]): ujson.Obj =
+  // `seqOf` (below) and `moduleObjectsInit`'s fold build a right-nested
+  // `{"k":"seq","a":...,"b":...}` chain, one level per statement, mirroring Lean's
+  // binary `Stmt.seq` constructor exactly (`render_lean.py` reads this shape 1:1). For a
+  // long flat statement list that chain is deep enough that `ujson`'s own recursive
+  // `Value.transform` -- third-party library code, not ours -- overflows the JVM stack
+  // writing it out: confirmed live, a 3,000-statement chain crashes entirely inside
+  // `upickle.core.RenderUtils`/`ujson.AstTransformer`, with zero frames in this file's
+  // own code (research.md item 1). `maxSeqChainLen`/`seqChainCompactThreshold` are
+  // declared near the top of `exec` (search "seqChainCompactThreshold"), not here, so
+  // that `moduleObjectsInit` (defined earlier in this file, and also updating
+  // `maxSeqChainLen`) is a backward reference to it rather than a forward one.
+
+  /** Renders a `ujson.Value` to JSON text by driving the same `Renderer`/`Visitor`
+    * protocol `ujson.write` itself uses (`ujson.Value$.transform` walks a value and
+    * calls exactly these `visitObject`/`visitArray`/`visitString`/... methods), but with
+    * an explicit heap-allocated frame stack instead of the JVM call stack -- so output is
+    * produced for a chain of any depth without recursing once per nesting level. This is
+    * research.md item 3's route (a) (drive the streaming visitor directly): confirmed
+    * reachable from a `.sc` script via `ujson.Renderer`'s public constructor and
+    * `upickle.core.Visitor`'s public methods (no `ujson.Value` internals needed), and
+    * confirmed byte-identical to `ujson.write(v, indent)` for both `indent = 1` and
+    * compact (`indent = -1`) on every shape tested, including this exact `seq`-chain
+    * shape. `indent = 1` pretty-printing is quadratic in output size at deep nesting
+    * (indentation alone is a 1..N space triangle) -- confirmed empirically to
+    * OutOfMemoryError a 100,000-deep chain regardless of stack safety -- so the caller
+    * passes `indent = -1` once `maxSeqChainLen` crosses `seqChainCompactThreshold`;
+    * every already-working (shallow) run keeps `indent = 1` and is therefore still
+    * byte-identical to today's output (FR-004). */
+  def writeJson(root: ujson.Value, indent: Int): String = {
+    val sw = new java.io.StringWriter()
+    val renderer = new ujson.Renderer(sw, indent, false)
+
+    sealed trait JsonFrame { var awaitingChild: Boolean = false }
+    final case class ArrFrame(ov: upickle.core.ArrVisitor[Any, Any], it: Iterator[ujson.Value])
+      extends JsonFrame
+    final case class ObjFrame(ov: upickle.core.ObjVisitor[Any, Any], it: Iterator[(String, ujson.Value)])
+      extends JsonFrame
+
+    val stack = scala.collection.mutable.ArrayBuffer.empty[JsonFrame]
+    var lastResult: AnyRef = null
+
+    def visitScalar(v: upickle.core.Visitor[Any, Any], value: ujson.Value): AnyRef = value match {
+      case ujson.Str(s) => v.visitString(s, -1).asInstanceOf[AnyRef]
+      case ujson.Num(n) => v.visitFloat64(n, -1).asInstanceOf[AnyRef]
+      case ujson.True   => v.visitTrue(-1).asInstanceOf[AnyRef]
+      case ujson.False  => v.visitFalse(-1).asInstanceOf[AnyRef]
+      case ujson.Null   => v.visitNull(-1).asInstanceOf[AnyRef]
+      case other        => throw new IllegalArgumentException(s"writeJson: not a scalar: $other")
+    }
+
+    // Pushes a frame for Obj/Arr (their children are visited across later loop
+    // iterations, not here) or resolves a scalar immediately into `lastResult`.
+    def descend(v: upickle.core.Visitor[Any, Any], value: ujson.Value): Unit = value match {
+      case a: ujson.Arr =>
+        val ov = v.visitArray(a.value.length, -1).asInstanceOf[upickle.core.ArrVisitor[Any, Any]]
+        stack.append(ArrFrame(ov, a.value.iterator))
+      case o: ujson.Obj =>
+        val ov = v.visitObject(o.value.size, true, -1).asInstanceOf[upickle.core.ObjVisitor[Any, Any]]
+        stack.append(ObjFrame(ov, o.value.iterator))
+      case scalar =>
+        lastResult = visitScalar(v, scalar)
+    }
+
+    descend(renderer.asInstanceOf[upickle.core.Visitor[Any, Any]], root)
+    while (stack.nonEmpty) {
+      stack.last match {
+        case af: ArrFrame =>
+          // `awaitingChild` is true when we come back around to this frame after a
+          // previously-pushed child (however many levels it itself descended) finally
+          // unwound -- its result must reach `visitValue` before asking for the next item.
+          if (af.awaitingChild) { af.ov.visitValue(lastResult, -1); af.awaitingChild = false }
+          if (af.it.hasNext) {
+            val sub = af.ov.subVisitor.asInstanceOf[upickle.core.Visitor[Any, Any]]
+            af.awaitingChild = true
+            descend(sub, af.it.next())
+            // A scalar child resolves in the same iteration (no frame was pushed);
+            // consume it right away instead of waiting for a loop iteration that will
+            // never come back to a still-scalar "child".
+            if (stack.last eq af) { af.ov.visitValue(lastResult, -1); af.awaitingChild = false }
+          } else {
+            lastResult = af.ov.visitEnd(-1).asInstanceOf[AnyRef]
+            stack.remove(stack.length - 1)
+          }
+        case of: ObjFrame =>
+          if (of.awaitingChild) { of.ov.visitValue(lastResult, -1); of.awaitingChild = false }
+          if (of.it.hasNext) {
+            val (k, value) = of.it.next()
+            val kv = of.ov.visitKey(-1).asInstanceOf[upickle.core.Visitor[Any, Any]]
+            of.ov.visitKeyValue(kv.visitString(k, -1))
+            val sub = of.ov.subVisitor.asInstanceOf[upickle.core.Visitor[Any, Any]]
+            of.awaitingChild = true
+            descend(sub, value)
+            if (stack.last eq of) { of.ov.visitValue(lastResult, -1); of.awaitingChild = false }
+          } else {
+            lastResult = of.ov.visitEnd(-1).asInstanceOf[AnyRef]
+            stack.remove(stack.length - 1)
+          }
+      }
+    }
+    renderer.flushCharBuilder()
+    sw.toString
+  }
+
+  def seqOf(xs: List[ujson.Obj]): ujson.Obj = {
+    if (xs.length > maxSeqChainLen) maxSeqChainLen = xs.length
     if (xs.isEmpty) skip
-    else xs.reduceRight((a, b) => ujson.Obj("k" -> "seq", "a" -> a, "b" -> b))
+    else {
+      // An explicit right-to-left loop, not `reduceRight`: this is the "iterative
+      // sequence writer" -- it builds the exact same right-nested chain `reduceRight`
+      // did, but with a JVM-stack cost that is O(1) in `xs.length` by construction,
+      // rather than relying on `reduceRight`'s own (unverified, in this planning
+      // environment) stack behavior for long lists.
+      val arr = xs.toArray
+      var acc: ujson.Obj = arr(arr.length - 1)
+      var i = arr.length - 2
+      while (i >= 0) {
+        acc = ujson.Obj("k" -> "seq", "a" -> arr(i), "b" -> acc)
+        i -= 1
+      }
+      acc
+    }
+  }
 
   /** Python's frontend turns statement-expressions (comprehensions, display literals)
     * into a BLOCK whose last child is the value. Split it into prelude statements and
@@ -2165,7 +2907,11 @@ import io.shiftleft.codepropertygraph.generated.nodes._
             case ks   => (stmts(ks.init), expr(ks.last))
           }
       }
-    case other => (Nil, expr(other))
+    // `006-reduce-remaining-holes`: an assignment/increment nested anywhere inside
+    // this position's own value now threads its prelude out too (research.md §3) --
+    // `exprV`'s base case is `(Nil, expr(other))`, identical to before, whenever
+    // `other` contains no such construct.
+    case other => exprV(other)
   }
 
   /** `for x in e:` — the Python frontend desugars it before we ever see it, into
@@ -2330,17 +3076,74 @@ import io.shiftleft.codepropertygraph.generated.nodes._
       // never reaches `callExpr`, so it is guarded here too.
       case _ if cLikeFile && aug.isDefined && (isCString(lhs) || isCString(rhs)) =>
         holeS("cstr:pointer-arith")
+      // `003-box-address-taken-locals`: a plain write to a boxed local/parameter
+      // writes the box's one field instead of rebinding the name -- see `expr`'s
+      // matching read-side case just above, and `boxedLocals`.
+      case i: Identifier if boxedLocals.contains(localName(i.name)) =>
+        val nm = localName(i.name)
+        ujson.Obj("k" -> "setField", "r" -> boxRef(nm), "f" -> "v", "v" -> combine(boxField(nm)))
+      // `006-reduce-remaining-holes`, Story 5: the C frontend spells BOTH
+      // `int a[4];` and `int a[4] = {0};` as a synthetic assignment to `a`
+      // (RHS `<operator>.alloc`/`<operator>.arrayInitializer`) -- confirmed live,
+      // this session, against exactly this shape. For a recognized boxed array/
+      // struct this is now `skip`, not translated: the unconditional prologue
+      // already allocated `a`'s box (every field `.unit`), so the ONLY thing this
+      // statement could still contribute is the source initializer's actual
+      // values, which this increment does not model (out of scope, matching
+      // spec.md's own "no VLA/malloc-sized allocation" exclusion in spirit --
+      // every quickstart.md Story 5 acceptance scenario only reads a
+      // previously-WRITTEN element/field, never relies on this initializer).
+      case i: Identifier if boxedArrays.contains(localName(i.name)) ||
+                             boxedStructs.contains(localName(i.name)) =>
+        skip
       case i: Identifier =>
         // At module scope, and for a name a `global` statement rebound, an assignment
         // writes the module-level frame rather than creating a local.
         val k = if (moduleScope || declaredGlobals.contains(i.name)) "setGlobal" else "assign"
         ujson.Obj("k" -> k, "x" -> localName(i.name),
                   "e" -> combine(ujson.Obj("k" -> "name", "v" -> localName(i.name))))
+      // `*p = v` where `p` is PROVABLY, for its whole lifetime in this method, an
+      // alias of one specific boxed local (`ptrAliases`), OR (Increment B) `p` is
+      // itself a parameter verified closed (`closedOutParams`) -- the write-side
+      // counterpart of the read case in `callExpr`'s `<operator>.indirection`
+      // handling. Checked BEFORE the generic `<operator>`-prefixed catch-all below,
+      // which still fires (unchanged `assign:lhs:indirection`) for every `*p` this
+      // cannot prove safe. `ptrAliases.getOrElse(nm, nm)` reads as: if `nm` aliases
+      // some OTHER boxed local, write through that; otherwise (must be because the
+      // guard's `closedOutParams` branch matched) `nm` itself already IS the ref.
+      // `006-reduce-remaining-holes`, Story 5: `*p = v`, `p` PROVABLY holding an
+      // interior pointer VALUE for its whole lifetime (`ptrIrefNames`) -- write
+      // side of `callExpr`'s matching `<operator>.indirection` read case. `p`
+      // itself is unboxed, so this writes straight through its own binding.
+      case c: Call if c.methodFullName == "<operator>.indirection" && kidsOf(c).size == 1 &&
+                       rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(ptrIrefNames.contains) =>
+        val nm = rawLocalOrParamName(kidsOf(c)(0)).map(localName).get
+        val pRef = ujson.Obj("k" -> "name", "v" -> nm)
+        ujson.Obj("k" -> "setDerefIref", "p" -> pRef,
+                  "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> pRef)))
+      case c: Call if c.methodFullName == "<operator>.indirection" && kidsOf(c).size == 1 &&
+                       rawLocalOrParamName(kidsOf(c)(0)).map(localName)
+                         .exists(n => ptrAliases.contains(n) || closedOutParams.contains(n)) =>
+        val nm = rawLocalOrParamName(kidsOf(c)(0)).map(localName).get
+        val target = ptrAliases.getOrElse(nm, nm)
+        ujson.Obj("k" -> "setField", "r" -> boxRef(target), "f" -> "v",
+                  "v" -> combine(boxField(target)))
       case fa if asField(fa).isDefined =>
         val (r, f) = asField(fa).get
         if (aug.isDefined && !pureNode(r)) holeS("assign:aug-impure-receiver")
         else ujson.Obj("k" -> "setField", "r" -> expr(r), "f" -> f,
                        "v" -> combine(ujson.Obj("k" -> "field", "a" -> expr(r), "f" -> f)))
+      // `006-reduce-remaining-holes`, Story 5: `a[i] = v`, `a` a recognized boxed
+      // array -- write side of `callExpr`'s matching `indexOps` read case.
+      // Checked BEFORE the generic `asIndex` case just below.
+      case ia if asIndex(ia).isDefined &&
+                 rawLocalOrParamName(asIndex(ia).get._1).map(localName).exists(boxedArrays.contains) =>
+        val (a, b) = asIndex(ia).get
+        val arrName = rawLocalOrParamName(a).map(localName).get
+        val p = ujson.Obj("k" -> "irefIndex", "a" -> ujson.Obj("k" -> "name", "v" -> arrName),
+                          "i" -> expr(b))
+        ujson.Obj("k" -> "setDerefIref", "p" -> p,
+                  "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> p)))
       case ia if asIndex(ia).isDefined =>
         val (a, b) = asIndex(ia).get
         if (aug.isDefined && !(pureNode(a) && pureNode(b))) holeS("assign:aug-impure-target")
@@ -2373,8 +3176,27 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     val one = ujson.Obj("k" -> "int", "v" -> ujson.Num(1.0))
     def bump(cur: ujson.Obj): ujson.Obj =
       ujson.Obj("k" -> "binop", "op" -> op, "a" -> cur, "b" -> one)
-    if (isPointerType(staticTypeOf(tgt)) || isCString(tgt)) holeS("op:" + opName + ":pointer")
+    // `006-reduce-remaining-holes`, Story 5: `p++`/`p--`, `p` PROVABLY holding an
+    // interior pointer VALUE for its whole lifetime (`ptrIrefNames`) -- checked
+    // BEFORE the general pointer-target guard just below, which exists precisely
+    // because Core cannot scale plain `+1` by `sizeof(*p)` for an ORDINARY
+    // pointer; an interior pointer needs no such scaling (`applyBinop`'s new
+    // `Val.iref`+`Val.int` arm is already element-indexed, not byte-based), so
+    // this is the ordinary, unboxed-identifier bump `incrStmt` already applies to
+    // any other scalar local -- `p`'s own binding holds the value directly.
+    if (rawLocalOrParamName(tgt).map(localName).exists(ptrIrefNames.contains)) {
+      val nm = rawLocalOrParamName(tgt).map(localName).get
+      val k = if (moduleScope || declaredGlobals.contains(nm)) "setGlobal" else "assign"
+      ujson.Obj("k" -> k, "x" -> nm, "e" -> bump(ujson.Obj("k" -> "name", "v" -> nm)))
+    }
+    else if (isPointerType(staticTypeOf(tgt)) || isCString(tgt)) holeS("op:" + opName + ":pointer")
     else tgt match {
+      // `003-box-address-taken-locals`: `x++`/`x--` on a boxed local, same rewrite as
+      // a plain write (`assignTo`'s matching case) -- `x`'s own binding holds the ref,
+      // not the value, so the bump has to go through the box's field.
+      case i: Identifier if boxedLocals.contains(localName(i.name)) =>
+        val nm = localName(i.name)
+        ujson.Obj("k" -> "setField", "r" -> boxRef(nm), "f" -> "v", "v" -> bump(boxField(nm)))
       case i: Identifier =>
         val k = if (moduleScope || declaredGlobals.contains(i.name)) "setGlobal" else "assign"
         ujson.Obj("k" -> k, "x" -> localName(i.name),
@@ -2394,10 +3216,221 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     }
   }
 
+  // ---- `006-reduce-remaining-holes`, Story 3: assignment/increment as a VALUE ----
+  //
+  // `valueOf`'s prelude-threading pattern (research.md §3), generalised into a proper
+  // recursive helper reachable from every expression position, not just `return`/an
+  // assignment's own RHS.
+
+  /** Walk a `seqOf`-built right-nested `seq` chain to its innermost statement. */
+  @tailrec def tailStmt(v: ujson.Obj): ujson.Obj =
+    if (v.value.get("k").exists(_.str == "seq")) tailStmt(v("b").obj) else v
+
+  /** If `write` (as built by `assignTo`/`incrStmt`) is, at its core, a hole statement
+    * for any of THEIR OWN internal reasons (an impure receiver/target, a `char*`
+    * pointer target, an unsupported target shape, ...), the label -- so callers can
+    * surface it as an `Expr.hole` with the identical text, rather than trusting a
+    * write that never actually happened. */
+  def holeLabelOf(write: ujson.Obj): Option[String] = {
+    val t = tailStmt(write)
+    if (t.value.get("k").exists(_.str == "holeS")) Some(t("label").str) else None
+  }
+
+  /** The current-value READ expression for an assignment/increment target, mirroring
+    * exactly what `assignTo`/`incrStmt` read internally: a boxed local's field, an
+    * ordinary name, or a field/index read. `None` for a target shape neither
+    * translates to a plain write at all (e.g. `*p`). */
+  def targetReadExpr(lhs: AstNode): Option[ujson.Obj] = lhs match {
+    case i: Identifier =>
+      val nm = localName(i.name)
+      Some(if (boxedLocals.contains(nm)) boxField(nm) else ujson.Obj("k" -> "name", "v" -> nm))
+    case fa if asField(fa).isDefined =>
+      val (r, f) = asField(fa).get
+      Some(ujson.Obj("k" -> "field", "a" -> expr(r), "f" -> f))
+    // `006-reduce-remaining-holes`, Story 5: consistent with `assignTo`'s/
+    // `callExpr`'s own boxed-array read -- a plain `index` read would silently
+    // mistranslate (Core's `Expr.index` does not accept a `Val.iref` receiver).
+    case ia if asIndex(ia).isDefined &&
+               rawLocalOrParamName(asIndex(ia).get._1).map(localName).exists(boxedArrays.contains) =>
+      val (a, b) = asIndex(ia).get
+      val arrName = rawLocalOrParamName(a).map(localName).get
+      Some(ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
+        "a" -> ujson.Obj("k" -> "name", "v" -> arrName), "i" -> expr(b))))
+    case ia if asIndex(ia).isDefined =>
+      val (a, b) = asIndex(ia).get
+      Some(ujson.Obj("k" -> "index", "a" -> expr(a), "b" -> expr(b)))
+    case _ => None
+  }
+
+  /** A name no source program can spell, so it can never collide with a real local —
+    * used only to carry a postfix increment/decrement's PRE-bump value across the
+    * bump statement (`Env.set` binds any name; no prior declaration is needed). */
+  def freshExprVTemp(): String = { val n = "$exprV$" + exprVTempCounter; exprVTempCounter += 1; n }
+
+  /** FR-005/FR-008: an assignment (plain or augmented) reached in expression
+    * position. On a provably pure target, the write is `assignTo` verbatim and the
+    * value is a fresh READ of the target after the write -- deliberately NOT a
+    * second evaluation of `rhs` itself, even for a plain assignment: `rhs` may be
+    * impure (a call), and `assignTo`'s own write already evaluates it exactly once
+    * as part of computing what to store, so reusing that RHS expression node again
+    * here would evaluate it a SECOND time -- the double-evaluation FR-008 exists to
+    * rule out, just relocated to the wrong side of the assignment. Reading the
+    * target back is sound because the target is provably pure (gated below): the
+    * same location is written and re-read, once each. An impure target keeps a hole
+    * under `assignTo`'s own aug-impure label for a field/index target, or today's
+    * existing generic `op:assignment`/`op:<op>` label for any other shape `assignTo`
+    * was never going to attempt in the first place. */
+  def assignAsValue(lhs: AstNode, rhs: AstNode, aug: Option[String],
+                     genericLabel: String): (List[ujson.Obj], ujson.Obj) = {
+    def proceed(): (List[ujson.Obj], ujson.Obj) = {
+      val write = assignTo(lhs, rhs, aug)
+      holeLabelOf(write) match {
+        case Some(label) => (Nil, hole(label))
+        case None         => (List(write), targetReadExpr(lhs).getOrElse(hole(genericLabel)))
+      }
+    }
+    lhs match {
+      case _: Identifier               => proceed()
+      case fa if asField(fa).isDefined =>
+        if (pureNode(asField(fa).get._1)) proceed() else (Nil, hole("assign:aug-impure-receiver"))
+      case ia if asIndex(ia).isDefined =>
+        val (a, b) = asIndex(ia).get
+        if (pureNode(a) && pureNode(b)) proceed() else (Nil, hole("assign:aug-impure-target"))
+      case _ => (Nil, hole(genericLabel))
+    }
+  }
+
+  /** FR-006/FR-007/FR-008: `++x`/`x++`/`--x`/`x--` reached in expression position.
+    * Prefix yields the POST-bump value (a fresh read after `incrStmt`'s write, sound
+    * under the same pure-target reasoning as the augmented-assignment case above);
+    * postfix yields the PRE-bump value, captured into a fresh temporary immediately
+    * before the bump runs, since Core's evaluator has no way to look "backwards"
+    * past a statement it already ran. Reuses `incrStmt` verbatim for the bump/write
+    * itself -- no new arithmetic. */
+  def incrAsValue(tgt: AstNode, op: String, opName: String,
+                  postfix: Boolean): (List[ujson.Obj], ujson.Obj) = {
+    val genericLabel = "op:" + opName + ":value"
+    def proceed(): (List[ujson.Obj], ujson.Obj) = {
+      val write = incrStmt(tgt, op, opName)
+      holeLabelOf(write) match {
+        case Some(label) => (Nil, hole(label))
+        case None =>
+          val cur = targetReadExpr(tgt).getOrElse(hole(genericLabel))
+          if (postfix) {
+            val tmp = freshExprVTemp()
+            (List(ujson.Obj("k" -> "assign", "x" -> tmp, "e" -> cur), write),
+             ujson.Obj("k" -> "name", "v" -> tmp))
+          } else (List(write), cur)
+      }
+    }
+    tgt match {
+      case _: Identifier               => proceed()
+      case fa if asField(fa).isDefined =>
+        if (pureNode(asField(fa).get._1)) proceed() else (Nil, hole("op:" + opName + ":impure-receiver"))
+      case ia if asIndex(ia).isDefined =>
+        val (a, b) = asIndex(ia).get
+        if (pureNode(a) && pureNode(b)) proceed() else (Nil, hole("op:" + opName + ":impure-target"))
+      case _ => (Nil, hole(genericLabel))
+    }
+  }
+
+  /** `expr()`'s prelude-threading counterpart (research.md §3): for a node that may
+    * itself carry an assignment/increment used as a VALUE, returns the statements
+    * that must run first plus the resulting value expression, in source evaluation
+    * order. Every node shape that cannot itself contain such a construct -- the
+    * overwhelming majority -- is the unchanged base case, `(Nil, expr(n))`. */
+  def exprV(n: AstNode): (List[ujson.Obj], ujson.Obj) = n match {
+    case c: Call if c.methodFullName == "<operator>.assignment" =>
+      kidsOf(c) match {
+        case lhs :: rhs :: Nil => assignAsValue(lhs, rhs, None, "op:assignment")
+        case _                 => (Nil, hole("assign:arity"))
+      }
+    case c: Call if augOps.contains(c.methodFullName) =>
+      kidsOf(c) match {
+        case lhs :: rhs :: Nil =>
+          assignAsValue(lhs, rhs, Some(augOps(c.methodFullName)), "op:" + opLabel(c.methodFullName))
+        case _ => (Nil, hole("assign:arity"))
+      }
+    case c: Call if incrOps.contains(c.methodFullName) =>
+      kidsOf(c) match {
+        case tgt :: Nil =>
+          val opName = c.methodFullName.stripPrefix("<operator>.")
+          incrAsValue(tgt, incrOps(c.methodFullName), opName, postfix = opName.startsWith("post"))
+        case _ => (Nil, hole("op:" + c.methodFullName.stripPrefix("<operator>.") + ":arity"))
+      }
+    // Compound-expression pass-through (research.md §3, point 2): thread and
+    // concatenate sub-preludes left-to-right, matching source evaluation order.
+    case c: Call if c.methodFullName == "<operator>.arithmeticShiftRight" && kidsOf(c).size == 2 =>
+      val List(a, b) = kidsOf(c)
+      shiftRightOp(a) match {
+        case Some(op) =>
+          val (pa, ae) = exprV(a); val (pb, be) = exprV(b)
+          (pa ++ pb, ujson.Obj("k" -> "binop", "op" -> op, "a" -> ae, "b" -> be))
+        case None => (Nil, hole("op:shiftRight:unknown-signedness"))
+      }
+    case c: Call if binops.contains(c.methodFullName) && kidsOf(c).size == 2 &&
+                    !(cLikeFile && kidsOf(c).exists(isCString) && cStringUnsafe.contains(c.methodFullName)) =>
+      val List(a, b) = kidsOf(c)
+      val (pa, ae) = exprV(a); val (pb, be) = exprV(b)
+      (pa ++ pb, ujson.Obj("k" -> "binop", "op" -> binops(c.methodFullName), "a" -> ae, "b" -> be))
+    case c: Call if unops.contains(c.methodFullName) && kidsOf(c).size == 1 =>
+      val (pa, ae) = exprV(kidsOf(c).head)
+      (pa, ujson.Obj("k" -> "unop", "op" -> unops(c.methodFullName), "a" -> ae))
+    // `006-reduce-remaining-holes`, Story 5: `a[i]`, `a` a recognized boxed array
+    // -- mirrors `callExpr`'s own matching case exactly (this file's `exprV`
+    // never routes an `indexOps` call through `callExpr`, so without this the
+    // Story 5 rewrite there would silently never fire for an index reached via
+    // `exprV` -- an `if`/`while`/`do`/`for` condition, a `return`/assignment-RHS
+    // position, or any compound expression -- which is most real call sites).
+    case c: Call if indexOps.contains(c.methodFullName) && kidsOf(c).size == 2 &&
+                    rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(boxedArrays.contains) =>
+      val List(a, b) = kidsOf(c)
+      val arrName = rawLocalOrParamName(a).map(localName).get
+      val (pb, be) = exprV(b)
+      (pb, ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
+        "a" -> ujson.Obj("k" -> "name", "v" -> arrName), "i" -> be)))
+    case c: Call if indexOps.contains(c.methodFullName) && kidsOf(c).size == 2 =>
+      val List(a, b) = kidsOf(c)
+      val (pa, ae) = exprV(a); val (pb, be) = exprV(b)
+      (pa ++ pb, ujson.Obj("k" -> "index", "a" -> ae, "b" -> be))
+    case c: Call if fieldOps.contains(c.methodFullName) && resolvedRef(c).isEmpty &&
+                    asField(c).isDefined =>
+      val (r, f) = asField(c).get
+      val (pr, re) = exprV(r)
+      (pr, ujson.Obj("k" -> "field", "a" -> re, "f" -> f))
+    // An ordinary named call's positional arguments (research.md §3, point 2,
+    // "function-call arguments"). Delegates the actual call classification to
+    // `expr`/`callExpr` unchanged (ctor/mcall/`<fakeNew>`/class-body and every other
+    // special form are simply not touched here, and fall to the base case below) --
+    // only the positional-argument VALUES are threaded through `exprV`, and only when
+    // at least one of them actually has a prelude to hoist; otherwise this returns
+    // `expr(c)` verbatim; byte-identical to today.
+    case c: Call if !c.methodFullName.startsWith("<operator>") && c.methodFullName != "<unknownFullName>" =>
+      val baseline = expr(c)
+      val posArgs = kidsOf(c).filter(k => aidx(k) >= 1 && !isKeywordArg(k))
+      val ok = baseline.value.get("k").exists(_.str == "call") &&
+               baseline.value.get("args").flatMap(_.arrOpt).exists(_.length >= posArgs.length)
+      if (!ok) (Nil, baseline)
+      else {
+        val argsArr = baseline("args").arr.toList
+        val recur = posArgs.map {
+          case sc: Call if sc.methodFullName == "<operator>.starredUnpack" =>
+            (List.empty[ujson.Obj], argExpr(sc))
+          case a => val (pa, ae) = exprV(a); (pa, ae: ujson.Value)
+        }
+        val prelude = recur.flatMap(_._1)
+        if (prelude.isEmpty) (Nil, baseline)
+        else (prelude, ujson.Obj("k" -> "call", "f" -> baseline("f"),
+                                 "args" -> ujson.Arr.from(recur.map(_._2) ++ argsArr.drop(posArgs.length))))
+      }
+    case other => (Nil, expr(other))
+  }
+
   /** Translate a statement list, merging the two-statement C++ stack-construction shape
     * (`x = <operator>.alloc` followed by `Cls.Cls(args)`) into one `Expr.alloc`. See
     * `ctorAlloc` for the expression-position form of the same pattern. */
-  def stmts(ks: List[AstNode]): List[ujson.Obj] = ks match {
+  @tailrec
+  def stmts(ks: List[AstNode], acc: List[ujson.Obj] = Nil): List[ujson.Obj] = ks match {
     case (asg: Call) :: (ctor: Call) :: rest if asg.methodFullName == "<operator>.assignment" =>
       val merged =
         for {
@@ -2415,18 +3448,29 @@ import io.shiftleft.codepropertygraph.generated.nodes._
                                      "args" -> exprs(kidsOf(ctor).filter(aidx(_) >= 1))))
         }
       merged match {
-        case Some(m) => m :: stmts(rest)
-        case None    => stmt(asg) :: stmts(ctor :: rest)
+        case Some(m) => stmts(rest, m :: acc)
+        case None    => stmts(ctor :: rest, stmt(asg) :: acc)
       }
-    case k :: rest => stmt(k) :: stmts(rest)
-    case Nil       => Nil
+    case k :: rest => stmts(rest, stmt(k) :: acc)
+    case Nil       => acc.reverse
   }
 
   def stmt(n: AstNode): ujson.Obj = n match {
     case b: Block =>
       val kids = kidsOf(b)
-      forPattern(kids).getOrElse(seqOf(stmts(kids)))
+      // An empty `kidsOf` is ambiguous by itself: it is the correct shape for a real
+      // no-op body (`{}`, or `{ /* NO-OP */ }`), but it is ALSO what the C frontend
+      // produces when it gives up parsing a body it could not fully resolve --
+      // silently, with the raw source text still sitting on `.code`. Telling those
+      // apart by whether anything survives stripping braces and comments is the
+      // difference between "nothing to translate" and "something was dropped
+      // on the floor": on the SQLite CPG, 15%+ of core-file functions hit the
+      // latter, each exporting as a hole-free `skip` that in fact translated
+      // nothing of the function's real body.
+      if (kids.isEmpty && stripBlockCode(b.code).nonEmpty) holeS("stmt:empty-ast-children")
+      else forPattern(kids).getOrElse(seqOf(stmts(kids)))
     case l: Local => skip   // declarations carry no behaviour here
+    case td: TypeDecl => skip   // a struct/union/typedef/class decl carries no behaviour either
     case r: Return =>
       kidsOf(r).headOption match {
         case Some(e) =>
@@ -2491,9 +3535,22 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     case cs: ControlStructure =>
       val kids = kidsOf(cs)
       cs.controlStructureType match {
+        // `006-reduce-remaining-holes`: an `if` condition is evaluated exactly once,
+        // so splicing `exprV`'s prelude ahead of the `ifte` (mirroring how `Return`
+        // already splices `valueOf`'s) is exactly as sound here as there.
         case "IF" if kids.size >= 2 =>
-          ujson.Obj("k" -> "ifte", "c" -> expr(kids(0)), "t" -> stmt(kids(1)),
-                    "e" -> (if (kids.size > 2) stmt(kids(2)) else skip))
+          val (prelude, condVal) = exprV(kids(0))
+          seqOf(prelude :+ ujson.Obj("k" -> "ifte", "c" -> condVal, "t" -> stmt(kids(1)),
+                                     "e" -> (if (kids.size > 2) stmt(kids(2)) else skip)))
+        // A loop's own condition is instead evaluated ONCE PER ITERATION, so the same
+        // "splice the prelude once, ahead of the loop" trick would be wrong: an
+        // assignment-as-value inside a `while`/`do`/`for` condition would fire only on
+        // the very first check, then read a permanently stale value on every
+        // subsequent one -- a silent wrong answer, not merely a missed improvement.
+        // Fixing that needs the condition's prelude re-run before every re-check
+        // (and before every `continue`, matching `pushStep`'s own precedent for a
+        // `for`-loop's step) -- a real, separate increment this plan does not
+        // attempt, so a loop condition keeps the plain `expr(cond)` it has today.
         case "WHILE" if kids.size >= 2 =>
           // A `while` whose condition is the frontend's synthetic iterator probe only
           // makes sense inside the `for` shape above; on its own it is not a condition.
@@ -2686,9 +3743,6 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     }
   }
 
-  /** The AST parent of a node, or `None` for a root. `astParent` throws on a root. */
-  def parentOf(n: AstNode): Option[AstNode] = scala.util.Try(n.astParent).toOption
-
   /** A method body, translating the kernel's `goto out;` idiom when — and only when — it
     * is a *reducible forward jump to a tail label*, which is structured control flow
     * wearing an unstructured spelling.
@@ -2813,7 +3867,247 @@ import io.shiftleft.codepropertygraph.generated.nodes._
       .filter(c => fieldOps.contains(c.methodFullName)).l
       .flatMap(fa => asField(fa).collect { case (r: Identifier, f) => r.name -> f })
       .groupBy(_._1).map { case (k, vs) => k -> vs.map(_._2).toSet }
-    val body = methodBody(m)
+    // `003-box-address-taken-locals`: every name whose address is taken anywhere in
+    // this method, restricted to the boxable "local" shape (`boxableName` -- depends
+    // on `localTypes`/`declaredGlobals`/`moduleScope`/`cppFile`, all set above) AND
+    // -- per spec.md's edge cases and SC-001's own scoping -- never fed to an
+    // external call at ANY of its address-of sites (`addressOfFeedsExternalCall`): a
+    // name with even one such site is excluded ENTIRELY, so every one of its
+    // addressOf/indirection sites keeps today's hole rather than mixing boxed and
+    // unboxed behaviour for the same name.
+    val addrCalls = m.body.ast.isCall.filter(_.methodFullName == "<operator>.addressOf").l
+    val candidates: Map[String, List[Call]] =
+      addrCalls.flatMap(c => kidsOf(c) match {
+        case List(n) => boxableName(n).map(_ -> c)
+        case _       => None
+      }).groupBy(_._1).map { case (k, vs) => k -> vs.map(_._2) }
+    boxedLocals = candidates.collect {
+      case (nm, sites) if !sites.exists(addressOfFeedsExternalCall) => nm
+    }.toSet
+    // `p -> n`: every pointer-typed local provably aliasing exactly one boxed local
+    // for its whole lifetime -- `p = &n` is the ONLY assignment to `p` anywhere in
+    // this method (see `ptrAliases`'s own doc comment for why this must be stricter
+    // than merely "the only ADDRESS-OF-shaped assignment to `p`").
+    ptrAliases = {
+      val assigns = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+      val assignCounts = assigns.flatMap { a =>
+        kidsOf(a) match { case (t: Identifier) :: _ :: Nil => Some(t.name); case _ => None }
+      }.groupBy(identity).view.mapValues(_.size).toMap
+      assigns.flatMap { a =>
+        kidsOf(a) match {
+          case (t: Identifier) :: (rhs: Call) :: Nil
+              if rhs.methodFullName == "<operator>.addressOf" &&
+                 assignCounts.getOrElse(t.name, 0) == 1 &&
+                 !boxedLocals.contains(localName(t.name)) =>
+            kidsOf(rhs) match {
+              // The alias TARGET must be in the FINAL `boxedLocals` -- not merely
+              // `boxableName`-eligible -- since `boxableName` alone no longer implies
+              // membership (a name can be eligible in shape but still excluded for
+              // feeding an external call at some OTHER address-of site).
+              case List(x) => boxableName(x).filter(boxedLocals.contains).map(localName(t.name) -> _)
+              case _       => None
+            }
+          case _ => None
+        }
+      }.toMap
+    }
+    // `003-box-address-taken-locals`, Increment B: candidate out-parameters of THIS
+    // method -- a parameter actually dereferenced somewhere in the body, and NOT
+    // already boxed under Increment A's own-address-taken case (disjoint by
+    // construction, see `closedOutParams`'s doc comment) -- each checked against the
+    // whole-program precondition (`closedOutParam`).
+    closedOutParams = {
+      val derefOperands = m.body.ast.isCall.filter(_.methodFullName == "<operator>.indirection").l
+        .flatMap(c => kidsOf(c) match { case List(n) => rawLocalOrParamName(n); case _ => None })
+        .toSet
+      m.parameter.l
+        .filter(p => derefOperands.contains(p.name) && !boxedLocals.contains(localName(p.name)))
+        .filter(p => closedOutParam(m, p.index))
+        .map(p => localName(p.name))
+        .toSet
+    }
+    // `004-function-pointer-tracking`: every local/parameter of THIS method assigned
+    // a known, non-capturing, in-program function or method value in exactly one
+    // place in the entire method (research.md §5, mirroring `ptrAliases`'s own
+    // whole-function single-assignment count above, applied to a different RHS
+    // shape). Two rounds: `direct` sources (a plain `METHOD_REF`, or `&function`
+    // wrapping one -- research.md §1) resolve immediately; `chained` sources (RHS is
+    // itself a single-assignment identifier) resolve via a small, bounded
+    // fixed-point pass so `op3 = op2 = op1 = add` all resolve to `add`, not just a
+    // single hop -- bounded rather than recursive, matching this file's own
+    // established style (e.g. `ancestorsTo`'s `guard` counter) since a real chain in
+    // source is never more than a handful of assignments long regardless.
+    fnPtrVars = {
+      val assigns = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+      val assignCounts = assigns.flatMap { a =>
+        kidsOf(a) match { case (t: Identifier) :: _ :: Nil => Some(t.name); case _ => None }
+      }.groupBy(identity).view.mapValues(_.size).toMap
+      // `methodByName.contains(...)` (built from `cpg.method.isExternal(false)`, the
+      // same "is this actually one of our own functions" evidence
+      // `addressOfFeedsExternalCall` already uses) is REQUIRED here, not optional: a
+      // `MethodRef` naming an external/library function is a real value `fnValue`
+      // happily represents today, but rewriting a call through it would change that
+      // call site's hole from `op:pointerCall` to some OTHER hole shape at
+      // evaluation time (the unresolved call name), not leave it "unchanged" as
+      // FR-004 requires — silently relabeling a hole is not the same violation as
+      // answering wrong, but it is still not what this feature is licensed to do.
+      def fnTarget(mr: MethodRef): Option[(String, Boolean)] =
+        if (methodByName.contains(mr.methodFullName))
+          Some((mangledFullName(mr.methodFullName), capturesEnv.getOrElse(mr.methodFullName, false)))
+        else None
+      val direct: Map[String, (String, Boolean)] = assigns.flatMap { a =>
+        kidsOf(a) match {
+          case (t: Identifier) :: (mr: MethodRef) :: Nil if assignCounts.getOrElse(t.name, 0) == 1 =>
+            fnTarget(mr).map(localName(t.name) -> _)
+          case (t: Identifier) :: (addr: Call) :: Nil
+              if assignCounts.getOrElse(t.name, 0) == 1 && addr.methodFullName == "<operator>.addressOf" =>
+            kidsOf(addr) match {
+              case List(mr: MethodRef) => fnTarget(mr).map(localName(t.name) -> _)
+              case _                   => None
+            }
+          case _ => None
+        }
+      }.toMap
+      val chained: Map[String, String] = assigns.flatMap { a =>
+        kidsOf(a) match {
+          case (t: Identifier) :: (src: Identifier) :: Nil if assignCounts.getOrElse(t.name, 0) == 1 =>
+            Some(localName(t.name) -> localName(src.name))
+          case _ => None
+        }
+      }.toMap
+      var resolved = direct
+      var changed  = true
+      var guard    = 0
+      while (changed && guard < 20) {
+        changed = false; guard += 1
+        chained.foreach { case (nm, alias) =>
+          if (!resolved.contains(nm) && resolved.contains(alias)) {
+            resolved += (nm -> resolved(alias)); changed = true
+          }
+        }
+      }
+      // The closure-safety guard (research.md §3): a resolved target that captures
+      // its enclosing scope is excluded -- `Expr.call name args` dispatches with no
+      // captured environment, so translating a call through such a value directly
+      // would silently run it with the wrong (empty) captures instead of a hole.
+      resolved.collect { case (nm, (target, false)) => nm -> target }
+    }
+    // `006-reduce-remaining-holes`, Story 5: array/struct locals of THIS method
+    // admitted under research.md §5.3's scope boundary -- generalising `003`'s
+    // Increment A boundary from scalars to aggregates: never passed as an
+    // argument to any call (in-program or external, by value or by address,
+    // `argFeedsName`) across the WHOLE function, and (automatically, since these
+    // are drawn from `m.local.l`, never `m.parameter.l`) not itself a function
+    // parameter.
+    // A `Call` here means a REAL call (`!startsWith("<operator>")`) only --
+    // Joern represents indexing/assignment/address-of as `Call` nodes too, with
+    // the receiver/operands at `aidx >= 1` exactly like a real argument, so
+    // scanning every `Call` indiscriminately would misclassify `a[1]`'s own
+    // receiver as `a` "escaping" through a call argument. Checked directly
+    // against a live fixture this session (`a[1]` wrongly excluded `a` from
+    // `boxedArrays` before this filter was added), not merely assumed correct
+    // from the operator-call convention alone.
+    def nameEverPassedToCall(nm: String): Boolean =
+      m.body.ast.isCall.filterNot(_.methodFullName.startsWith("<operator>")).l
+        .exists(c => kidsOf(c).exists(k => aidx(k) >= 1 && argFeedsName(k, nm)))
+    // `moduleScope` is checked FIRST and unconditionally, mirroring `boxableName`'s
+    // own existing precedent for scalar boxing: a `<module>`/`<global>` pseudo-
+    // method's own "locals" are actually FILE-SCOPE globals, and every assignment
+    // there already goes through `setGlobal`, not a real local binding -- boxing
+    // one would create a phantom local no `setGlobal`/`name` read anywhere else in
+    // the program would ever see. Missing this exclusion is a confirmed, live bug,
+    // not a hypothetical: `test_vdbecov.c`'s own `<global>` initializer declares a
+    // 200,000-element file-scope array, and boxing it unconditionally produced a
+    // single `Expr.boxFields` with 200,000 fields -- which `render_lean.py` renders
+    // as a 200,000-entry Lean list literal, whose `List.cons` chain blew through
+    // both `maxHeartbeats` and `maxRecDepth` on a real SQLite build. A *global*
+    // array/struct's declaration keeps its existing, unrelated hole
+    // (`op:alloc:array-decl`/`op:arrayDecl:size`/etc.) exactly as before Story 5 --
+    // Story 5's own scope boundary (research.md §5.3) was written for locals within
+    // one function's activation, and a module-scope name was never meant to be in
+    // scope for it at all.
+    boxedArrays = if (moduleScope) Map.empty else {
+      val candidates = m.local.l.flatMap { l =>
+        localTypes.get(l.name).flatMap { ty =>
+          arrayShape.findFirstMatchIn(bareType(ty)).map(mt => localName(l.name) -> mt.group(2).toInt)
+        }
+      }.toMap
+      candidates.filterNot { case (nm, _) => nameEverPassedToCall(nm) }
+    }
+    boxedStructs = if (moduleScope) Map.empty else {
+      val candidates = m.local.l.flatMap { l =>
+        localTypes.get(l.name).filter(isClassType).flatMap { ty =>
+          structTypeDeclOf(ty).map(td => localName(l.name) -> td.member.l.map(_.name))
+        }
+      }.toMap
+      candidates.filterNot { case (nm, _) => nameEverPassedToCall(nm) }
+    }
+    // `006-reduce-remaining-holes`, Story 5: plain pointer locals PROVABLY, for
+    // their whole lifetime, holding an interior pointer VALUE -- `p = &a[i]`,
+    // `p = &s.f` (mirroring `ptrAliases`'s own whole-function single-assignment
+    // discipline), or `p = a` (array-to-pointer decay, C's own rule that an
+    // array used as a value is the address of its first element).
+    ptrIrefNames = {
+      val assigns = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+      val assignCounts = assigns.flatMap { a =>
+        kidsOf(a) match { case (t: Identifier) :: _ :: Nil => Some(t.name); case _ => None }
+      }.groupBy(identity).view.mapValues(_.size).toMap
+      assigns.flatMap { a =>
+        kidsOf(a) match {
+          case (t: Identifier) :: (rhs: Call) :: Nil
+              if rhs.methodFullName == "<operator>.addressOf" &&
+                 assignCounts.getOrElse(t.name, 0) == 1 =>
+            kidsOf(rhs) match {
+              case List(operand)
+                  if boxedArrayIndexOperand(operand).isDefined ||
+                     boxedStructFieldOperand(operand).isDefined =>
+                Some(localName(t.name))
+              case _ => None
+            }
+          case (t: Identifier) :: (src: Identifier) :: Nil
+              if assignCounts.getOrElse(t.name, 0) == 1 &&
+                 boxedArrays.contains(localName(src.name)) =>
+            Some(localName(t.name))
+          case _ => None
+        }
+      }.toSet
+    }
+    val body0 = methodBody(m)
+    // `003-box-address-taken-locals`: allocate every boxed local's/parameter's cell
+    // exactly once, unconditionally, before the translated body's first real
+    // statement runs -- for a parameter, reboxing the plain incoming value; for a
+    // local, starting from `unit` (Core's existing answer for an unassigned local
+    // read before its first write, boxed or not). This is deliberately UNCONDITIONAL
+    // rather than inserted "at the declaration/first assignment": a declaration
+    // without an initializer, first written inside an `if`/`else`, has no single
+    // textual "first binding" that dominates every other write and read, and boxing
+    // only one branch would leave the other reading/writing an unboxed name that
+    // every other reference in the function now expects to be a `Val.ref` -- exactly
+    // the silent-wrong failure Constitution Principle III forbids. An unconditional
+    // prologue sidesteps the question entirely: the box exists before ANY branch of
+    // the body can run, for every control-flow shape, not just the straight-line one.
+    val boxedParamNames = m.parameter.l.map(_.name).filter(boxedLocals.contains).toSet
+    val prologues: List[ujson.Obj] = boxedLocals.toList.sorted.map { nm =>
+      val init = if (boxedParamNames.contains(nm)) boxRef(nm) else ujson.Obj("k" -> "unit")
+      ujson.Obj("k" -> "assign", "x" -> nm, "e" -> ujson.Obj("k" -> "boxNew", "e" -> init))
+    }
+    // `006-reduce-remaining-holes`, Story 5: the same unconditional-prologue
+    // discipline as `boxedLocals` above, extended to arrays/structs -- every
+    // field starts `unit` (Core's own "unassigned local" convention; `003`'s own
+    // precedent for a boxed LOCAL with no incoming value, and every array/struct
+    // this story boxes is a local, never a parameter, per the scope boundary).
+    def boxFieldsExpr(keys: List[String]): ujson.Obj =
+      ujson.Obj("k" -> "boxFields", "fields" -> ujson.Arr.from(
+        keys.map(k => (ujson.Arr(ujson.Str(k), ujson.Obj("k" -> "unit")): ujson.Value))))
+    val aggPrologues: List[ujson.Obj] =
+      boxedArrays.toList.sortBy(_._1).map { case (nm, n) =>
+        ujson.Obj("k" -> "assign", "x" -> nm, "e" -> boxFieldsExpr((0 until n).map(_.toString).toList))
+      } ++
+      boxedStructs.toList.sortBy(_._1).map { case (nm, members) =>
+        ujson.Obj("k" -> "assign", "x" -> nm, "e" -> boxFieldsExpr(members))
+      }
+    val allPrologues = prologues ++ aggPrologues
+    val body = if (allPrologues.isEmpty) body0 else seqOf(allPrologues :+ body0)
     moduleScope = false
     localTypes = Map.empty
     valueReceivers = Set.empty
@@ -2822,6 +4116,13 @@ import io.shiftleft.codepropertygraph.generated.nodes._
     declaredGlobals = Set.empty
     boundMethods = Map.empty
     attrsOf = Map.empty
+    boxedLocals = Set.empty
+    ptrAliases = Map.empty
+    closedOutParams = Set.empty
+    fnPtrVars = Map.empty
+    boxedArrays = Map.empty
+    boxedStructs = Map.empty
+    ptrIrefNames = Set.empty
     // `self` is stripped ONLY for a method of a class, where `applyFunc` binds the
     // receiver itself. A MODULE-LEVEL function whose first parameter happens to be named
     // `self` is not a method and its `self` is an ordinary positional: cachetools defines
@@ -2909,13 +4210,38 @@ import io.shiftleft.codepropertygraph.generated.nodes._
   // it first there.
   val all   = funcs ++ moduleObjectsInit.toList ++ inits
 
-  os.write.over(os.Path(out, os.pwd), ujson.write(ujson.Arr.from(all), indent = 1))
+  // `writeJson` (not `ujson.write`) for the same reason `seqOf`/`moduleObjectsInit` are
+  // now iterative: this is the single call that walks the whole exported tree, including
+  // any long "seq" chain either of them built, and `ujson.write` recurses once per
+  // nesting level to do it (research.md item 1). `indent = 1` is byte-identical to
+  // today's output (verified) and kept whenever nothing long enough to matter was built;
+  // past `seqChainCompactThreshold`, `indent = 1`'s whitespace is quadratic in output
+  // size (confirmed empirically: pretty-printing a 100,000-deep chain this way
+  // OutOfMemoryErrors regardless of stack safety), so compact (`indent = -1`) is used
+  // instead -- valid here per data-model.md, since a run that crosses this threshold
+  // never produced byte-identical (or any) output before this fix.
+  val jsonIndent = if (maxSeqChainLen >= seqChainCompactThreshold) -1 else 1
+  os.write.over(os.Path(out, os.pwd), writeJson(ujson.Arr.from(all), indent = jsonIndent))
 
-  def countKind(v: ujson.Value, k: String): Int = v match {
-    case o: ujson.Obj => (if (o.value.get("k").exists(_.str == k)) 1 else 0) +
-                         o.value.values.map(countKind(_, k)).sum
-    case a: ujson.Arr => a.value.map(countKind(_, k)).sum
-    case _            => 0
+  // Iterative for the same reason `writeJson` is: `all` may contain a "seq" chain as
+  // deep as `maxSeqChainLen`, and this walk is our own code, not `ujson`'s -- a plain
+  // self-recursive version (as this was before) would overflow the JVM stack right after
+  // the write above succeeds, on the very inputs this feature exists to fix.
+  def countKind(v: ujson.Value, k: String): Int = {
+    var total = 0
+    val work = scala.collection.mutable.ArrayBuffer.empty[ujson.Value]
+    work.append(v)
+    while (work.nonEmpty) {
+      work.remove(work.length - 1) match {
+        case o: ujson.Obj =>
+          if (o.value.get("k").exists(_.str == k)) total += 1
+          o.value.values.foreach(work.append(_))
+        case a: ujson.Arr =>
+          a.value.foreach(work.append(_))
+        case _ => ()
+      }
+    }
+    total
   }
   val doc = ujson.Arr.from(all)
   println(s"data model assumed for target-sized integer types: ${dataModel.toLowerCase}"

@@ -25,20 +25,39 @@ namespace Autoform.Core
 
 /-- Source-language dialect.
 
-**Two constructors are not enough** and this is known (STRATEGY.md §29): six languages
+**Two constructors were not enough** and this was known (STRATEGY.md §29): six languages
 have been run through the pipeline and they disagree on integer width, string semantics,
-boolean-operator semantics, and equality. `cLike` currently means "32-bit truncating C"
-and is applied to Java, Go, JavaScript and TypeScript, which are none of those things.
+boolean-operator semantics, and equality. `cLike` used to mean "32-bit truncating C" and
+was applied to Java, Go, JavaScript and TypeScript, which are none of those things.
+`javascript` is the first constructor added past the original two — for JS/TS
+specifically, not for Java/Go, which really do agree with `cLike` on `&&`/`||`
+(`Lang.dialect` still routes them there).
 
-The fix is a constructor per language. The prerequisite — done here — is that *every*
-dialect-dependent decision is a named predicate below rather than a `match` scattered
-through the interpreter, so adding `java`/`go`/`javascript` means extending this table
-and nothing else. Every time this project added a dialect axis (integer division, unary
-minus, strings, now booleans and widths) it under-provisioned it; centralizing the
-decisions is what stops the next axis from touching 56 call sites. -/
+**What `javascript` fixes, because it was measured wrong (`docs/languages.md`):**
+`&&`/`||` now yield an **operand**, not a coerced boolean (`0 || 5` is `5`, not `true`) —
+`boolOpsAreValues := true`, like Python. Arithmetic now uses unbounded integers instead
+of 32-bit two's-complement wraparound — `toNumConfig .javascript = NumConfig.python` —
+which is the specific fix for the measured bug `2147483647 + 1`: Node reports
+`2147483648`, the old `.cLike`-routed Core reported `-2147483648` (wrapped), and unbounded
+arithmetic now agrees with Node up to `Number.MAX_SAFE_INTEGER` (2^53 - 1).
+
+**What `javascript` does NOT fix, named rather than hidden:** real JS numbers are IEEE
+doubles, and this project's `Val` has no single "JS number" representation that is
+sometimes-int-sometimes-float the way `Number` is — `NumConfig.python`'s *unbounded*
+integers are themselves a known-wrong approximation past 2^53 (Numeric.lean already
+recorded this before this dialect existed). Bitwise/shift operators (`&`, `|`, `^`, `<<`,
+`>>`, `>>>`) go through the same `NumConfig`, but real JS converts their operands to
+Int32 first (ECMA `ToInt32`) — a genuinely different width policy from JS's own
+arithmetic operators. Modelling that correctly needs a *second* numeric config per
+dialect (one for arithmetic, one for bitwise), which `Dialect.toNumConfig`'s
+one-config-per-dialect shape does not support yet; until it does, `<<`/`>>`/bitwise ops
+on `.javascript` inherit the unbounded config and are a known, recorded gap, not a
+claimed fix. `Lang.approximated` still marks JavaScript/TypeScript `true` for this
+reason. -/
 inductive Dialect where
   | python
   | cLike
+  | javascript
   deriving Repr, Inhabited, DecidableEq
 
 namespace Dialect
@@ -46,15 +65,17 @@ namespace Dialect
 /-- Do `and`/`or` evaluate to one of their **operands** (Python, JavaScript) rather than
 to a boolean (C, Java, Go)? `0 and 5` is `0` in Python and `1` in C. -/
 def boolOpsAreValues : Dialect → Bool
-  | .python => true
-  | .cLike  => false
+  | .python     => true
+  | .cLike      => false
+  | .javascript => true
 
 /-- Are strings **values** with content equality and concatenation (Python, Java, Go,
 JavaScript), or pointers with address semantics (C)? Under pointer semantics `+`, `<`,
 `>` and `==` on strings are holes rather than the content operations. -/
 def stringsAreValues : Dialect → Bool
-  | .python => true
-  | .cLike  => false
+  | .python     => true
+  | .cLike      => false
+  | .javascript => true
 
 /-- Is `e.f` on a **dict** value a member selection?
 
@@ -68,18 +89,28 @@ Under Python it must **not**: `{'a': 1}.a` is an `AttributeError`, not `1`, and 
 `1` would be a silent wrong answer of the §12 kind. So `.python` says `false` and the
 access stays the `field:a:non-object` hole it has always been.
 
+JavaScript agrees with the C-family answer here, for a different reason: a JS object
+literal's fields genuinely are accessible by dot notation (`({a: 1}).a === 1`), so
+`.javascript` says `true`, like `.cLike`.
+
 Note what this does *not* buy: a `dict` is not on the heap, so `e.f = v` on one is still
 `setField:non-object`. A struct whose fields are written after initialization is a hole,
 not a wrong answer. -/
 def fieldsOnDicts : Dialect → Bool
-  | .python => false
-  | .cLike  => true
+  | .python     => false
+  | .cLike      => true
+  | .javascript => true
 
 /-- Does comparing an integer against a float compare **exactly** (Python: `10**23 ==
-1e23` is `False`), or promote the integer to a double first (C)? -/
+1e23` is `False`), or promote the integer to a double first (C)? JavaScript has no
+separate integer type at runtime — every `Number` is already a double — so there is no
+"exact bignum vs. float" comparison to have; `.javascript` says `false`, matching the
+promote-and-compare behaviour that is the closer model for a language with one numeric
+type. -/
 def comparesIntFloatExactly : Dialect → Bool
-  | .python => true
-  | .cLike  => false
+  | .python     => true
+  | .cLike      => false
+  | .javascript => false
 
 end Dialect
 
@@ -87,13 +118,39 @@ end Dialect
 the oracle measures on x86-64 (SSE2, `FLT_EVAL_METHOD = 0`); switch it to
 `FConfig.cDoubleExcess` to *surface* excess-precision dependence instead of assuming it
 away. As with `NumConfig`, the ledger must record which one a result was obtained under —
-`1.0 / 0.0` is `ZeroDivisionError` under one and `inf` under the other. -/
+`1.0 / 0.0` is `ZeroDivisionError` under one and `inf` under the other. `javascript` also
+gets `cDouble`: JS's `Number` *is* an IEEE binary64, the same format C's `double` uses on
+this architecture. -/
 def Dialect.toFConfig : Dialect → FConfig
-  | .python => FConfig.python
-  | .cLike  => FConfig.cDouble
+  | .python     => FConfig.python
+  | .cLike      => FConfig.cDouble
+  | .javascript => FConfig.cDouble
 
 /-- A heap address. Objects are boxed and mutable; everything else is a value. -/
 abbrev Ref := Nat
+
+/-- `006-reduce-remaining-holes`, Story 5: a position WITHIN a heap-boxed array or
+struct -- an element index, or a field name. Two constructors rather than one unified
+key type because pointer arithmetic (`applyBinop` below) is only ever defined, in
+standard C, for the array/`.idx` case: a struct field's address has no `+`/`-` outside
+an array-typed field, which stays a hole under `"iref:arith-on-field"` rather than
+inventing a meaning C itself does not give. -/
+inductive Sel where
+  | idx : Int → Sel
+  | fld : String → Sel
+  deriving Repr, Inhabited, DecidableEq
+
+namespace Sel
+
+/-- The one bridge to `Heap.getField`/`setField`'s existing `String`-keyed lookup: an
+array's elements are `Obj.fields` entries keyed by their decimal-string index, reusing
+the exact association list `003`'s scalar boxes already use -- no `Heap`-level change
+at all. -/
+def key : Sel → String
+  | .idx n => toString n
+  | .fld f => f
+
+end Sel
 
 /-- Runtime values. A small universal core; anything richer becomes a hole. -/
 inductive Val where
@@ -116,6 +173,13 @@ inductive Val where
   | dict  : List (Val × Val) → Val
   /-- A reference to a heap object. Reference identity is what `is` compares. -/
   | ref   : Ref → Val
+  /-- `006-reduce-remaining-holes`, Story 5: an INTERIOR pointer -- a reference to a
+  heap-boxed array/struct PLUS a position within it. The one genuinely new
+  representational concept this project's whole history has needed: `Val.ref` alone
+  can name an object, but cannot express "partway into" one. Not derived from `Val.ref`
+  because a bare object reference and a positioned interior pointer must stay
+  distinguishable to `applyBinop` below (only the latter has pointer arithmetic). -/
+  | iref  : Ref → Sel → Val
   /-- A function or method used as a value (`METHOD_REF`), or a class (`TYPE_REF`). -/
   | fn    : String → Val
   /-- A class together with the bindings it captured, for classes defined inside a
@@ -340,6 +404,47 @@ inductive Expr where
   | dstarred : Expr → Expr
   /-- Unmapped expression, tagged with the originating CPG node label. -/
   | hole   : String → Expr
+  /-- Unconditional heap allocation of a fresh single-field `Obj` -- `{cls :=
+  "<local>", fields := [("v", value)]}` -- holding the evaluated argument, returning
+  the resulting `Val.ref`. This is the ONE new primitive `003-box-address-taken-locals`
+  needs (`research.md` item 2): boxing an address-taken local reuses `Expr.field`/
+  `Stmt.setField` as-is for reads/writes of the box, but allocation has no existing
+  counterpart. `Expr.alloc` is the wrong tool for it -- `Expr.alloc`'s documented
+  semantics is "run `Cls.__init__` if one is known" for a NAMED class, which is either
+  undefined behaviour or an accidental fallback for a synthetic box that has no class
+  and no constructor. `Expr.boxNew` is unconditional and constructor-free: it always
+  allocates, exactly once, with exactly one field. -/
+  | boxNew : Expr → Expr
+  /-- `006-reduce-remaining-holes`, Story 5: `Expr.boxNew` generalised from exactly one
+  field (`"v"`) to N -- allocates a fresh, multi-field `Obj` from a list of (key,
+  initial-value) pairs, evaluated left-to-right, returning the resulting `Val.ref`. The
+  producer is the unconditional per-function allocation prologue for every array/struct
+  local Story 5's own scope boundary admits: an array's elements become fields keyed by
+  their decimal-string index (`"0"`, `"1"`, ...), a struct's members become fields keyed
+  by their real member names.
+
+  The key of each pair is an `Expr` (always a string LITERAL, in every site this project
+  emits), not a bare `String`, DELIBERATELY: it lets evaluation reuse `evalPairs` --
+  already proven fuel-monotone as part of `Expr.dictE`'s own machinery -- verbatim,
+  rather than a second, parallel list-evaluator needing its own proof. Any key that does
+  not evaluate to a `Val.str` is a hole, never reached by anything the exporter emits. -/
+  | boxFields : List (Expr × Expr) → Expr
+  /-- `006-reduce-remaining-holes`, Story 5: `&a[i]` once `a` is a boxed array --
+  evaluates the receiver to `Val.ref r`, evaluates the index, and produces
+  `Val.iref r (.idx i)`. Takes a full sub-`Expr` for the index (not a literal), since
+  most real `&a[i]` sites have a runtime-valued `i`. The address-of counterpart to
+  `Expr.index` (a whole-VALUE read); does not replace it. -/
+  | irefIndex : Expr → Expr → Expr
+  /-- `006-reduce-remaining-holes`, Story 5: `&s.f` once `s` is a boxed struct --
+  evaluates the receiver to `Val.ref r`, produces `Val.iref r (.fld f)`. The
+  address-of counterpart to `Expr.field` (a whole-VALUE read); does not replace it. -/
+  | irefField : Expr → String → Expr
+  /-- `006-reduce-remaining-holes`, Story 5: `*p` where `p` is an interior-pointer
+  VALUE (as opposed to `Expr.field`, which takes an explicit field name for a NAMED
+  receiver). Requires its operand to evaluate to `Val.iref r sel` and delegates,
+  unconditionally, to the unchanged `Heap.getField h r sel.key` -- no `Heap`-level
+  change at all. -/
+  | derefIref : Expr → Expr
   deriving Repr, Inhabited
 
 /-- Statements. -/
@@ -351,6 +456,11 @@ inductive Stmt where
   | setField : Expr → String → Expr → Stmt
   /-- `e[i] = v` -/
   | setIndex : Expr → Expr → Expr → Stmt
+  /-- `006-reduce-remaining-holes`, Story 5: `*p = v` where `p` is an interior-pointer
+  VALUE (as opposed to `Stmt.setField`, which takes an explicit field name for a NAMED
+  receiver). Requires its pointer operand to evaluate to `Val.iref r sel` and
+  delegates, unconditionally, to the unchanged `Heap.setField h r sel.key v`. -/
+  | setDerefIref : Expr → Expr → Stmt
   | seq      : Stmt → Stmt → Stmt
   | ifte     : Expr → Stmt → Stmt → Stmt
   | loop     : Expr → Stmt → Stmt
@@ -453,6 +563,11 @@ def holes : Expr → List String
   | .starred a    => holes a
   | .kwargE _ a   => holes a
   | .dstarred a   => holes a
+  | .boxNew a     => holes a
+  | .boxFields kvs => holesP kvs
+  | .irefIndex a i => holes a ++ holes i
+  | .irefField a _ => holes a
+  | .derefIref a   => holes a
   | _             => []
 
 /-- Holes across a list of expressions. -/
@@ -485,6 +600,11 @@ def size : Expr → Nat
   | .starred a    => 1 + size a
   | .kwargE _ a   => 1 + size a
   | .dstarred a   => 1 + size a
+  | .boxNew a     => 1 + size a
+  | .boxFields kvs => 1 + sizeP kvs
+  | .irefIndex a i => 1 + size a + size i
+  | .irefField a _ => 1 + size a
+  | .derefIref a   => 1 + size a
   | _             => 1
 
 /-- Node count across a list of expressions. -/
@@ -509,6 +629,7 @@ def holes : Stmt → List String
   | .assign _ e      => e.holes
   | .setField r _ v  => r.holes ++ v.holes
   | .setIndex r i v  => r.holes ++ i.holes ++ v.holes
+  | .setDerefIref p v => p.holes ++ v.holes
   | .seq a b         => a.holes ++ b.holes
   | .ifte c a b      => c.holes ++ a.holes ++ b.holes
   | .loop c a        => c.holes ++ a.holes
@@ -526,6 +647,7 @@ def size : Stmt → Nat
   | .assign _ e      => 1 + e.size
   | .setField r _ v  => 1 + r.size + v.size
   | .setIndex r i v  => 1 + r.size + i.size + v.size
+  | .setDerefIref p v => 1 + p.size + v.size
   | .seq a b         => a.size + b.size
   | .ifte c a b      => 1 + c.size + a.size + b.size
   | .loop c a        => 1 + c.size + a.size
@@ -578,6 +700,7 @@ def Val.kind : Val → Nat
   | .clos _ _    => 10
   | .clsClos _ _ => 11
   | .bobj _ _    => 12
+  | .iref _ _    => 13
 
 /-- Python `is` -- reference identity, as a PARTIAL function.
 
@@ -823,6 +946,8 @@ def Val.truthy : Val → Bool
   | .tuple vs => !vs.isEmpty
   | .dict kvs => !kvs.isEmpty
   | .ref _    => true
+  -- An interior pointer is an address, exactly like `.ref` -- never falsy.
+  | .iref _ _ => true
   | .fn _     => true
   | .clos _ _ => true
   | .clsClos _ _ => true

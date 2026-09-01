@@ -245,10 +245,16 @@ end NumConfig
 
 /-- Numeric config implied by a `Core.Dialect`. `cLike` gets the *wrapping* 32-bit
 signed config, so the interpreter agrees with the compiler the oracle measures; use
-`NumConfig.c32` explicitly to surface UB reliance instead. -/
+`NumConfig.c32` explicitly to surface UB reliance instead. `javascript` gets `python`
+(unbounded): this is the specific, measured fix for `2147483647 + 1` (Node:
+`2147483648`; the old `.cLike`-routed answer: `-2147483648`) and is exact for every
+value up to `Number.MAX_SAFE_INTEGER`. It is still a *named* approximation past that
+bound, and for the bitwise/shift operators, which real JS truncates to Int32 and this
+config does not — see `Dialect`'s doc comment in `Syntax.lean`. -/
 def Dialect.toNumConfig : Dialect → NumConfig
-  | .python => NumConfig.python
-  | .cLike  => NumConfig.c32Wrapv
+  | .python     => NumConfig.python
+  | .cLike      => NumConfig.c32Wrapv
+  | .javascript => NumConfig.python
 
 /-! ## Results -/
 
@@ -622,6 +628,15 @@ example : NumConfig.c32Wrapv.mul 100000 100000 = .ok 1410065408 := by decide
 #eval NumConfig.u32.add 4294967295 1              -- ok 0
 #eval NumConfig.java32.neg (-2147483648)          -- ok (-2147483648)
 
+-- The measured JS bug (research.md / docs/languages.md), now fixed and checked at build
+-- time rather than only in a fixture whose export shape may or may not exercise it:
+-- Node reports `2147483647 + 1 === 2147483648`. Under the OLD `.cLike`-routed dialect
+-- this wrapped to -2147483648, same as `NumConfig.c32Wrapv` above -- a confirmed wrong
+-- answer. `Dialect.javascript.toNumConfig` is `NumConfig.python` (unbounded), so it now
+-- agrees with Node exactly, up to `Number.MAX_SAFE_INTEGER`.
+#eval Dialect.javascript.toNumConfig.add 2147483647 1   -- ok 2147483648  (matches Node)
+#eval Dialect.javascript.toNumConfig.mul 100000 100000  -- ok 10000000000 (matches Node)
+
 -- INT_MIN / -1.
 #eval NumConfig.c32.div (-2147483648) (-1)        -- ub "signed integer overflow"
 #eval NumConfig.java32.div (-2147483648) (-1)     -- ok (-2147483648)
@@ -665,19 +680,22 @@ end Evidence
 
 /-! ## Languages, and the approximation each one is currently under
 
-`Dialect` has two constructors, and §29 records that two are not enough: Java, Go and
-JavaScript are all run as `.cLike`, which is right about `and`/`or` for Java and Go and
-**wrong** for JavaScript, where `0 || 5` is `5`. Collapsing them was invisible because
-nothing in the build ever named a language.
+`Dialect` originally had two constructors, and §29 recorded that two were not enough:
+Java, Go and JavaScript were all run as `.cLike`, which is right about `and`/`or` for
+Java and Go and **wrong** for JavaScript, where `0 || 5` is `5`. Collapsing them was
+invisible because nothing in the build ever named a language.
 
-`Lang` names it. It does not fix the approximation — it makes the approximation a
-statement you can read, and `Lang.approximated` lists exactly which languages are
-currently sharing semantics with a language they do not agree with.
+`Lang` names it. `javascript`/`typescript` now route to the real `Dialect.javascript`
+(see `Syntax.lean`) instead of `.cLike`, which fixes the measured `&&`/`||` and integer-
+overflow bugs; `Lang.approximated` still marks them `true` because the bitwise/shift-op
+gap documented on `Dialect` itself remains open. Java and Go stay on `.cLike`, which is
+still the correct call for their boolean operators.
 
-Why this is additive rather than the constructor-per-language split §29 actually calls
-for: about 110 sites still `match` on `Dialect` directly, so adding constructors makes
-every one of them non-exhaustive at once. That split is the right end state and is
-blocked only on those sites, not on this type. -/
+Why constructor-per-language for the *other* under-provisioned languages (Java, Go) is
+still additive rather than done: about 110 sites still `match` on `Dialect` directly, so
+adding a constructor makes every one of them non-exhaustive at once — which is exactly
+what happened, and was worked through, when `javascript` was added. `java`/`go`
+constructors are the same shape of work, not yet done. -/
 inductive Lang where
   | python | c | java | go | javascript | typescript | kotlin
   deriving Repr, Inhabited, DecidableEq
@@ -700,20 +718,24 @@ def extensions : Lang → List String
 approximations; `approximated` says which. -/
 def dialect : Lang → Dialect
   | .python     => .python
-  -- Correct for `and`/`or`: Java and Go really do yield a bool.
+  -- Correct for `and`/`or`: Java and Go really do yield a bool. No constructor of their
+  -- own yet (see the module doc comment above), so they stay on `.cLike`.
   | .java | .go | .c => .cLike
-  -- WRONG for `and`/`or`: JS and TS yield an operand, like Python, not a bool.
-  -- Mapped to `.cLike` because their *strings* and *numerics* are further from Python
-  -- than their boolean operators are — a two-constructor type cannot get both right.
-  | .javascript | .typescript => .cLike
+  -- `.javascript` is a real constructor now (Syntax.lean): `&&`/`||` yield an operand
+  -- and arithmetic no longer wraps at 32 bits. TypeScript shares it — type erasure means
+  -- TS's runtime numeric/boolean/string behaviour is JS's.
+  | .javascript | .typescript => .javascript
   -- Kotlin's `&&`/`||` are bool-valued, like Java's.
   | .kotlin     => .cLike
 
 /-- Does this language's real behaviour disagree with the dialect it is run under, in a
 way the semantics can currently express? Each `true` is a known-wrong answer, not an
-unknown one. -/
+unknown one. JS/TS's `&&`/`||`/overflow bugs are fixed by `.javascript`; `true` here now
+tracks the *narrower*, still-open gap: real JS truncates bitwise/shift operands to
+Int32, and `.javascript`'s one `NumConfig` (unbounded, chosen to fix arithmetic) does not
+model that separately — see `Dialect`'s doc comment in `Syntax.lean`. -/
 def approximated : Lang → Bool
-  | .javascript | .typescript => true   -- bool ops yield an operand; `.cLike` says bool
+  | .javascript | .typescript => true   -- bitwise/shift ops still truncate wrong
   | _ => false
 
 /-- The integer model. `java64` and `go64` were written months ago and never wired to
@@ -723,9 +745,10 @@ def numConfig : Lang → NumConfig
   | .c                        => NumConfig.c32
   | .java | .kotlin           => NumConfig.java64
   | .go                       => NumConfig.go64
-  -- JS/TS numbers are IEEE doubles, not integers at all. `python`'s unbounded integers
-  -- are the wrong answer too; this is recorded as wrong rather than dressed up.
-  | .javascript | .typescript => NumConfig.python
+  -- JS/TS numbers are IEEE doubles, not integers at all; `.javascript`'s `NumConfig` is
+  -- `NumConfig.python` (unbounded) — exact up to `Number.MAX_SAFE_INTEGER`, a named
+  -- approximation beyond it and for bitwise/shift ops. See `Dialect.toNumConfig`.
+  | .javascript | .typescript => Dialect.javascript.toNumConfig
 
 /-- Languages whose semantics are currently known to be wrong. -/
 def known_wrong : List Lang :=

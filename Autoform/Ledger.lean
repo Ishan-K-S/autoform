@@ -325,8 +325,9 @@ def Program.ledger (p : Program) (name : String) : String :=
 
 /-- Human-readable dialect name, for the ledger and for provenance in the assurance case. -/
 def Dialect.name : Dialect -> String
-  | .python => "python"
-  | .cLike  => "c-like"
+  | .python     => "python"
+  | .cLike      => "c-like"
+  | .javascript => "javascript"
 
 /-- Machine-readable ledger, for `scripts/sacm.py` to consume as evidence.
 
