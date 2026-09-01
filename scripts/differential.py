@@ -1226,16 +1226,19 @@ LANG_BY_EXT = {".py": "python", ".pyi": "python",
                ".ts": "ts", ".tsx": "ts", ".mts": "ts",
                ".kt": "kotlin", ".kts": "kotlin"}
 
-# The Core dialect each language *should* have. There are only two constructors
-# (`.python`, `.cLike`), so some languages necessarily run under an approximation:
-# JS/TS `&&`/`||` yield an operand (Python-like) while `/` is float division and all
-# numbers are doubles (neither dialect). Where the run is approximate it says so, and a
-# divergence traceable to that is reported as a dialect gap, not a transpiler bug.
+# The Core dialect each language *should* have. Java, Go and Kotlin have no constructor
+# of their own yet, so they necessarily run under an approximation (`.cLike`). JS/TS now
+# have their own `Autoform.Core.Dialect.javascript` (fixes the measured `&&`/`||` and
+# 32-bit-overflow bugs, `docs/languages.md`), so they are no longer flagged inexact for
+# those — but `.javascript`'s bitwise/shift operators still truncate wrong (real JS
+# converts them to Int32; `.javascript`'s one `NumConfig` does not model that
+# separately), so a divergence traceable to `&`/`|`/`^`/`<<`/`>>`/`>>>` is still a named
+# dialect gap, not a transpiler bug — see `Dialect`'s doc comment in `Syntax.lean`.
 DIALECT_FOR = {"python": ("python", True), "c": ("cLike", True),
                "java": ("cLike", False),      # java64 NumConfig exists but is unused
                "go": ("cLike", False),        # go64 likewise
-               "js": ("python", False),       # operand-valued &&/||, but float `/`
-               "ts": ("python", False),
+               "js": ("javascript", True),    # bitwise/shift ops remain an approximation
+               "ts": ("javascript", True),    # (see comment above); everything else fixed
                "kotlin": ("cLike", False)}
 
 TOOLCHAIN = {"python": [], "c": ["cc"], "java": ["javac", "java"], "go": ["go"],
@@ -1646,9 +1649,9 @@ def main():
           % (lang, ", ".join("%s x%d" % (e, n) for e, n in sorted(exts.items())),
              runtime, "" if not missing else "  [MISSING: %s]" % ", ".join(missing)))
     if not exact:
-        print("  dialect note: Core has only .python and .cLike, so %s runs under an "
-              "approximation (wants a %s-specific dialect; java64/go64 NumConfigs "
-              "exist but are unwired)." % (lang, lang))
+        print("  dialect note: Core has no %s-specific dialect yet (only .python, "
+              ".cLike, .javascript exist), so %s runs under an approximation "
+              "(java64/go64 NumConfigs exist but are unwired)." % (lang, lang))
 
     holefree = [f for f in funcs if not has_hole(f["body"])]
     # NOTE ON MEASUREMENT BASIS. `skip_varargs` used to exist here and was removed

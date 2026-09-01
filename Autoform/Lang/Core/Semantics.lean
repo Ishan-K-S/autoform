@@ -58,15 +58,23 @@ This was not designed in. It was found by `scripts/differential.py`, which caugh
 propagating into `gcdish`. That is what the conformance oracle is for.
 -/
 
-/-- Integer division under a dialect. -/
-def Dialect.idiv : Dialect → Int → Int → Int
-  | .python, a, b => Int.fdiv a b
-  | .cLike,  a, b => Int.tdiv a b
+/-- Integer division under a dialect.
 
-/-- Integer remainder under a dialect. -/
+Unused by `applyBinop` (superseded by `NumConfig.quot`, per this section's own intro);
+kept, and kept exhaustive, because `Numeric.lean` cites it as the pattern's first
+instance. `.javascript` mirrors `.python`'s arm: `Dialect.toNumConfig .javascript` is
+`NumConfig.python`, whose `divRound` is `.floor`. -/
+def Dialect.idiv : Dialect → Int → Int → Int
+  | .python,     a, b => Int.fdiv a b
+  | .cLike,      a, b => Int.tdiv a b
+  | .javascript, a, b => Int.fdiv a b
+
+/-- Integer remainder under a dialect. See `idiv` — unused, kept exhaustive and
+consistent with it. -/
 def Dialect.imod : Dialect → Int → Int → Int
-  | .python, a, b => Int.fmod a b
-  | .cLike,  a, b => Int.tmod a b
+  | .python,     a, b => Int.fmod a b
+  | .cLike,      a, b => Int.tmod a b
+  | .javascript, a, b => Int.fmod a b
 
 
 /-- Result of executing a statement: how control left it. -/
@@ -147,15 +155,19 @@ def flCmp (d : Dialect) : Val → Val → Option Ordering
   | .int n,   .float y =>
       match d with
       | .python => Fl.cmpIntv n y                     -- exact, no conversion
-      | .cLike  => match (d.toFConfig).ofInt n with   -- C promotes, and may round
-                   | .ok x => Fl.cmpv x y
-                   | _     => none
+      -- `comparesIntFloatExactly d = false` for both: JS has no separate int type to be
+      -- exact about, so it promotes like C.
+      | .cLike | .javascript =>
+          match (d.toFConfig).ofInt n with
+          | .ok x => Fl.cmpv x y
+          | _     => none
   | .float x, .int n   =>
       (match d with
        | .python => Fl.cmpIntv n x
-       | .cLike  => match (d.toFConfig).ofInt n with
-                    | .ok y => Fl.cmpv y x
-                    | _     => none).map Ordering.swap
+       | .cLike | .javascript =>
+           match (d.toFConfig).ofInt n with
+           | .ok y => Fl.cmpv y x
+           | _     => none).map Ordering.swap
   | _,        _        => none
 
 /-- Turn a comparison outcome into the answer for a relational operator. Unordered is
@@ -294,6 +306,64 @@ def applyBinop (d : Dialect) (op : String) (a b : Val) : EResult :=
   -- `applyBinop_py_div`), so `"//"` is unreachable from the present corpora and exists so
   -- that the transpiler can start emitting the two separately.
   | "//", .int x, .int y => numToE (nc.div x y)
+  -- `006-reduce-remaining-holes`, Story 5: interior-pointer arithmetic and
+  -- comparison. Placed BEFORE the generic `"==",x,y`/`"!=",x,y` catch-all just
+  -- below, deliberately: those would otherwise route an `.iref`/`.iref` pair
+  -- through `Val.beq`, whose own wildcard (`Syntax.lean`) answers `false`
+  -- unconditionally, silently wrong for FR-013's own "cross-object `==` is
+  -- well-defined, not a hole" requirement.
+  --
+  -- Same-object arithmetic/subtraction/ordering succeed (an array's elements
+  -- only -- a struct FIELD's address has no `+`/`-`/ordering in standard C, so a
+  -- `.fld` selector on either side of one of those three stays a hole, `Sel`'s own
+  -- doc comment's reasoning). Cross-object arithmetic, subtraction and ordering
+  -- (undefined behaviour in C itself) become a DYNAMIC hole -- evaluation-time, not
+  -- export-time, mirroring the already-shipped `.str`/`.str` `.cLike`
+  -- "pointer-arithmetic/-compare-not-modelled" precedent just above. Equality and
+  -- inequality are NOT gated on same-object: comparing addresses for equality
+  -- across two different objects is well-defined in C (it is only ordering and
+  -- subtraction across objects that are UB), so `==`/`!=` answer directly from
+  -- `(ref, selector)` structural equality regardless of which object each side
+  -- names.
+  | "+", .iref r sel, .int n =>
+      match sel with
+      | .idx i => .val (.iref r (.idx (i + n)))
+      | .fld _ => .hole "iref:arith-on-field"
+  | "+", .int n, .iref r sel =>
+      match sel with
+      | .idx i => .val (.iref r (.idx (i + n)))
+      | .fld _ => .hole "iref:arith-on-field"
+  | "-", .iref r sel, .int n =>
+      match sel with
+      | .idx i => .val (.iref r (.idx (i - n)))
+      | .fld _ => .hole "iref:arith-on-field"
+  | "-", .iref r1 s1, .iref r2 s2 =>
+      if r1 != r2 then .hole "iref:cross-object"
+      else match s1, s2 with
+           | .idx i, .idx j => numToE (nc.sub i j)
+           | _,      _      => .hole "iref:sub-non-index"
+  | "<",  .iref r1 s1, .iref r2 s2 =>
+      if r1 != r2 then .hole "iref:cross-object"
+      else match s1, s2 with
+           | .idx i, .idx j => .val (.bool (i < j))
+           | _,      _      => .hole "iref:cmp-non-index"
+  | "<=", .iref r1 s1, .iref r2 s2 =>
+      if r1 != r2 then .hole "iref:cross-object"
+      else match s1, s2 with
+           | .idx i, .idx j => .val (.bool (i ≤ j))
+           | _,      _      => .hole "iref:cmp-non-index"
+  | ">",  .iref r1 s1, .iref r2 s2 =>
+      if r1 != r2 then .hole "iref:cross-object"
+      else match s1, s2 with
+           | .idx i, .idx j => .val (.bool (i > j))
+           | _,      _      => .hole "iref:cmp-non-index"
+  | ">=", .iref r1 s1, .iref r2 s2 =>
+      if r1 != r2 then .hole "iref:cross-object"
+      else match s1, s2 with
+           | .idx i, .idx j => .val (.bool (i ≥ j))
+           | _,      _      => .hole "iref:cmp-non-index"
+  | "==", .iref r1 s1, .iref r2 s2 => .val (.bool (r1 == r2 && s1 == s2))
+  | "!=", .iref r1 s1, .iref r2 s2 => .val (.bool !(r1 == r2 && s1 == s2))
   | "==", x, y           => .val (.bool (Val.beq x y))
   | "!=", x, y           => .val (.bool (!Val.beq x y))
   -- Reached only when the left operand did not decide the result, so the value
@@ -329,6 +399,26 @@ mathematical model where nothing overflows.
     applyBinop .python "/" (.int x) (.int 0) = .exn (.str "ZeroDivisionError") := rfl
 @[simp] theorem applyBinop_py_modZero (x : Int) :
     applyBinop .python "%" (.int x) (.int 0) = .exn (.str "ZeroDivisionError") := rfl
+
+/-! ### The two measured JS bugs (research.md / docs/languages.md), checked here rather
+than only in a real corpus, whose export shape may or may not exercise them. -/
+
+/-- Node: `0 || 5` is `5`. Under the OLD `.cLike`-routed dialect this returned a coerced
+`Val.bool`, a confirmed wrong answer. `Val`/`EResult` have no `DecidableEq` (`Syntax.lean`
+derives only `Repr, Inhabited` for both), so this is `rfl`, not `decide` — matching how
+`applyBinop_py_add` etc. above are proved. -/
+example : applyBinop .javascript "||" (.int 0) (.int 5) = .val (.int 5) := rfl
+#eval applyBinop .javascript "||" (.int 0) (.int 5)   -- val (int 5), matches Node
+
+/-- Node: `1 && 0` is `0` (the second operand, since the first is truthy). -/
+example : applyBinop .javascript "&&" (.int 1) (.int 0) = .val (.int 0) := rfl
+#eval applyBinop .javascript "&&" (.int 1) (.int 0)   -- val (int 0), matches Node
+
+/-- Node: `2147483647 + 1 === 2147483648`. Under the OLD `.cLike`-routed dialect this
+wrapped to `-2147483648`, the same confirmed-wrong answer `applyBinop_c_add` above would
+give (32-bit wraparound). -/
+example : applyBinop .javascript "+" (.int 2147483647) (.int 1) = .val (.int 2147483648) := rfl
+#eval applyBinop .javascript "+" (.int 2147483647) (.int 1)  -- val (int 2147483648)
 
 /-! ### Float equations, and the two that must not regress
 
@@ -1078,6 +1168,69 @@ def evalExpr (ctx : Ctx) : Nat → Heap → Env → Expr → Heap × EResult
           | some (h₃, .mutating _ _) => (h₃, .hole s!"mcall:{m}:unboxed-container")
           | none                     => (h₂, .hole s!"mcall:{m}:non-object")
       | (h₁, r)      => (h₁, r)
+  -- `003-box-address-taken-locals`: unconditional, constructor-free allocation of a
+  -- fresh single-field box. Evaluate the argument, allocate `{cls := "<local>",
+  -- fields := [("v", value)]}`, and yield the resulting `Val.ref` -- no class lookup,
+  -- no `__init__`, unlike `.alloc` just below.
+  | n+1, h, ρ, .boxNew e =>
+      match evalExpr ctx n h ρ e with
+      | (h₁, .val v) =>
+        let (h₂, r) := h₁.alloc { cls := "<local>", fields := [("v", v)] }
+        (h₂, .val (.ref r))
+      | (h₁, r) => (h₁, r)
+  -- `006-reduce-remaining-holes`, Story 5: `Expr.boxNew` generalised to N fields --
+  -- evaluate every (key, value) pair left-to-right, allocate one fresh `Obj` from the
+  -- whole list, and yield `Val.ref`. The producer is the unconditional per-function
+  -- allocation prologue for every array/struct local the exporter's own scope
+  -- boundary admits (research.md §5.3-§5.4); this is what closes the pre-existing
+  -- §5.1 gap (a plain struct local that looked hole-free but silently depended on a
+  -- `setField` special case that did not cover it) for every struct this admits.
+  --
+  -- Reuses `evalPairs` verbatim (each key an `Expr`, always a string literal at
+  -- every site the exporter emits) rather than a parallel `String`-keyed evaluator:
+  -- `evalPairs` is already proven fuel-monotone as part of `dictE`'s own machinery
+  -- (`Autoform/FuelMono.lean`), so `boxFields` needs no separate proof obligation of
+  -- its own -- only the fuel-free key-extraction step below is new.
+  | n+1, h, ρ, .boxFields kvs =>
+      match evalPairs ctx n h ρ kvs with
+      | (h₁, .inr pairs) =>
+        match pairs.foldr (fun kv acc => match kv.1, acc with
+                | .str k, some rest => some ((k, kv.2) :: rest)
+                | _,      _         => none) (some []) with
+        | some fields =>
+          let (h₂, r) := h₁.alloc { cls := "<local>", fields := fields }
+          (h₂, .val (.ref r))
+        | none => (h₁, .hole "boxFields:non-string-key")
+      | (h₁, .inl res) => (h₁, res)
+  -- `006-reduce-remaining-holes`, Story 5: `&a[i]` once `a` is a boxed array --
+  -- evaluate the receiver to `Val.ref r`, evaluate the index, produce
+  -- `Val.iref r (.idx i)`. Anything else is a shape the exporter's own scope
+  -- boundary should never have emitted this node for; named as a hole rather than
+  -- risking a wrong answer, per this project's own discipline.
+  | n+1, h, ρ, .irefIndex a i =>
+      match evalExpr ctx n h ρ a with
+      | (h₁, .val (.ref r)) =>
+        match evalExpr ctx n h₁ ρ i with
+        | (h₂, .val (.int k)) => (h₂, .val (.iref r (.idx k)))
+        | (h₂, .val _)        => (h₂, .hole "irefIndex:non-int-index")
+        | (h₂, res)           => (h₂, res)
+      | (h₁, .val _) => (h₁, .hole "irefIndex:non-object")
+      | (h₁, res)    => (h₁, res)
+  -- `006-reduce-remaining-holes`, Story 5: `&s.f` once `s` is a boxed struct --
+  -- evaluate the receiver to `Val.ref r`, produce `Val.iref r (.fld f)`.
+  | n+1, h, ρ, .irefField a f =>
+      match evalExpr ctx n h ρ a with
+      | (h₁, .val (.ref r)) => (h₁, .val (.iref r (.fld f)))
+      | (h₁, .val _)        => (h₁, .hole "irefField:non-object")
+      | (h₁, res)           => (h₁, res)
+  -- `006-reduce-remaining-holes`, Story 5: `*p`, `p` an interior-pointer VALUE --
+  -- requires the operand to evaluate to `Val.iref r sel` and delegates,
+  -- unconditionally, to the unchanged `Heap.getField` -- no `Heap`-level change.
+  | n+1, h, ρ, .derefIref a =>
+      match evalExpr ctx n h ρ a with
+      | (h₁, .val (.iref r sel)) => (h₁, .val (h₁.getField r sel.key))
+      | (h₁, .val _)             => (h₁, .hole "derefIref:non-iref")
+      | (h₁, res)                => (h₁, res)
   | n+1, h, ρ, .alloc cls args =>
       match evalList ctx n h ρ args with
       | (h₁, .inl r)  => (h₁, r)
@@ -1286,6 +1439,21 @@ def execStmt (ctx : Ctx) : Nat → Heap → Env → Stmt → Heap × Ctl
   | n+1, h, ρ, .setIndex _ _ _ =>
       -- Container mutation needs boxed containers, which Core does not have yet.
       (h, .hole "setIndex:immutable-containers")
+  -- `006-reduce-remaining-holes`, Story 5: `*p = v`, `p` an interior-pointer VALUE --
+  -- requires the pointer operand to evaluate to `Val.iref r sel` and delegates,
+  -- unconditionally, to the unchanged `Heap.setField`.
+  | n+1, h, ρ, .setDerefIref p v =>
+      match evalExpr ctx n h ρ p with
+      | (h₁, .val (.iref r sel)) =>
+        match evalExpr ctx n h₁ ρ v with
+        | (h₂, .val vv)    => (h₂.setField r sel.key vv, .normal ρ)
+        | (h₂, .exn e)     => (h₂, .exn e)
+        | (h₂, .hole l)    => (h₂, .hole l)
+        | (h₂, .outOfFuel) => (h₂, .outOfFuel)
+      | (h₁, .val _)      => (h₁, .hole "setDerefIref:non-iref")
+      | (h₁, .exn e)      => (h₁, .exn e)
+      | (h₁, .hole l)     => (h₁, .hole l)
+      | (h₁, .outOfFuel)  => (h₁, .outOfFuel)
   | n+1, h, ρ, .seq a b =>
       match execStmt ctx n h ρ a with
       | (h₁, .normal ρ') => execStmt ctx n h₁ ρ' b

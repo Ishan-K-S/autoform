@@ -289,7 +289,7 @@ on `.int` but not on `.str` — that residue is `dynamic-hole risk`, exactly lik
 `field`/`index` cases the ledger already counts there. -/
 def knowsFree (d : Dialect) (name : String) : Bool :=
   match d with
-  | .cLike  => false
+  | .cLike | .javascript => false
   | .python => freeNames.contains name
 
 /-- The builtin bodies. Call `builtin`, not this: only `builtin` carries the `knowsFree`
@@ -297,7 +297,7 @@ guard that keeps the ledger honest. -/
 def builtinCore (d : Dialect) (h : Heap) (name : String) (args : List Val) :
     Option (Heap × EResult) :=
   match d with
-  | .cLike => none
+  | .cLike | .javascript => none
   | .python =>
     let ok (r : EResult) : Option (Heap × EResult) := some (h, r)
     let v (x : Val) : Option (Heap × EResult) := ok (.val x)
@@ -457,7 +457,7 @@ String methods are not modelled at all: an exception value and a string are the 
 def methodCore (d : Dialect) (h : Heap) (recv : Val) (name : String) (args : List Val) :
     Option (Heap × MethodResult) :=
   match d with
-  | .cLike => none
+  | .cLike | .javascript => none
   | .python =>
     let p (r : EResult) : Option (Heap × MethodResult) := some (h, .pure r)
     let pv (x : Val) : Option (Heap × MethodResult) := p (.val x)
@@ -559,7 +559,7 @@ is only usable where the receiver value is in hand — the interpreter, or the c
 harness, not the static ledger. -/
 def knowsMethod (d : Dialect) (name : String) : Bool :=
   match d with
-  | .cLike  => false
+  | .cLike | .javascript => false
   | .python => methodNames.contains name
 
 /-- Methods on non-object receivers, for `Expr.mcall`. Guarded by `knowsMethod` for the
@@ -583,9 +583,17 @@ the vacuity `STRATEGY.md` §14 and the mutation gate exist to catch. -/
 @[simp] theorem builtin_cLike_none (h : Heap) (n : String) (as : List Val) :
     builtin .cLike h n as = none := rfl
 
+/-- Likewise for JavaScript: no stdlib modelling exists for it either yet. -/
+@[simp] theorem builtin_javascript_none (h : Heap) (n : String) (as : List Val) :
+    builtin .javascript h n as = none := rfl
+
 /-- Likewise for methods. -/
 @[simp] theorem method_cLike_none (h : Heap) (r : Val) (n : String) (as : List Val) :
     method .cLike h r n as = none := rfl
+
+/-- Likewise for methods, under JavaScript. -/
+@[simp] theorem method_javascript_none (h : Heap) (r : Val) (n : String) (as : List Val) :
+    method .javascript h r n as = none := rfl
 
 
 /-! ### The name predicates the ledger consumes
@@ -598,8 +606,14 @@ that stops the ledger *overstating* — holds by construction, because `builtin`
 /-- No C program is answered by a Python builtin, at the predicate level too. -/
 @[simp] theorem knowsFree_cLike (n : String) : knowsFree .cLike n = false := rfl
 
+/-- Likewise at the predicate level for JavaScript. -/
+@[simp] theorem knowsFree_javascript (n : String) : knowsFree .javascript n = false := rfl
+
 /-- Likewise for methods. -/
 @[simp] theorem knowsMethod_cLike (n : String) : knowsMethod .cLike n = false := rfl
+
+/-- Likewise for methods, under JavaScript. -/
+@[simp] theorem knowsMethod_javascript (n : String) : knowsMethod .javascript n = false := rfl
 
 /-- **The direction that matters.** A name the predicate rejects is never answered, so a
 ledger built on `knowsFree` can only understate, never overstate. True by `rfl` under the
@@ -708,6 +722,7 @@ theorem builtin_heap_unchanged {d : Dialect} {h h' : Heap} {n : String} {as : Li
     {r : EResult} (hb : builtin d h n as = some (h', r)) : h' = h := by
   cases d with
   | cLike => simp at hb
+  | javascript => simp at hb
   | python =>
     -- Every branch either returns `(h, _)` or is `none`; `split` enumerates them and
     -- `simp_all` discharges each by injectivity of `some`/`Prod.mk`.

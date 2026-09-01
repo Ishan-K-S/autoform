@@ -128,6 +128,73 @@ private theorem fuelStep : ∀ k, FuelStep k := by
             cases r₁ <;> first
               | (cases hy; exact absurd rfl hne)
               | (rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
+        -- `003-box-address-taken-locals`: same shape as `unop` -- one recursive
+        -- `evalExpr` call, then a fuel-free follow-up (`Heap.alloc` here, `applyUnop`
+        -- there) with no further recursion to induct on.
+        | boxNew a =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ <;> first
+              | (cases hy; exact absurd rfl hne)
+              | (rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
+        -- `006-reduce-remaining-holes`, Story 5: `Expr.boxFields` reuses `evalPairs`
+        -- verbatim (each key an `Expr`, always a string literal at every site the
+        -- exporter emits) -- same shape as `dictE` exactly, `ihP` already proves it.
+        -- The key-extraction fold after `evalPairs` returns is fuel-free, so once
+        -- `ihP` shows the SAME `(h₁, pairs)` at fuel `k+1`, the rest is identical on
+        -- both sides and `exact hy` (already unified by the rewrite) closes it.
+        | boxFields kvs =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalPairs ctx k h ρ kvs with ⟨h₁, s⟩
+            rw [hA] at hy
+            cases s with
+            | inr pairs => rw [ihP _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | inl r₁ =>
+                cases r₁ <;> first
+                  | (cases hy; exact absurd rfl hne)
+                  | (rw [ihP _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
+        -- `006-reduce-remaining-holes`, Story 5: `&a[i]` -- same shape as `index`,
+        -- two sequential `evalExpr` calls with no further recursion afterwards.
+        | irefIndex a i =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ with
+            | exn v => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | hole l => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | outOfFuel => cases hy; exact absurd rfl hne
+            | val x =>
+                rw [ihE _ hctx _ _ _ _ _ hA (by simp)]
+                -- Unlike `index`, this match discriminates on `x`'s OWN shape (only
+                -- `.ref` recurses further) before recursing again, so `x` needs its
+                -- own case split first.
+                cases x
+                case ref r =>
+                    dsimp only at hy ⊢
+                    rcases hB : evalExpr ctx k h₁ ρ i with ⟨h₂, r₂⟩
+                    rw [hB] at hy
+                    cases r₂ <;> first
+                      | (cases hy; exact absurd rfl hne)
+                      | (rw [ihE _ hctx _ _ _ _ _ hB (by simp)]; exact hy)
+                all_goals (dsimp only at hy ⊢; exact hy)
+        -- `006-reduce-remaining-holes`, Story 5: `&s.f` -- same shape as `field`/
+        -- `boxNew`, one recursive `evalExpr` call with no further recursion.
+        | irefField a f =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ <;> first
+              | (cases hy; exact absurd rfl hne)
+              | (rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
+        -- `006-reduce-remaining-holes`, Story 5: `*p` -- same shape as `field`.
+        | derefIref a =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ <;> first
+              | (cases hy; exact absurd rfl hne)
+              | (rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
         | binop op a b =>
             simp only [evalExpr] at hy ⊢
             rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
@@ -421,6 +488,7 @@ private theorem fuelStep : ∀ k, FuelStep k := by
                                       | ref _ => exact hy
                                       | clsClos _ _ => exact hy
                                       | bobj _ _ => exact hy
+                                      | iref _ _ => exact hy
                                 · rw [if_neg hmod] at hy ⊢
                                   exact hy
                             | some fn =>
@@ -673,6 +741,27 @@ private theorem fuelStep : ∀ k, FuelStep k := by
         | del x => exact hy
         | declGlobal x => exact hy
         | setIndex a b c => exact hy
+        -- `006-reduce-remaining-holes`, Story 5: `*p = v` -- same shape as
+        -- `setField`'s `ref`/non-object split, one constructor case instead of three.
+        | setDerefIref p v =>
+            simp only [execStmt] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ p with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ with
+            | exn e => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | hole l => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | outOfFuel => cases hy; exact absurd rfl hne
+            | val pv =>
+                rw [ihE _ hctx _ _ _ _ _ hA (by simp)]
+                cases pv
+                case iref r sel =>
+                    dsimp only at hy ⊢
+                    rcases hB : evalExpr ctx k h₁ ρ v with ⟨h₂, r₂⟩
+                    rw [hB] at hy
+                    cases r₂ <;> first
+                      | (cases hy; exact absurd rfl hne)
+                      | (rw [ihE _ hctx _ _ _ _ _ hB (by simp)]; exact hy)
+                all_goals (dsimp only at hy ⊢; exact hy)
         | tryFinally a b => simp [tfFreeS] at hfree
         | expr e =>
             simp only [execStmt] at hy ⊢

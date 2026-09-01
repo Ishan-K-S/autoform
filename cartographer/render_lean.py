@@ -130,6 +130,23 @@ def expr_shape(n):
     if k == "index":  return ".index", [("e", f('a')), ("e", f('b'))]
     if k == "call":   return ".call", [("atom", lean_str(f('f'))), ("es", f('args'))]
     if k == "hole":   return ".hole", [("atom", lean_str(f('label')))]
+    # `003-box-address-taken-locals`: unconditional, constructor-free box allocation.
+    # See `data-model.md` for the on-disk shape and `Expr.boxNew` (`Syntax.lean`) for
+    # its semantics.
+    if k == "boxNew": return ".boxNew", [("e", f('e'))]
+    # `006-reduce-remaining-holes`, Story 5: `boxNew` generalised to N fields. The
+    # wire format keeps plain string keys (`data-model.md`'s `[["<key>", <expr>],
+    # ...]`); each key is wrapped as an ordinary `{"k":"str",...}` expr node here so
+    # the existing `("ps", ...)` pair-list machinery (already used by `dictE`)
+    # renders it with no further changes -- `Expr.boxFields`'s own Lean signature is
+    # `List (Expr × Expr)` for exactly this reason (reusing `evalPairs`, already
+    # proven fuel-monotone, rather than a second list-evaluator).
+    if k == "boxFields":
+        pairs = [[{"k": "str", "v": key}, val] for key, val in f('fields')]
+        return ".boxFields", [("ps", pairs)]
+    if k == "irefIndex": return ".irefIndex", [("e", f('a')), ("e", f('i'))]
+    if k == "irefField": return ".irefField", [("e", f('a')), ("atom", lean_str(f('f')))]
+    if k == "derefIref": return ".derefIref", [("e", f('p'))]
     # --- objects, containers, control ---
     if k == "field":  return ".field", [("e", f('a')), ("atom", lean_str(f('f')))]
     if k == "mcall":  return ".mcall", [("e", f('recv')), ("atom", lean_str(f('m'))), ("es", f('args'))]
@@ -174,6 +191,7 @@ def stmt_shape(n):
     # --- objects, iteration, exceptions ---
     if k == "setField": return ".setField", [("e", f('r')), ("atom", lean_str(f('f'))), ("e", f('v'))]
     if k == "setIndex": return ".setIndex", [("e", f('r')), ("e", f('i')), ("e", f('v'))]
+    if k == "setDerefIref": return ".setDerefIref", [("e", f('p')), ("e", f('v'))]
     if k == "forIn":    return ".forIn", [("atom", lean_str(f('x'))), ("e", f('e')), ("s", f('body'))]
     if k == "tryCatch": return ".tryCatch", [("s", f('body')), ("atom", lean_str(f('x'))), ("s", f('handler'))]
     # `try: body finally: fin`. Distinct from `tryCatch` because it intercepts *every* way
@@ -308,6 +326,53 @@ def _flat_pair(p):
         raise ValueError(f"dictE pair must be a 2-element array, got {p!r}")
     return "(" + flat(p[0], "e") + ", " + flat(p[1], "e") + ")"
 
+def _render_seq_chain(node, col) -> str:
+    """Render a `Stmt.seq` whose flat form already failed to fit at `col`, without one
+    Python stack frame per statement.
+
+    `.seq(a, b)` is right-associated, so a function with N consecutive top-level
+    statements is a chain N deep. The fully-recursive walk (`render` -> `render_child` ->
+    `render` for `b`, all the way down) turns that into N nested Python calls, which is
+    exactly the wall `docs/scale.md` measured at 247 statements (independent of total
+    repo size — `sqlparse` at 8.8k lines failed, `requests` at 12k lines did not, because
+    the trigger is one file's statement count). Raising `sys.setrecursionlimit` and the
+    thread stack size (`main`, below) moved that cliff without removing it; this removes
+    it, by walking the spine with an explicit `while` loop instead of the call stack.
+
+    Reproduces `render()`'s output byte-for-byte: at every link in the spine, the same
+    flat-then-structural decision `render()` itself makes is made here too, so a
+    sub-chain short enough to fit on one line still renders flat, exactly as it would
+    have under full recursion. Real nesting (if/loop bodies) is not the measured problem
+    and is not touched — each individual statement in the chain still renders through the
+    ordinary recursive `render`, only as deep as that one statement's own structure.
+    """
+    heads = []              # (statement node, its column), outermost first
+    cur, cur_col = node, col
+    while True:
+        if not (isinstance(cur, dict) and cur.get("k") == "seq"):
+            tail_text = render(cur, "s", cur_col)
+            break
+        try:
+            one = flat_capped(cur, "s", WIDTH - cur_col)
+            if one is not None:
+                tail_text = one
+                break
+        except _RawNewline:
+            one = flat(cur, "s")
+            if cur_col + len(one) <= WIDTH or "\n" in one:
+                tail_text = one
+                break
+        inner = min(cur_col + INDENT, MAX_INDENT)
+        heads.append((cur["a"], inner))
+        cur_col = inner
+        cur = cur["b"]
+    acc = tail_text
+    for head_node, head_col in reversed(heads):
+        pad = " " * head_col
+        head_text = render(head_node, "s", head_col)
+        acc = "(.seq\n" + pad + head_text + "\n" + pad + acc + ")"
+    return acc
+
 def render(node, kind, col) -> str:
     """Render `node` starting at column `col`, wrapping if the flat form is too wide.
 
@@ -322,6 +387,8 @@ def render(node, kind, col) -> str:
         one = flat(node, kind)
         if col + len(one) <= WIDTH or "\n" in one:
             return one
+    if kind == "s" and isinstance(node, dict) and node.get("k") == "seq":
+        return _render_seq_chain(node, col)
     head, children = SHAPE[kind](node)
     if not children:
         # A nullary constructor's flat form IS its head. The capped flatten returns None
@@ -385,10 +452,18 @@ def ident(name: str) -> str:
 # being decided by the *headers* alone, and a corpus of `.cc` files with no header
 # aborted the render outright. Found by tests/test_render_lean.py, which recorded it as
 # a strict xfail before it had a fix.
+#
+# `.js`/`.ts`/`.tsx`/`.jsx`/`.mjs`/`.cjs` map to `.javascript`, not `.cLike`. Mapping them
+# to `.cLike` was itself a measured, confirmed wrong answer (docs/languages.md): `&&`/`||`
+# returned a coerced boolean instead of an operand, and arithmetic wrapped at 32 bits
+# instead of matching Node's IEEE-double `Number` (`2147483647 + 1` gave `-2147483648`
+# instead of Node's `2147483648`). `Autoform.Core.Dialect.javascript`
+# (`Autoform/Lang/Core/Syntax.lean`) is the real fix; this table just has to point at it.
 DIALECT = {".py": ".python", ".c": ".cLike", ".h": ".cLike", ".cpp": ".cLike",
            ".cc": ".cLike", ".cxx": ".cLike", ".hh": ".cLike", ".hpp": ".cLike",
-           ".java": ".cLike", ".js": ".cLike", ".ts": ".cLike", ".kt": ".cLike",
-           ".go": ".cLike"}
+           ".java": ".cLike", ".kt": ".cLike", ".go": ".cLike",
+           ".js": ".javascript", ".ts": ".javascript", ".tsx": ".javascript",
+           ".jsx": ".javascript", ".mjs": ".javascript", ".cjs": ".javascript"}
 
 def infer_dialect(funcs) -> str:
     """Pick the arithmetic/string dialect from file extensions.
@@ -457,6 +532,23 @@ def _run_main():
         "-- Ansible has 5,546. So the limit has to scale with the module's function count,",
         "-- not with how deep its code happens to be.",
         f"set_option maxRecDepth {max(8000, 8 * len(funcs) + 8000)}",
+        "",
+        "-- Lean's default `maxHeartbeats` (200000) budgets ONE declaration's own",
+        "-- elaboration cost, separately from `maxRecDepth` above (which bounds nesting",
+        "-- depth, not total work). A single source file whose top-level declarations",
+        "-- carry a large static table -- SQLite's `test_vdbecov.c`, whose `<global>`",
+        "-- initializer alone is ~5.3M characters of generated Lean -- blows through the",
+        "-- default budget on that ONE declaration and fails with a `(deterministic)",
+        "-- timeout at isDefEq` error, unrelated to whether the translation is correct.",
+        "-- Unlike `maxRecDepth`, this does not scale with function COUNT (Ansible-style",
+        "-- corpora with thousands of small functions never hit it); it is one",
+        "-- pathologically large declaration, which no per-function-count formula would",
+        "-- predict, so this disables the budget outright rather than guessing a bigger",
+        "-- number that the next large static table would just exceed again. Scoped to",
+        "-- THIS generated file only (`set_option` here does not touch hand-written proof",
+        "-- files elsewhere in the project, which keep the default as a real safety net",
+        "-- against a genuine runaway elaboration bug while someone is editing them).",
+        "set_option maxHeartbeats 0",
         "",
         "/-!",
         f"# {module} — machine-generated",
