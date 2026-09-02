@@ -963,10 +963,24 @@ import scala.annotation.tailrec
     * any kind for `p`. */
   var ptrIrefNames = Set.empty[String]
 
-  /** `(owning type, member name) -> member type`, for the whole program. */
+  /** `(owning type, member name) -> member type`, for the whole program.
+    *
+    * `007-reduce-remaining-holes-2`: Joern's C frontend emits multiple `TypeDecl`
+    * nodes per struct when it parses the same declaration more than once across
+    * translation contexts -- `AioFile`, `AioFile<duplicate>0`, `AioFile<duplicate>1`
+    * -- and empirically (live-CPG-sampled on SQLite) the PLAIN, un-suffixed name is
+    * often the one with ZERO members, while a `<duplicate>N` sibling carries the
+    * real member list. A lookup here is always keyed by a USE SITE's own type
+    * string (`bareType(staticTypeOf(receiver))`), which never itself contains a
+    * `<duplicate>` suffix -- so without stripping it here first, the member-bearing
+    * TypeDecl's data was simply never found, correct or not. Safe to strip
+    * unconditionally: a member-EMPTY duplicate contributes no tuples to this map at
+    * all (`td.member.l` is empty), so there is no risk of a real member list being
+    * overwritten by an empty one after normalizing the key. */
+  def stripDuplicateSuffix(name: String): String = name.replaceAll("""<duplicate>\d+$""", "")
   lazy val memberTypes: Map[(String, String), String] =
     cpg.typeDecl.l.flatMap { td =>
-      td.member.l.map(mm => (bareType(td.fullName), mm.name) -> mm.typeFullName)
+      td.member.l.map(mm => (stripDuplicateSuffix(bareType(td.fullName)), mm.name) -> mm.typeFullName)
     }.toMap
 
   /** The static type of an expression, **recovered from declarations when the node does
@@ -1356,8 +1370,16 @@ import scala.annotation.tailrec
 
   /** Every `TypeDecl` of the program, by its bare (tag-stripped) name -- `cpg.typeDecl`
     * itself, not `aggregateNames`, because layout resolution needs the member LIST,
-    * not merely a name to test membership against. */
-  lazy val typeDeclsByName: Map[String, List[TypeDecl]] = cpg.typeDecl.l.groupBy(td => bareType(td.fullName))
+    * not merely a name to test membership against.
+    *
+    * `007-reduce-remaining-holes-2`: grouped by `stripDuplicateSuffix`'d name, for the
+    * exact same reason `memberTypes` needs it (that doc comment has the full
+    * explanation) -- without this, a struct's real, member-bearing `TypeDecl`
+    * (`Foo<duplicate>0`) groups SEPARATELY from the plain-named, member-empty one
+    * (`Foo`) that every use site's own type string actually resolves to, so
+    * `.find(_.member.nonEmpty)` below never sees it. */
+  lazy val typeDeclsByName: Map[String, List[TypeDecl]] =
+    cpg.typeDecl.l.groupBy(td => stripDuplicateSuffix(bareType(td.fullName)))
 
   /** The `TypeDecl` actually carrying `ty`'s members, if this program has one --
     * `.find(_.member.nonEmpty)` skips a forward-only declaration in favour of the
@@ -4263,7 +4285,7 @@ import scala.annotation.tailrec
     // interior-pointer case Story 5's own scope boundary originally excluded
     // wholesale, now narrowed to the one shape this can verify sound without a
     // general points-to analysis.
-    def nameEscapesSafely(nm: String): Boolean =
+    def nameEscapesSafely(nm: String, wholeObjectAddressOk: Boolean): Boolean =
       m.body.ast.isCall.filterNot(_.methodFullName.startsWith("<operator>")).l
         .forall { c =>
           kidsOf(c).filter(k => aidx(k) >= 1 && argFeedsName(k, nm)).forall { k =>
@@ -4277,12 +4299,44 @@ import scala.annotation.tailrec
                 }
               case _ => false
             }
-            elementOrFieldAddress && !c.methodFullName.startsWith("<operator>") &&
-              methodByName.get(c.methodFullName).exists(callee => closedIrefOutParam(callee, aidx(k)))
+            // `007-reduce-remaining-holes-2`: a WHOLE-OBJECT address (`&nm`, not
+            // `&nm[i]`/`&nm.f`) fed to an in-program call is ALSO safe -- but only for
+            // a STRUCT (`wholeObjectAddressOk`, set from `isClassType` at the call
+            // site below), never an array. `&s` for a class-typed local is aggregate
+            // IDENTITY (`addressOfIsAggregate`/`callExpr`'s own `aggregate` branch --
+            // `s`'s `Val.ref` already IS its own address, no wrapper), so the callee's
+            // parameter receives `s`'s own already-boxed reference directly and every
+            // `p->f`/`p.f` on it translates via the ordinary, UNCONDITIONAL
+            // `setField`/`field` mechanism -- correct for ANY object-shaped runtime
+            // value, needing no `ptrIrefNames`/`closedIrefOutParam`-style per-parameter
+            // tracking at all. This is what `boxedLocals` (`003`, scalars) already
+            // does for `&n` fed to any in-program call (`addressOfFeedsExternalCall`
+            // checks only for an EXTERNAL callee) -- structs get the identical
+            // treatment here, closing a real, confirmed "hole-free but dynamically
+            // wrong" gap (`setField:*:non-object` at evaluation time) that existed
+            // because this exclusion was stricter than `boxedLocals`'s own for no
+            // reason specific to structs. An ARRAY'S whole-object address (`&arr`,
+            // distinct from decay) is NOT eligible here: unlike a struct, it is not
+            // already handled by an existing unconditional mechanism, and today's own
+            // `addressOf` handling has no case for it at all (falls to its existing
+            // hole) -- extending that is a separate, unverified change this fix does
+            // not make.
+            val wholeObjectAddress = wholeObjectAddressOk && (k match {
+              case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+                kidsOf(addr) match {
+                  case List(x) => argFeedsName(x, nm)
+                  case _       => false
+                }
+              case _ => false
+            })
+            val calleeIsInProgram = !c.methodFullName.startsWith("<operator>") && methodByName.contains(c.methodFullName)
+            (elementOrFieldAddress && calleeIsInProgram &&
+              methodByName.get(c.methodFullName).exists(callee => closedIrefOutParam(callee, aidx(k)))) ||
+            (wholeObjectAddress && calleeIsInProgram)
           }
         }
-    def nameSafelyBoxable(nm: String): Boolean =
-      !nameEverPassedToCall(nm) || nameEscapesSafely(nm)
+    def nameSafelyBoxable(nm: String, wholeObjectAddressOk: Boolean): Boolean =
+      !nameEverPassedToCall(nm) || nameEscapesSafely(nm, wholeObjectAddressOk)
     // `moduleScope` is checked FIRST and unconditionally, mirroring `boxableName`'s
     // own existing precedent for scalar boxing: a `<module>`/`<global>` pseudo-
     // method's own "locals" are actually FILE-SCOPE globals, and every assignment
@@ -4305,7 +4359,7 @@ import scala.annotation.tailrec
           arrayShape.findFirstMatchIn(bareType(ty)).map(mt => localName(l.name) -> mt.group(2).toInt)
         }
       }.toMap
-      candidates.filter { case (nm, _) => nameSafelyBoxable(nm) }
+      candidates.filter { case (nm, _) => nameSafelyBoxable(nm, wholeObjectAddressOk = false) }
     }
     boxedStructs = if (moduleScope) Map.empty else {
       val candidates = m.local.l.flatMap { l =>
@@ -4313,7 +4367,7 @@ import scala.annotation.tailrec
           structTypeDeclOf(ty).map(td => localName(l.name) -> td.member.l.map(_.name))
         }
       }.toMap
-      candidates.filter { case (nm, _) => nameSafelyBoxable(nm) }
+      candidates.filter { case (nm, _) => nameSafelyBoxable(nm, wholeObjectAddressOk = true) }
     }
     // `006-reduce-remaining-holes`, Story 5: plain pointer locals PROVABLY, for
     // their whole lifetime, holding an interior pointer VALUE -- `p = &a[i]`,
