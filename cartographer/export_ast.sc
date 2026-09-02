@@ -1658,6 +1658,45 @@ import scala.annotation.tailrec
       }
     }
 
+  /** `007-reduce-remaining-holes-2`: `closedOutParam`'s own discipline, generalized
+    * from a whole-object scalar out-parameter to an INTERIOR-pointer one -- a
+    * parameter receiving `&r[idx]`/`&r.f` (the address of one ELEMENT or FIELD of an
+    * array/struct, `Val.iref` at runtime under `006-reduce-remaining-holes` Story 5,
+    * not `Val.ref`). Is parameter position `paramIndex` of function `fn` safe to
+    * treat this way -- does EVERY call site of `fn`, across the whole analyzed
+    * program, pass that position exactly this shape, with `r`'s own static type a
+    * plausible boxable array/struct shape, AND is `fn`'s own address never taken
+    * anywhere (so it cannot be called indirectly, sidestepping this very check)?
+    *
+    * Checked purely via `staticTypeOf`/`bareType`/`isClassType` on the argument node
+    * itself, which Joern resolves regardless of which method the node belongs to --
+    * this needs no per-CALLER precomputed state, so there is no circularity with
+    * `boxedArrays`/`boxedStructs`'s own per-method computation (each caller's
+    * eligibility to KEEP `r` boxed despite this call, decided separately below,
+    * depends on this purely-structural result, never the reverse). */
+  def closedIrefOutParam(fn: Method, paramIndex: Int): Boolean =
+    if (takenAsValueFns.contains(fn.fullName)) false
+    else {
+      val callSites = allCalls.filter(_.methodFullName == fn.fullName)
+      callSites.nonEmpty && callSites.forall { c =>
+        kidsOf(c).find(aidx(_) == paramIndex).exists {
+          case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+            kidsOf(addr) match {
+              case List(x) =>
+                asIndex(x).exists { case (r, _) =>
+                  arrayShape.findFirstMatchIn(bareType(staticTypeOf(r))).isDefined
+                } ||
+                asField(x).exists { case (r, _) =>
+                  val ty = staticTypeOf(r)
+                  isClassType(ty) && structTypeDeclOf(ty).isDefined
+                }
+              case _ => false
+            }
+          case _ => false
+        }
+      }
+    }
+
   /** `004-function-pointer-tracking`: the name of the variable a `pointerCall`'s
     * callee (the child at `argumentIndex == -1`) reads, if it is one of the two
     * shapes confirmed against the CPG (research.md §4) -- a bare
@@ -4190,6 +4229,38 @@ import scala.annotation.tailrec
     def nameEverPassedToCall(nm: String): Boolean =
       m.body.ast.isCall.filterNot(_.methodFullName.startsWith("<operator>")).l
         .exists(c => kidsOf(c).exists(k => aidx(k) >= 1 && argFeedsName(k, nm)))
+    // `007-reduce-remaining-holes-2`: the one narrow exception to the exclusion
+    // above -- `nm` still escapes via a call argument, but SAFELY, when EVERY such
+    // feeding site is `&nm[idx]`/`&nm.f` (an element/field address, not a bare
+    // pass-by-value/decay and not `&nm` naming the whole object -- `argFeedsName`
+    // still catches both of those as disqualifying, unconditionally) to an
+    // in-program callee whose corresponding parameter is `closedIrefOutParam`-
+    // verified across the WHOLE program. `nm` stays boxed and the callee's
+    // parameter (populated into `ptrIrefNames` below) reads/writes `nm`'s own
+    // storage directly via `derefIref`/`setDerefIref` -- exactly the cross-function
+    // interior-pointer case Story 5's own scope boundary originally excluded
+    // wholesale, now narrowed to the one shape this can verify sound without a
+    // general points-to analysis.
+    def nameEscapesSafely(nm: String): Boolean =
+      m.body.ast.isCall.filterNot(_.methodFullName.startsWith("<operator>")).l
+        .forall { c =>
+          kidsOf(c).filter(k => aidx(k) >= 1 && argFeedsName(k, nm)).forall { k =>
+            val elementOrFieldAddress = k match {
+              case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+                kidsOf(addr) match {
+                  case List(x) =>
+                    asIndex(x).exists { case (r, _) => rawLocalOrParamName(r).map(localName).contains(nm) } ||
+                    asField(x).exists { case (r, _) => rawLocalOrParamName(r).map(localName).contains(nm) }
+                  case _ => false
+                }
+              case _ => false
+            }
+            elementOrFieldAddress && !c.methodFullName.startsWith("<operator>") &&
+              methodByName.get(c.methodFullName).exists(callee => closedIrefOutParam(callee, aidx(k)))
+          }
+        }
+    def nameSafelyBoxable(nm: String): Boolean =
+      !nameEverPassedToCall(nm) || nameEscapesSafely(nm)
     // `moduleScope` is checked FIRST and unconditionally, mirroring `boxableName`'s
     // own existing precedent for scalar boxing: a `<module>`/`<global>` pseudo-
     // method's own "locals" are actually FILE-SCOPE globals, and every assignment
@@ -4212,7 +4283,7 @@ import scala.annotation.tailrec
           arrayShape.findFirstMatchIn(bareType(ty)).map(mt => localName(l.name) -> mt.group(2).toInt)
         }
       }.toMap
-      candidates.filterNot { case (nm, _) => nameEverPassedToCall(nm) }
+      candidates.filter { case (nm, _) => nameSafelyBoxable(nm) }
     }
     boxedStructs = if (moduleScope) Map.empty else {
       val candidates = m.local.l.flatMap { l =>
@@ -4220,7 +4291,7 @@ import scala.annotation.tailrec
           structTypeDeclOf(ty).map(td => localName(l.name) -> td.member.l.map(_.name))
         }
       }.toMap
-      candidates.filterNot { case (nm, _) => nameEverPassedToCall(nm) }
+      candidates.filter { case (nm, _) => nameSafelyBoxable(nm) }
     }
     // `006-reduce-remaining-holes`, Story 5: plain pointer locals PROVABLY, for
     // their whole lifetime, holding an interior pointer VALUE -- `p = &a[i]`,
@@ -4250,7 +4321,17 @@ import scala.annotation.tailrec
             Some(localName(t.name))
           case _ => None
         }
-      }.toSet
+      }.toSet ++
+      // `007-reduce-remaining-holes-2`: parameters of THIS method verified, across
+      // the whole program (`closedIrefOutParam`), to always receive the address of
+      // an element/field of a boxed array/struct -- the cross-function counterpart
+      // to the local-only shapes just above. `p` itself already holds the caller's
+      // `Val.iref` value directly, exactly like a local `ptrIrefNames` member;
+      // excluded when `p`'s OWN address is separately taken within this method
+      // (`boxedLocals`), matching `closedOutParams`'s own disjointness precedent.
+      m.parameter.l
+        .filter(p => closedIrefOutParam(m, p.index) && !boxedLocals.contains(localName(p.name)))
+        .map(p => localName(p.name)).toSet
     }
     val body0 = methodBody(m)
     // `003-box-address-taken-locals`: allocate every boxed local's/parameter's cell
