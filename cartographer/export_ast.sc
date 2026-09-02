@@ -2796,12 +2796,46 @@ import scala.annotation.tailrec
     // callee this cannot prove safe (ambiguous, external, a struct field, an array
     // element, or the general shape) falls through to the unchanged generic hole
     // just below, exactly as today.
-    else if (mfn == "<operator>.pointerCall")
-      pointerCallCalleeVar(c).flatMap(fnPtrVars.get) match {
-        case Some(target) =>
-          ujson.Obj("k" -> "call", "f" -> target, "args" -> exprs(kidsOf(c).filter(aidx(_) >= 1)))
-        case None => hole("op:" + opLabel(mfn))
+    else if (mfn == "<operator>.pointerCall") {
+      val realArgs = kidsOf(c).filter(aidx(_) >= 1)
+      val callee   = kidsOf(c).find(aidx(_) == -1)
+      // `007-reduce-remaining-holes-2`: `(size_t)(expr)` -- an ordinary C-style
+      // parenthesized cast to a typedef'd scalar type -- is frequently mis-parsed
+      // by Joern's C frontend as a CALL to a "variable" whose name happens to be
+      // the type name, with the cast's own operand as its sole argument (this
+      // node, since `size_t` resolves to no known function). Live-CPG-sampled on
+      // SQLite: 831 of 5,724 `pointerCall` sites are exactly this shape -- a
+      // bare-identifier callee `resolveIntType` recognizes as a scalar type, with
+      // exactly one real argument -- and every one of the sampled 15 is visibly a
+      // cast in its own source text (`(size_t) (...)`), not a genuine
+      // function-pointer call. Checked before the `004` function-pointer
+      // resolution below: a real function is never itself the name of a
+      // resolvable scalar type, so there is no collision risk. Reuses the exact
+      // `cast:<width>` shape `<operator>.cast` already produces -- no new
+      // `Expr`/`Val`.
+      val functionalCastWidth: Option[String] = (callee, realArgs) match {
+        case (Some(i: Identifier), List(_)) => resolveIntType(i.name)
+        case _ => None
       }
+      functionalCastWidth match {
+        case Some(w) =>
+          ujson.Obj("k" -> "unop", "op" -> ("cast:" + w), "a" -> expr(realArgs.head))
+        case None =>
+          // `004-function-pointer-tracking`: a call through a function-pointer-
+          // valued variable Joern itself could not statically resolve (research.md
+          // §1). When the callee names a variable this method's own `fnPtrVars`
+          // has proven, by a bounded whole-function single-assignment check, holds
+          // exactly one known, non-capturing, in-program function -- rewrite the
+          // WHOLE call to an ordinary direct call to that function. Any callee
+          // this cannot prove safe (ambiguous, external, a struct field, an array
+          // element, or the general shape) falls through to the unchanged generic
+          // hole just below, exactly as today.
+          pointerCallCalleeVar(c).flatMap(fnPtrVars.get) match {
+            case Some(target) => ujson.Obj("k" -> "call", "f" -> target, "args" -> exprs(realArgs))
+            case None          => hole("op:" + opLabel(mfn))
+          }
+      }
+    }
     // `005-sizeof-constant-folding`: `sizeof(expr)` and `sizeof(TypeName)` are
     // indistinguishable at this point -- confirmed against the CPG directly
     // (research.md §1): both produce a single child carrying the operand's type
