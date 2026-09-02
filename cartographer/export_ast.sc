@@ -1003,6 +1003,28 @@ import scala.annotation.tailrec
             if (t.endsWith("*")) t.dropRight(1) else direct
           case _ => direct
         }
+      // `007-reduce-remaining-holes-2`: `a[i]` has the type `a`'s own elements are --
+      // Joern does not always propagate this onto the index-access node itself (live-
+      // CPG-sampled on SQLite: 1,763 of 2,933 `&a[i]:unknown-type` sites have a
+      // perfectly resolved RECEIVER type -- `char**`, `int*`, `Foo[]` -- with only the
+      // index EXPRESSION's own type left unresolved), so it is derived here from the
+      // receiver the same way `<operator>.indirection` above derives `*p`'s type from
+      // `p`'s: strip one level of `*`, or one `[N]`/`[]` array dimension.
+      case c: Call if indexOps.contains(c.methodFullName) =>
+        asIndex(c) match {
+          case Some((r, _)) =>
+            val t = bareType(staticTypeOf(r))
+            if (t.endsWith("*")) t.dropRight(1)
+            // Inlined rather than reusing `arrayShape` (defined later in this file):
+            // referencing that `val` from this earlier `def` is a genuine forward-
+            // reference error in this file's script-object compilation, not merely a
+            // style choice -- confirmed by trying it first.
+            else """^(.+)\[\d*\]$""".r.findFirstMatchIn(t) match {
+              case Some(m) => m.group(1)
+              case None    => direct
+            }
+          case None => direct
+        }
       case _ => direct
     }
   }
