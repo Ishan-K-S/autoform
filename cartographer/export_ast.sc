@@ -1235,6 +1235,36 @@ import scala.annotation.tailrec
       c.endsWith("*") || c.endsWith("&") || c.matches(""".*\[.*\]""")
     }
 
+  /** `007-reduce-remaining-holes-2` US3: is a cast's OPERAND (as opposed to its target,
+    * `castTargetIsPointer` above) itself pointer-shaped -- i.e. is reinterpreting it as a
+    * different pointer type a representation-preserving no-op under `Autoform.Core`'s
+    * heap model?
+    *
+    * Confirmed sound by reading `Semantics.lean`'s `derefIref`/`irefIndex`/`irefField`
+    * directly (research.md US3): dereferencing a `Val.iref`/`Val.ref` resolves purely via
+    * the object's address and a selector fixed when that value was produced -- never by
+    * the casting expression's compile-time target type. So if the operand already
+    * evaluates to a pointer-shaped value, the cast changes nothing observable and can be
+    * dropped.
+    *
+    * Two ways an operand is confirmed pointer-shaped: its own static type is ALSO a
+    * pointer type (mirrors `castTargetIsPointer`'s own `isPointerType` check, just aimed
+    * at the other side of the cast), or it is a direct `&expr` -- an address-of
+    * expression is a pointer/reference value by construction regardless of what type
+    * inference reports for it, and `expr()`'s own `<operator>.addressOf` handling already
+    * correctly resolves every such case on its own terms (a boxed array/struct interior
+    * pointer, an aggregate identity, a function identity, or -- if none of those apply --
+    * its own honestly-labeled `op:addressOf:*` hole, which then correctly propagates as
+    * this cast's own translation too, exactly as it should).
+    *
+    * An operand that is neither -- most commonly an integer literal or arithmetic
+    * expression, e.g. `(int*)0` -- has no `Ref`/`iref` to pass through: `Autoform.Core`
+    * has no representation for "a pointer to an arbitrary, non-heap-allocated address",
+    * so this MUST NOT be folded into the identity translation (see the
+    * `op:cast:pointer:int-to-pointer` branch in `callExpr`, below). */
+  def castOperandIsPointerShaped(operand: AstNode): Boolean =
+    isPointerType(staticTypeOf(operand)) || isOp(operand, "<operator>.addressOf")
+
   /** `char` is deliberately absent from `intTypeNames`: its signedness is
     * implementation-defined, so `static_cast<char>(300)` has no standard-mandated value.
     * Naming it separately keeps the hole label specific instead of guessing a sign. */
@@ -1788,6 +1818,18 @@ import scala.annotation.tailrec
     * the standing reminder of what an ungated language-specific helper costs. */
   def pyFile: Boolean = currentFile.toLowerCase.endsWith(".py")
 
+  /** `007-reduce-remaining-holes-2` US4: Go's `switch` does NOT fall through between
+    * cases by default (unlike C/C++/Java/JS/TS, which all share `switchStmt`'s
+    * fallthrough-by-threading-into-the-next-segment design) -- a `case` implicitly
+    * breaks unless the source uses Go's own explicit `fallthrough` statement. Whether
+    * Joern's Go frontend normalizes this into the same CPG shape `switchStmt` assumes
+    * (an explicit trailing break per case, unless `fallthrough` is used) was not
+    * verified this session -- no Go toolchain was available to build a test CPG, and
+    * guessing here risks exactly the well-typed-but-silently-wrong translation this
+    * project's ledger exists to prevent. So `.go` files keep today's `control:SWITCH`
+    * hole, honestly, until this is checked; `switchStmt` is applied everywhere else. */
+  def goFile: Boolean = currentFile.toLowerCase.endsWith(".go")
+
   /** One `{...}` field of an f-string.
     *
     * `Left` carries the reason it is not expressible, so the hole says which of the two
@@ -1941,7 +1983,12 @@ import scala.annotation.tailrec
           // makes `p == nullptr` answer `false` for every allocated object, which is the
           // right answer, and `Val.unit` for a *dereferenced* null is not reachable
           // because dereference is itself a hole.
-          else if (c == "None" || c == "null" || c == "nil" || c == "nullptr")
+          // `007-reduce-remaining-holes-2` US1: `NULL` (the standard C/C++ macro spelling,
+          // all-caps) was missing here -- it fell through to the bare-identifier check below
+          // and was mislabeled `import:operand` (a label meant for Python's `import` operand
+          // shape) on every C/C++ file, live-CPG-sampled at 1,927 of 1,927 non-Python
+          // `import:operand` hits on the SQLite corpus (research.md US1 sampling results).
+          else if (c == "None" || c == "null" || c == "nil" || c == "nullptr" || c == "NULL")
             ujson.Obj("k" -> "unit")
           // A float is not a string. Core has no floats, so this is a hole, not a lie.
           // Float forms, including the C/C++ `f`/`F`/`l`/`L` suffix and exponent-only
@@ -1987,8 +2034,16 @@ import scala.annotation.tailrec
           // wrong remedy -- on Ansible it hid 2,157 import operands inside a label that
           // says "we could not read this number". Naming them `import:operand` puts them
           // with the other import holes, where the actual work is.
-          else if (c.matches("""[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*""") ||
-                   c == ".")
+          // `007-reduce-remaining-holes-2` US1: guarded by `pyFile`, matching every sibling
+          // branch in this chain -- this label means Python's import-operand shape
+          // specifically, and was previously reachable on any file. Live-CPG sampling on the
+          // SQLite (C) corpus found 100% of what this let through was `NULL` (now handled
+          // above); this guard is the correctness fix for any other, unsampled case, so a
+          // non-Python bare identifier falls through to the ordinary `lit:unquoted` catch-all
+          // below instead of being mislabeled as a Python import operand.
+          else if (pyFile &&
+                   (c.matches("""[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*""") ||
+                    c == "."))
             hole("import:operand")
           // `b'...'` / `rb"..."`: a **bytes** literal. Core has `str` and no `bytes`, and
           // the two are not interchangeable in Python 3 (`b'a' == 'a'` is `False`), so
@@ -2469,7 +2524,17 @@ import scala.annotation.tailrec
     //   to the address hole.
     else if (mfn == "<operator>.cast" && kids.size == 2) {
       val tty = staticTypeOf(kids(0))
-      if (castTargetIsPointer(kids(0), tty)) hole("op:cast:pointer")
+      // `007-reduce-remaining-holes-2` US3: a pointer-to-pointer cast is a transparent
+      // pass-through of the operand's own (already-correct) translation -- see
+      // `castOperandIsPointerShaped`'s own doc comment for why this is sound under
+      // Core's structural heap model. An operand that is NOT confirmed pointer-shaped
+      // (most commonly an integer-to-pointer cast, e.g. `(int*)0`) has no `Ref`/`iref`
+      // to pass through and gets its own narrower, honestly-named hole instead of
+      // silently folding into the identity translation.
+      if (castTargetIsPointer(kids(0), tty)) {
+        if (castOperandIsPointerShaped(kids(1))) expr(kids(1))
+        else hole("op:cast:pointer:int-to-pointer")
+      }
       else resolveIntType(tty) match {
         case Some(w) => ujson.Obj("k" -> "unop", "op" -> ("cast:" + w),
                                   "a" -> expr(kids(1)))
@@ -3455,6 +3520,118 @@ import scala.annotation.tailrec
     case Nil       => acc.reverse
   }
 
+  /** `007-reduce-remaining-holes-2` US4: lower a `switch` statement to a FLAT sequence
+    * of `fell`/`matched` flag updates (one pair of statements per segment, in source
+    * order) wrapped in `Stmt.breakBlock` (research.md §4: the one existing construct
+    * missing the property `switch` needs -- absorbing a `break` without also absorbing
+    * a `continue`, unlike `Stmt.loop`/`Stmt.forIn`).
+    *
+    * REJECTED design, and why: an earlier version of this function built one `Stmt.ifte`
+    * per segment whose `t`/`e` branches threaded into a bottom-up `rests(i) =
+    * seq(body_i, rests(i+1))` chain shared BOTH as segment i's own dispatch target AND
+    * embedded inside every EARLIER segment's own `rests`. Sharing a `ujson.Obj`
+    * *reference* is free in memory, but JSON has no notion of a shared reference: a node
+    * reachable from `k` different paths in the tree is serialized `k` times. For `n`
+    * segments that is O(n^2) total output size -- confirmed, not assumed, via an
+    * out-of-memory crash on SQLite's own `sqlite3VdbeExec` (`src/vdbe.c`, ~190-case
+    * opcode dispatch) that reproduced identically even at 4x the default JVM heap,
+    * proving it was this quadratic blowup and not merely "a large function needs more
+    * memory" (`006-reduce-remaining-holes`'s own `maxHeartbeats` precedent). The flat
+    * encoding below has each segment's body appear exactly ONCE in the output, full stop.
+    *
+    * The encoding: `fell` starts false and is set true the first time either (a) the
+    * controlling value matches one of THIS segment's case values, or (b) this is the
+    * `default` segment and `matched` (computed ONCE, up front, as the OR of every real
+    * case's values, regardless of `default`'s own lexical position) is false. Once
+    * `fell` is true, every subsequent segment's body runs unconditionally -- exactly
+    * `switch`'s real fallthrough semantics -- until a `break` (`Stmt.brk`) is hit, which
+    * propagates out of the flat `Stmt.seq` chain via its ordinary short-circuit-on-
+    * non-normal-result behavior (unchanged, existing `execStmt` semantics) straight to
+    * the wrapping `breakBlock`, ending the whole dispatch there.
+    *
+    * The controlling expression is evaluated at most ONCE: `pureExpr` decides whether
+    * it is safe to duplicate across every comparison, or must be hoisted into a fresh
+    * temp first (the same discipline `006-reduce-remaining-holes` Story 3 established
+    * for assignment-as-value's own double-evaluation risk).
+    *
+    * Empirically confirmed against this Joern version (not assumed): a `switch`'s body
+    * `Block` interleaves, per label, a `JumpTarget` (`parserTypeName` `CASTCaseStatement`
+    * for `case`, `CASTDefaultStatement` for `default`) immediately followed -- for
+    * `case` only -- by a `Literal` sibling holding the label's value; ordinary
+    * statements appear between labels exactly as `stmts` already expects. */
+  def switchStmt(cond: AstNode, bodyNode: AstNode): ujson.Obj = {
+    case class Segment(caseValues: List[AstNode], isDefault: Boolean, body: List[AstNode])
+
+    def consumeLabels(ks: List[AstNode], caseVals: List[AstNode],
+                       isDefault: Boolean): (List[AstNode], List[AstNode], Boolean) = ks match {
+      case (j: JumpTarget) :: rest if j.parserTypeName == "CASTDefaultStatement" =>
+        consumeLabels(rest, caseVals, true)
+      case (j: JumpTarget) :: (v: AstNode) :: rest if j.parserTypeName == "CASTCaseStatement" =>
+        consumeLabels(rest, caseVals :+ v, isDefault)
+      // Defensive only: no other JumpTarget shape is expected inside a SWITCH body per
+      // this file's own empirical inspection; consumed with no value rather than looping.
+      case (_: JumpTarget) :: rest => consumeLabels(rest, caseVals, isDefault)
+      case _ => (ks, caseVals, isDefault)
+    }
+
+    def segmentsOf(ks: List[AstNode]): List[Segment] = ks match {
+      case Nil => Nil
+      case _ =>
+        val (afterLabels, caseVals, isDefault) = consumeLabels(ks, Nil, false)
+        val (body, rest) = afterLabels.span { case _: JumpTarget => false; case _ => true }
+        Segment(caseVals, isDefault, body) :: segmentsOf(rest)
+    }
+
+    val bodyKids = kidsOf(bodyNode)
+    val segments = segmentsOf(bodyKids)
+
+    // The controlling expression, evaluated at most once (see doc comment above).
+    val (condPrelude, condVal) =
+      if (pureExpr(cond)) (Nil, expr(cond))
+      else {
+        val tmp = freshExprVTemp()
+        (List(ujson.Obj("k" -> "assign", "x" -> tmp, "e" -> expr(cond))),
+         ujson.Obj("k" -> "name", "v" -> tmp))
+      }
+
+    def eqOr(vals: List[AstNode]): ujson.Obj =
+      vals.map(v => ujson.Obj("k" -> "binop", "op" -> "==", "a" -> condVal, "b" -> expr(v)))
+          .reduceRight((a, b) => ujson.Obj("k" -> "binop", "op" -> "||", "a" -> a, "b" -> b))
+
+    val fellVar = freshExprVTemp()
+    val matchedVar = freshExprVTemp()
+    def name(v: String): ujson.Obj = ujson.Obj("k" -> "name", "v" -> v)
+    def boolLit(b: Boolean): ujson.Obj = ujson.Obj("k" -> "bool", "v" -> b)
+    def assignBool(x: String, b: Boolean): ujson.Obj = ujson.Obj("k" -> "assign", "x" -> x, "e" -> boolLit(b))
+    def not(e: ujson.Obj): ujson.Obj = ujson.Obj("k" -> "unop", "op" -> "!", "a" -> e)
+    def and(a: ujson.Obj, b: ujson.Obj): ujson.Obj = ujson.Obj("k" -> "binop", "op" -> "&&", "a" -> a, "b" -> b)
+
+    val allCaseVals = segments.flatMap(s => if (s.isDefault) Nil else s.caseValues)
+    val matchedInit = if (allCaseVals.isEmpty) boolLit(false) else eqOr(allCaseVals)
+
+    val init = List(assignBool(fellVar, false), ujson.Obj("k" -> "assign", "x" -> matchedVar, "e" -> matchedInit))
+
+    val segStmts = segments.map { seg =>
+      val ownGuard =
+        if (seg.isDefault) not(name(matchedVar))
+        else if (seg.caseValues.isEmpty) boolLit(false)
+        else eqOr(seg.caseValues)
+      val setFell = ujson.Obj("k" -> "ifte", "c" -> and(not(name(fellVar)), ownGuard),
+                               "t" -> assignBool(fellVar, true), "e" -> skip)
+      // `outsideLoopScope`, matching WHILE/DO/FOR's own precedent for their nested
+      // bodies: a case body is a fresh scope for the goto-as-break heuristic, defense
+      // in depth (the function-wide precondition that heuristic already checks --
+      // `insideLoop` already treats SWITCH as a boundary -- makes this
+      // belt-and-suspenders rather than load-bearing, but costs nothing).
+      val runBody = ujson.Obj("k" -> "ifte", "c" -> name(fellVar),
+                               "t" -> outsideLoopScope(seqOf(stmts(seg.body))), "e" -> skip)
+      ujson.Obj("k" -> "seq", "a" -> setFell, "b" -> runBody)
+    }
+
+    val breakBlockStmt = ujson.Obj("k" -> "breakBlock", "body" -> seqOf(segStmts))
+    seqOf(condPrelude ++ init ++ List(breakBlockStmt))
+  }
+
   def stmt(n: AstNode): ujson.Obj = n match {
     case b: Block =>
       val kids = kidsOf(b)
@@ -3583,6 +3760,9 @@ import scala.annotation.tailrec
                       "body" -> ujson.Obj("k" -> "seq", "a" -> body, "b" -> test))
           }
         case "FOR"      => forStmt(cs)
+        // `007-reduce-remaining-holes-2` US4: see `switchStmt`'s own doc comment for the
+        // lowering and why `Stmt.breakBlock` is required, not merely convenient.
+        case "SWITCH" if kids.size >= 2 && !goFile => switchStmt(kids(0), kids(1))
         // `goto L` where `L` has been proved to be the single forward exit label of this
         // function, and this `goto` is not inside any loop or switch: see `methodBody`.
         // Everything else keeps the `control:GOTO` hole.

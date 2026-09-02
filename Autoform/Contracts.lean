@@ -161,6 +161,7 @@ def substS (σ : Impl) : Stmt → Stmt
   | .seq a b         => .seq (substS σ a) (substS σ b)
   | .ifte c a b      => .ifte (substE σ c) (substS σ a) (substS σ b)
   | .loop c a        => .loop (substE σ c) (substS σ a)
+  | .breakBlock a    => .breakBlock (substS σ a)
   | .forIn x e b     => .forIn x (substE σ e) (substS σ b)
   | .ret e           => .ret (substE σ e)
   | .tryCatch b x hd => .tryCatch (substS σ b) x (substS σ hd)
@@ -236,6 +237,7 @@ theorem substS_nil : ∀ s : Stmt, substS [] s = s
   | .seq a b         => by rw [substS, substS_nil a, substS_nil b]
   | .ifte c a b      => by rw [substS, substE_nil c, substS_nil a, substS_nil b]
   | .loop c a        => by rw [substS, substE_nil c, substS_nil a]
+  | .breakBlock a    => by rw [substS, substS_nil a]
   | .forIn x e b     => by rw [substS, substE_nil e, substS_nil b]
   | .ret e           => by rw [substS, substE_nil e]
   | .tryCatch b x hd => by rw [substS, substS_nil b, substS_nil hd]

@@ -188,6 +188,11 @@ def stmt_shape(n):
     if k == "seq":      return ".seq", [("s", f('a')), ("s", f('b'))]
     if k == "ifte":     return ".ifte", [("e", f('c')), ("s", f('t')), ("s", f('e'))]
     if k == "loop":     return ".loop", [("e", f('c')), ("s", f('body'))]
+    # `007-reduce-remaining-holes-2` US4: absorbs a `break` from `body` without also
+    # absorbing a `continue` (unlike `.loop`, which catches both) -- `switch` lowers to
+    # this wrapping its `ifte`-chain dispatch, so `break` inside a case ends only the
+    # switch, never an enclosing loop.
+    if k == "breakBlock": return ".breakBlock", [("s", f('body'))]
     # --- objects, iteration, exceptions ---
     if k == "setField": return ".setField", [("e", f('r')), ("atom", lean_str(f('f'))), ("e", f('v'))]
     if k == "setIndex": return ".setIndex", [("e", f('r')), ("e", f('i')), ("e", f('v'))]

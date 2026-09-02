@@ -1494,6 +1494,15 @@ def execStmt (ctx : Ctx) : Nat → Heap → Env → Stmt → Heap × Ctl
       | (h₁, .exn v)     => (h₁, .exn v)
       | (h₁, .hole l)    => (h₁, .hole l)
       | (h₁, .outOfFuel) => (h₁, .outOfFuel)
+  -- `007-reduce-remaining-holes-2` US4: catches a `.brk` from its inner statement and
+  -- converts it to `.normal`, exactly once (no re-execution, unlike `.loop`) --
+  -- deliberately does NOT catch `.cont`, so a `continue` written directly in a
+  -- `switch` case body keeps propagating to whatever REAL loop encloses the switch,
+  -- unchanged. This is the one thing `.loop`/`.forIn` do not provide on their own.
+  | n+1, h, ρ, .breakBlock body =>
+      match execStmt ctx n h ρ body with
+      | (h₁, .brk ρ') => (h₁, .normal ρ')
+      | (h₁, r)       => (h₁, r)
   | n+1, h, ρ, .forIn x e body =>
       match evalExpr ctx n h ρ e with
       | (h₁, .val v) =>

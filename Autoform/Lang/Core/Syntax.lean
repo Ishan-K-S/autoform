@@ -464,6 +464,16 @@ inductive Stmt where
   | seq      : Stmt → Stmt → Stmt
   | ifte     : Expr → Stmt → Stmt → Stmt
   | loop     : Expr → Stmt → Stmt
+  /-- `007-reduce-remaining-holes-2` US4: absorbs a `break` from its inner statement
+  without absorbing a `continue` -- the one thing `Stmt.loop`/`Stmt.forIn` do NOT
+  provide on their own, since both of those catch `.cont` too (re-entering the loop),
+  which is correct for a loop but wrong for a `switch`: a `continue` written directly
+  in a `switch` case body (no loop of its own between it and an enclosing loop) must
+  keep propagating past the switch to that enclosing loop, unchanged. `switch` lowers
+  to a `Stmt.ifte` dispatch chain wrapped in this constructor, so a `break` inside a
+  case body ends only the switch's own dispatch, never an enclosing loop. See
+  `execStmt`'s case for the exact semantics. -/
+  | breakBlock : Stmt → Stmt
   /-- `for x in e: body` -/
   | forIn    : String → Expr → Stmt → Stmt
   | ret      : Expr → Stmt
@@ -633,6 +643,7 @@ def holes : Stmt → List String
   | .seq a b         => a.holes ++ b.holes
   | .ifte c a b      => c.holes ++ a.holes ++ b.holes
   | .loop c a        => c.holes ++ a.holes
+  | .breakBlock a    => a.holes
   | .forIn _ e b     => e.holes ++ b.holes
   | .ret e           => e.holes
   | .tryCatch b _ h  => b.holes ++ h.holes
@@ -651,6 +662,7 @@ def size : Stmt → Nat
   | .seq a b         => a.size + b.size
   | .ifte c a b      => 1 + c.size + a.size + b.size
   | .loop c a        => 1 + c.size + a.size
+  | .breakBlock a    => 1 + a.size
   | .forIn _ e b     => 1 + e.size + b.size
   | .ret e           => 1 + e.size
   | .tryCatch b _ h  => 1 + b.size + h.size

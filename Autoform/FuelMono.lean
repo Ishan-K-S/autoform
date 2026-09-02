@@ -51,6 +51,7 @@ def tfFreeS : Stmt → Bool
   | .seq a b         => tfFreeS a && tfFreeS b
   | .ifte _ t e      => tfFreeS t && tfFreeS e
   | .loop _ b        => tfFreeS b
+  | .breakBlock b    => tfFreeS b
   | .forIn _ _ b     => tfFreeS b
   | .tryCatch b _ hd => tfFreeS b && tfFreeS hd
   | _                => true
@@ -854,6 +855,14 @@ private theorem fuelStep : ∀ k, FuelStep k := by
                  first
                    | exact hy
                    | exact ihS _ hctx _ _ _ hfree.2 _ _ hy hne)
+        | breakBlock a =>
+            have hb : tfFreeS a = true := by simpa [tfFreeS] using hfree
+            simp only [execStmt] at hy ⊢
+            rcases hA : execStmt ctx k h ρ a with ⟨h₁, c₁⟩
+            rw [hA] at hy
+            cases c₁ <;> first
+              | (cases hy; exact absurd rfl hne)
+              | (rw [ihS _ hctx _ _ _ hb _ _ hA (by simp)]; exact hy)
         | tryCatch a x hd =>
             simp only [tfFreeS, Bool.and_eq_true] at hfree
             simp only [execStmt] at hy ⊢
