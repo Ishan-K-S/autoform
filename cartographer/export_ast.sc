@@ -997,11 +997,35 @@ import scala.annotation.tailrec
     * So the ledger's largest label was in large part a *type-recovery* gap masquerading
     * as a semantics gap. That is worth stating precisely, because the two have completely
     * different remedies and only one of them is expensive. */
+  /** Whole-program: file-scope (`static` or plain global) C variable types, read
+    * from the `Local`s Joern scopes to each file's own synthetic `<global>`
+    * method. Confirmed live this session: `sqlite3SharedCacheList: BtShared*`,
+    * `zMagicHeader: char[]`, and others resolve correctly there -- but
+    * `localTypes` (`staticTypeOf`'s existing fallback below) is rebuilt PER
+    * ORDINARY METHOD (`m.local.l`, which never includes a *different* method's
+    * scope) and so never covers them, leaving a global's identifier no
+    * whole-program alternative when the node's own `direct` type is `ANY`.
+    *
+    * Same "every declaration agrees, or it is not trusted at all" discipline
+    * `typeAliases`'s own `byShort` map already uses for an ambiguous short name:
+    * two unrelated `static`s in different files sharing a name (`state`, `buf`,
+    * ...) are common in C, and are excluded here exactly like a same-named
+    * `using` alias with two different targets is excluded there. Consulted only
+    * as `staticTypeOf`'s LAST resort, after `localTypes` -- ordinary C scoping (a
+    * local/parameter shadows a same-named global) is what that ordering already
+    * encodes, unchanged. */
+  lazy val globalTypes: Map[String, String] =
+    cpg.method.name("<global>").local.l
+      .filter(l => l.typeFullName.nonEmpty && l.typeFullName != "ANY")
+      .groupBy(_.name)
+      .collect { case (nm, locals) if locals.map(_.typeFullName).distinct.size == 1 =>
+        nm -> locals.head.typeFullName }
+
   def staticTypeOf(x: AstNode): String = {
     val direct = nodeType(x)
     if (direct.nonEmpty && direct != "ANY") direct
     else x match {
-      case i: Identifier => localTypes.getOrElse(i.name, direct)
+      case i: Identifier => localTypes.getOrElse(i.name, globalTypes.getOrElse(i.name, direct))
       case c: Call if fieldOps.contains(c.methodFullName) =>
         asField(c).flatMap { case (r, f) =>
           // `p->f` and `o.f` are one node kind here, so strip any pointer depth off the
