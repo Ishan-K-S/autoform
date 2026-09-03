@@ -1313,6 +1313,93 @@ import scala.annotation.tailrec
     * decision made mid-implementation, not just at planning time. */
   val arrayShape = """^(.+)\[(\d+)\]$""".r
 
+  /** `008-reduce-remaining-holes-3` US1: a local array's declared size, when
+    * Joern's own type string does NOT carry a literal integer (`arrayShape`
+    * above requires `\d+`) but a raw, unresolved size EXPRESSION instead --
+    * Joern preserves the source text verbatim inside the brackets since it never
+    * runs the preprocessor.
+    *
+    * Confirmed live against this corpus before writing this, not assumed: the
+    * common real shape is NOT a bare macro name alone, but `MACRO +/- INTEGER`
+    * arithmetic (`u8[NB+2]`, `char[MAX_PATHNAME+1]`, `char[SQLITE_MAX_PATHLEN+2]`
+    * -- a defensive "reserve a few extra bytes" pattern) -- a first version of
+    * this fix that only matched a bare macro name would have resolved close to
+    * none of the 20 non-digit-bracket locals sampled live on this corpus. A
+    * `sizeof(...)`-based size expression (`u8[sizeof(aJournalMagic)+4]`,
+    * `u32[((int)(sizeof(aTable)/sizeof(aTable[0])))]`, also seen in that same
+    * live sample) is explicitly NOT resolved here -- it needs a different
+    * mechanism entirely and stays an honest hole; `macroSizeExpr` below simply
+    * does not match that shape, so it falls through unchanged.
+    *
+    * Deliberately narrow and separate from `arrayShape`: this regex/helper pair
+    * is used ONLY by `boxedArrays`'s own construction below, never touching
+    * `arrayShape` itself or its other four call sites (`sizeofBytes`,
+    * `memberSizeofBytes`, `closedIrefOutParam`'s array check) -- widening a
+    * shared helper's behavior for one caller's new need is exactly the kind of
+    * change that risks an unrelated silent regression elsewhere, so this stays
+    * its own, narrowly-scoped mechanism instead. */
+  val macroSizeExpr = """^([A-Za-z_]\w*)\s*([+-]\s*\d+)?$""".r
+
+  /** A single `#define NAME <integer literal>` line -- one identifier, one
+    * decimal integer, nothing else. Deliberately excludes function-like macros
+    * (`#define F(x) ...`), multi-token expressions, and anything not a bare
+    * integer -- those stay unresolved, matching FR-002's "never guess"
+    * discipline. */
+  // Confirmed live against this corpus, not assumed at design time: a trailing
+  // `/* ... */` documentation comment on the SAME line as the value is the
+  // common real shape (`#define NB 3  /* (NN*2+1): Total pages... */` in
+  // btree.c) -- a first version of this regex without the optional trailing
+  // comment matched zero real `#define` lines in this corpus at all, only
+  // caught by adding a temporary diagnostic print and checking the ACTUAL source
+  // line rather than assuming the "nothing else on the line" shape from
+  // spec.md's own FR-002 wording meant literally nothing, comments included.
+  val defineLine = """^\s*#\s*define\s+([A-Za-z_]\w*)\s+(\d+)\s*(?:/\*.*\*/\s*)?$""".r
+
+  /** Per-file `#define` table, built once per declaring file and cached (the
+    * same file's own macros are checked for every candidate array declared in
+    * it). A name defined more than once in the same file with different values
+    * is dropped from the table entirely -- ambiguous, not guessed, the same
+    * "every declaration agrees, or it is not trusted" discipline `typeAliases`
+    * and `globalTypes` already use elsewhere in this file. A macro defined in a
+    * DIFFERENT file (a shared header) is intentionally invisible here: reading
+    * only the declaring file's own text, not following `#include`, is what
+    * keeps this a bounded, single-file text scan rather than a second
+    * preprocessor. */
+  // `Method.filename` is relative to the ORIGINAL `joern-parse` input root, not
+  // to this script's own working directory -- confirmed live: `m.filename` for a
+  // `btree.c` method is the bare string `"btree.c"`, which does not exist relative
+  // to `cartographer/`'s own cwd. `cpg.metaData.root` recovers the root path
+  // Joern itself recorded at parse time (confirmed live: joining it with a bare
+  // filename resolves to a real, readable file), so every lookup below joins
+  // through it rather than trusting a bare filename to already be openable.
+  lazy val sourceRoot: Option[String] = cpg.metaData.root.headOption
+  val fileDefinesCache = scala.collection.mutable.Map.empty[String, Map[String, Int]]
+  def fileDefines(relPath: String): Map[String, Int] = fileDefinesCache.getOrElseUpdate(relPath, {
+    try {
+      val f = new java.io.File(relPath)
+      val resolved = if (f.isAbsolute) f else sourceRoot.map(r => new java.io.File(r, relPath)).getOrElse(f)
+      val found = scala.io.Source.fromFile(resolved).getLines()
+        .flatMap(defineLine.findFirstMatchIn).map(m => m.group(1) -> m.group(2).toInt).toList
+      found.groupBy(_._1).collect { case (nm, vs) if vs.map(_._2).distinct.size == 1 => nm -> vs.head._2 }
+    } catch { case _: Exception => Map.empty }
+  })
+
+  /** Resolve a raw array-size expression (the bracket contents Joern preserved
+    * verbatim) against the declaring file's own macro table -- `IDENT`,
+    * `IDENT + INTEGER`, or `IDENT - INTEGER` only. Anything else (a `sizeof`, a
+    * multi-term expression, an identifier not in this file's own table) yields
+    * `None`, leaving the declaration exactly where it is today. */
+  def resolveMacroArraySize(sizeExpr: String, filePath: String): Option[Int] =
+    macroSizeExpr.findFirstMatchIn(sizeExpr.trim).flatMap { m =>
+      fileDefines(filePath).get(m.group(1)).map { base =>
+        Option(m.group(2)).map(_.filterNot(_.isWhitespace)) match {
+          case Some(s) if s.startsWith("+") => base + s.drop(1).toInt
+          case Some(s) if s.startsWith("-") => base - s.drop(1).toInt
+          case _                            => base
+        }
+      }
+    }
+
   /** `005-sizeof-constant-folding`: byte count of a `sizeof` operand's type, trying
     * each resolvable shape in turn. The ARRAY check MUST run before the pointer
     * check, not after: `isPointerType` (used elsewhere in this file for the
@@ -4587,9 +4674,24 @@ import scala.annotation.tailrec
     // one function's activation, and a module-scope name was never meant to be in
     // scope for it at all.
     boxedArrays = if (moduleScope) Map.empty else {
+      // `008-reduce-remaining-holes-3` US1: `arrayShape` (a literal integer size)
+      // is tried FIRST, byte-identical to before this feature -- only when it does
+      // NOT match does `resolveMacroArraySize` get a chance, on the SAME bracket
+      // contents, via the broader `arrayShapeAny`. This ordering means a literal
+      // size is never routed through the macro path, and a non-digit size that
+      // `resolveMacroArraySize` cannot resolve (a `sizeof`, multi-term expression,
+      // or macro not in this file's own table) falls through to `None` exactly as
+      // it did before this feature existed.
+      val arrayShapeAny = """^(.+)\[(.+)\]$""".r
       val candidates = m.local.l.flatMap { l =>
         localTypes.get(l.name).flatMap { ty =>
-          arrayShape.findFirstMatchIn(bareType(ty)).map(mt => localName(l.name) -> mt.group(2).toInt)
+          val bt = bareType(ty)
+          arrayShape.findFirstMatchIn(bt).map(mt => localName(l.name) -> mt.group(2).toInt)
+            .orElse {
+              arrayShapeAny.findFirstMatchIn(bt).flatMap { mt =>
+                resolveMacroArraySize(mt.group(2), m.filename).map(localName(l.name) -> _)
+              }
+            }
         }
       }.toMap
       candidates.filter { case (nm, _) => nameSafelyBoxable(nm, wholeObjectAddressOk = false) }
