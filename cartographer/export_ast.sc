@@ -1672,6 +1672,98 @@ import scala.annotation.tailrec
   lazy val takenAsValueFns: Set[String] =
     cpg.methodRef.l.filter(mr => aidx(mr) != -1).map(_.methodFullName).toSet
 
+  /** Whole-program: the bare owner type of any struct/array-literal initializer's
+    * target, OR of a whole-aggregate copy's target (`x = y` where `x` and `y` are
+    * both class-typed and share a bare type) -- either shape can set a struct's
+    * fields to values `fieldFnTargets` just below, which scans only PLAIN
+    * `x.f = v`/`x->f = v` assignment statements, cannot see at all.
+    * `fieldFnTargets` excludes every type collected here unconditionally,
+    * regardless of what its own assignment-statement scan alone would conclude.
+    *
+    * Not a hypothetical exclusion: confirmed live, this session, against real
+    * SQLite -- `sqlite3_mem_methods.xMalloc`/`.xRealloc` resolve to a single
+    * target (`faultsimMalloc`/`faultsimRealloc`) by assignment-statement count
+    * alone, but the SAME type is ALSO initialized via three unrelated positional
+    * struct literals (`defaultMethods`, `memsys5Methods`, `memmethods`), each
+    * assigning a DIFFERENT function to the same field position -- the majority
+    * shape for that type, not an edge case. Resolving `xMalloc` from the
+    * assignment scan alone would have been a silent wrong answer for most of the
+    * objects it actually applies to. */
+  lazy val riskyLiteralInitTypes: Set[String] =
+    allCalls.filter(_.methodFullName == "<operator>.assignment").flatMap { a =>
+      kidsOf(a) match {
+        case lhs :: (rhs: Call) :: Nil if rhs.methodFullName == "<operator>.arrayInitializer" =>
+          val ty = stripDuplicateSuffix(bareType(staticTypeOf(lhs)))
+          if (ty.nonEmpty && ty != "ANY") Some(ty) else None
+        case (lhs: AstNode) :: (rhs: AstNode) :: Nil =>
+          val lty = stripDuplicateSuffix(bareType(staticTypeOf(lhs)))
+          if (lty.nonEmpty && lty != "ANY" && isClassType(lty) &&
+              lty == stripDuplicateSuffix(bareType(staticTypeOf(rhs))))
+            Some(lty)
+          else None
+        case _ => None
+      }
+    }.toSet
+
+  /** Whole-program: `(ownerType, fieldName) -> the one function every assignment
+    * to that struct field, anywhere in the program, agrees on`. The field-level
+    * analogue of `fnPtrVars`'s own whole-FUNCTION single-assignment discipline,
+    * generalized to whole-PROGRAM single-VALUE: unlike a local variable, a
+    * struct field is legitimately set at many call sites (one per object
+    * constructed), so requiring a single assignment SITE would resolve almost
+    * nothing for a real vtable-style field -- what has to hold instead is that
+    * every site, however many, assigns the SAME function. Absent real points-to
+    * analysis (the "new subsystem" this project has consistently deferred),
+    * this is a checkable, sound-when-it-fires substitute: the moment it cannot
+    * be shown, this returns no entry and the call site stays a hole, matching
+    * `closedOutParam`/`closedIrefOutParam`'s own conservative discipline
+    * elsewhere in this file. Reuses `fnPtrVars`'s own closure-safety guard
+    * (`capturesEnv`) and external-function guard (`methodByName`) verbatim --
+    * both apply here for exactly the same reasons. */
+  lazy val fieldFnTargets: Map[(String, String), String] = {
+    val assigns = allCalls.filter(_.methodFullName == "<operator>.assignment")
+    val targets = scala.collection.mutable.Map[(String, String), Set[String]]().withDefaultValue(Set.empty)
+    val unsafe  = scala.collection.mutable.Set[(String, String)]()
+
+    def fnTarget(mr: MethodRef): Option[(String, Boolean)] =
+      if (methodByName.contains(mr.methodFullName))
+        Some((mangledFullName(mr.methodFullName), capturesEnv.getOrElse(mr.methodFullName, false)))
+      else None
+
+    for (a <- assigns) {
+      kidsOf(a) match {
+        case (lhs: Call) :: rhs :: Nil if fieldOps.contains(lhs.methodFullName) =>
+          asField(lhs).foreach { case (recv, field) =>
+            val owner = stripDuplicateSuffix(
+              bareType(staticTypeOf(recv)).reverse.dropWhile(_ == '*').reverse)
+            if (owner.nonEmpty && owner != "ANY") {
+              val key = (owner, field)
+              val resolved: Option[(String, Boolean)] = rhs match {
+                case mr: MethodRef => fnTarget(mr)
+                case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+                  kidsOf(addr) match { case List(mr: MethodRef) => fnTarget(mr); case _ => None }
+                case _ => None
+              }
+              resolved match {
+                case Some((target, false)) => targets(key) = targets(key) + target
+                // A captured closure, or any RHS this cannot resolve to a known
+                // in-program function at all, disqualifies the field outright --
+                // the same non-negotiable exclusion `fnPtrVars` applies to a
+                // variable, extended here to every object that shares this field.
+                case Some((_, true)) | None => unsafe += key
+              }
+            }
+          }
+        case _ =>
+      }
+    }
+    targets.iterator.collect {
+      case (key @ (owner, _), ts) if ts.size == 1 && !unsafe.contains(key) &&
+                                      !riskyLiteralInitTypes.contains(owner) =>
+        key -> ts.head
+    }.toMap
+  }
+
   /** `003-box-address-taken-locals`, Increment B: FR-006's closed-call-site
     * precondition. Is parameter position `paramIndex` (Joern's own `ARGUMENT_INDEX`/
     * `MethodParameterIn.index` convention, so no separate off-by-one translation is
@@ -1777,6 +1869,25 @@ import scala.annotation.tailrec
       case n => nameOf(n)
     }
   }
+
+  /** The `(ownerType, fieldName)` a `pointerCall`'s callee reads, when it is a
+    * field access (`p->f(...)`/`p.f(...)`) whose receiver's static type Joern
+    * actually resolved -- `pointerCallCalleeVar`'s own struct-field exclusion,
+    * given a name here instead of staying unconditionally `None`, so
+    * `fieldFnTargets` can be tried as a second, independent resolution path.
+    * `None` when the receiver's type is Joern's own `ANY` (or otherwise
+    * unresolved): there is no owner type to look a target up against, and this
+    * must stay a hole exactly as it already does today. */
+  def pointerCallCalleeField(c: Call): Option[(String, String)] =
+    kidsOf(c).find(aidx(_) == -1).flatMap {
+      case fa: Call if fieldOps.contains(fa.methodFullName) =>
+        asField(fa).flatMap { case (recv, field) =>
+          val owner = stripDuplicateSuffix(
+            bareType(staticTypeOf(recv)).reverse.dropWhile(_ == '*').reverse)
+          if (owner.nonEmpty && owner != "ANY") Some((owner, field)) else None
+        }
+      case _ => None
+    }
 
   /** `Expr.name nm` -- the box's own reference, e.g. what `&x` evaluates to once `x`
     * is boxed, or what a boxed local's declared-type-preserving reference looks like. */
@@ -2847,11 +2958,21 @@ import scala.annotation.tailrec
           // §1). When the callee names a variable this method's own `fnPtrVars`
           // has proven, by a bounded whole-function single-assignment check, holds
           // exactly one known, non-capturing, in-program function -- rewrite the
-          // WHOLE call to an ordinary direct call to that function. Any callee
-          // this cannot prove safe (ambiguous, external, a struct field, an array
-          // element, or the general shape) falls through to the unchanged generic
-          // hole just below, exactly as today.
-          pointerCallCalleeVar(c).flatMap(fnPtrVars.get) match {
+          // WHOLE call to an ordinary direct call to that function.
+          //
+          // Second, independent path: the callee is a STRUCT FIELD
+          // (`p->xCellSize(...)`, this label's dominant real shape -- 396 of 592
+          // raw sites measured live on SQLite, vs 122 identifier-shaped and the
+          // rest smaller). `fieldFnTargets` proves the field-level analogue --
+          // whole-PROGRAM single-VALUE rather than single-assignment-SITE, with
+          // the struct/array-literal and whole-aggregate-copy exclusion
+          // `riskyLiteralInitTypes` enforces (its own doc comment: a confirmed,
+          // not hypothetical, silent-wrong-answer trap this session found and
+          // closed before it could ship). Any callee neither path can prove safe
+          // (ambiguous, external, an array element, or the general shape) falls
+          // through to the unchanged generic hole just below, exactly as today.
+          pointerCallCalleeVar(c).flatMap(fnPtrVars.get)
+            .orElse(pointerCallCalleeField(c).flatMap(fieldFnTargets.get)) match {
             case Some(target) => ujson.Obj("k" -> "call", "f" -> target, "args" -> exprs(realArgs))
             case None          => hole("op:" + opLabel(mfn))
           }
