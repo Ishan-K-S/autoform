@@ -1006,6 +1006,28 @@ import scala.annotation.tailrec
     * scope) and so never covers them, leaving a global's identifier no
     * whole-program alternative when the node's own `direct` type is `ANY`.
     *
+    * `cpg.local` filtered by each Local's OWN `.method` back-edge, NOT
+    * `cpg.method.name("<global>").local`'s forward traversal -- confirmed live,
+    * this session, the two disagree: the forward direction found 468 globals,
+    * the (correct) reverse direction 821, missing 353 real ones (`sqlite3Hooks`,
+    * `sqlite3Autoext`, `mem0`, ...) including well-typed ones the forward
+    * traversal had no excuse to drop. Not a hypothetical Joern quirk avoided on
+    * principle: measured, and the reverse direction is the one this file now
+    * uses everywhere it needs "every global", for exactly this reason.
+    *
+    * A global whose OWN `typeFullName` is one of Joern's generic anonymous-type
+    * fallbacks (`struct`/`union`, no tag name to report) is rescued through a
+    * SECOND path: Joern names an anonymous struct/union's synthesized `TypeDecl`
+    * after the variable it is declared on, when that variable is the only thing
+    * naming it. Confirmed live: `gMultiplex`'s own `Local.typeFullName` is the
+    * bare word `struct`, but `cpg.typeDecl` has a real, member-bearing
+    * `TypeDecl` named exactly `gMultiplex` (`pOrigVfs`, `sThisVfs`, ...) --
+    * Joern recovered the full shape, it is just filed under the variable's own
+    * name rather than a (nonexistent) tag name. Gated on a non-empty member
+    * list, matching `structTypeDeclOf`'s own "skip a forward-only declaration"
+    * discipline, so a global that is genuinely just an opaque anonymous blob
+    * with no member evidence anywhere stays unresolved rather than guessed.
+    *
     * Same "every declaration agrees, or it is not trusted at all" discipline
     * `typeAliases`'s own `byShort` map already uses for an ambiguous short name:
     * two unrelated `static`s in different files sharing a name (`state`, `buf`,
@@ -1014,12 +1036,23 @@ import scala.annotation.tailrec
     * as `staticTypeOf`'s LAST resort, after `localTypes` -- ordinary C scoping (a
     * local/parameter shadows a same-named global) is what that ordering already
     * encodes, unchanged. */
-  lazy val globalTypes: Map[String, String] =
-    cpg.method.name("<global>").local.l
-      .filter(l => l.typeFullName.nonEmpty && l.typeFullName != "ANY")
-      .groupBy(_.name)
-      .collect { case (nm, locals) if locals.map(_.typeFullName).distinct.size == 1 =>
-        nm -> locals.head.typeFullName }
+  lazy val globalTypes: Map[String, String] = {
+    val anonymous = Set("struct", "union", "")
+    val namedTypeDeclsWithMembers: Set[String] =
+      cpg.typeDecl.filter(_.member.nonEmpty).map(_.name).toSet
+    cpg.local.l
+      .filter(_.method.name.headOption.contains("<global>"))
+      .flatMap { l =>
+        if (l.typeFullName.nonEmpty && l.typeFullName != "ANY" && !anonymous.contains(l.typeFullName))
+          Some(l.name -> l.typeFullName)
+        else if (namedTypeDeclsWithMembers.contains(l.name))
+          Some(l.name -> l.name)
+        else None
+      }
+      .groupBy(_._1)
+      .collect { case (nm, entries) if entries.map(_._2).distinct.size == 1 =>
+        nm -> entries.head._2 }
+  }
 
   def staticTypeOf(x: AstNode): String = {
     val direct = nodeType(x)
