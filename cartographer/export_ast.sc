@@ -1048,6 +1048,22 @@ import scala.annotation.tailrec
     ty.matches("""(const|volatile|signed|unsigned)*char(\*|\[.*\]).*""")
   }
 
+  /** A null-literal spelling (`NULL`, `nullptr`, `null`, `None`, `nil`) -- the same set
+    * `expr`'s own literal dispatch recognises and renders as `Val.unit`. Used to let a
+    * `char*` null CHECK (`z == NULL`, `z != NULL`) through `callExpr`'s `cStringUnsafe`
+    * guard below: it needs no address/pointer-arithmetic semantics at all. `Val.beq`
+    * (`Syntax.lean`) has an explicit wildcard `_, _ => false` for any two different `Val`
+    * constructors, so `.str _ == .unit` evaluates to `false` (a real string is never
+    * null) and `.unit == .unit` to `true` (both null) -- exactly the reasoning already
+    * relied on for ordinary (non-string) pointer null checks, which never reach this
+    * guard at all since `isCString` only matches `char*`/`char[]`. */
+  def isNullLiteral(n: AstNode): Boolean = n match {
+    case l: Literal =>
+      val c = l.code.trim
+      c == "None" || c == "null" || c == "nil" || c == "nullptr" || c == "NULL"
+    case _ => false
+  }
+
   // ---- C and C++ types ------------------------------------------------------
   //
   // Everything below is about telling apart three things that C spells with much the same
@@ -2514,8 +2530,13 @@ import scala.annotation.tailrec
     // address comparison. This is the §12 lesson again: the constructs that *look* alike
     // across languages are the dangerous ones. So under a C-family dialect, an operand
     // with static `char*` evidence turns the whole operator into a hole.
+    // A null CHECK (`z == NULL` / `z != NULL`) on a char* is exempted from the guard
+    // just below: see `isNullLiteral`'s own doc comment for why it needs no address
+    // semantics at all, unlike every other `cStringUnsafe` shape.
+    val isNullCheck = (mfn == "<operator>.equals" || mfn == "<operator>.notEquals") &&
+                       kids.exists(isNullLiteral)
     if (cLikeFile && kids.size == 2 && kids.exists(isCString) &&
-        cStringUnsafe.contains(mfn))
+        cStringUnsafe.contains(mfn) && !isNullCheck)
       hole(cStringUnsafe(mfn))
     else if (binops.contains(mfn) && kids.size == 2)
       ujson.Obj("k" -> "binop", "op" -> binops(mfn), "a" -> expr(kids(0)), "b" -> expr(kids(1)))
