@@ -2050,7 +2050,16 @@ import scala.annotation.tailrec
     "dma_addr_t", "resource_size_t", "cycles_t", "ktime_t", "wchar_t", "intptr_t",
     "longdouble", "signedlong", "unsignedlong", "longunsigned", "int128_t", "__u8",
     "__u16", "__u32", "__u64", "__s8", "__s16", "__s32", "__s64", "__be16", "__be32",
-    "__be64", "__le16", "__le32", "__le64", "bool_t", "size_type"
+    "__be64", "__le16", "__le32", "__le64", "bool_t", "size_type",
+    // `010-reach-90pct-hole-free` US2: SQLite's own `typedef uintptr_t/u32/u64 uptr;`
+    // (sqliteInt.h, picked per data-model bitness) -- live-CPG-confirmed as the
+    // single most frequent unresolved cast target in the corpus (137 sites,
+    // `sqlite3DbMallocSize`/`isLookaside`/etc.'s pointer-as-integer bounds checks,
+    // e.g. `((uptr)p) < (uptr)(db->lookaside.pTrueEnd)`), sitting right next to its
+    // already-handled siblings `u8`/`u16`/`u32`/`u64` above -- simply never added
+    // when those were. `uintptr_t` itself was missing too, right next to the
+    // already-present `intptr_t` (its signed counterpart) two lines up.
+    "uptr", "uintptr_t"
   )
 
   /** The type is an aggregate, so `&it` is the identity: a Core class instance already
