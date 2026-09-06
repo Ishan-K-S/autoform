@@ -3290,6 +3290,56 @@ import scala.annotation.tailrec
     arrayShapeAny.findFirstMatchIn(bt).exists(m => resolveMacroArraySize(m.group(2), declFile).isDefined)
   }
 
+  /** `010-reach-90pct-hole-free` US3: is `x` (the operand of `&x` at a call
+    * site) a plain SCALAR local or parameter of its OWN enclosing method --
+    * the single most common C out-parameter idiom (`int n; f(&n);`), and the
+    * single biggest gap `closedIrefOutParam`'s existing enumeration (array
+    * index, struct field, bare array decay) did not cover at all, confirmed
+    * live by sampling real `assign:lhs:indirection` sites.
+    *
+    * `&n` for exactly this shape is ALREADY known sound at the CALLER's own
+    * site: `003-box-address-taken-locals`'s `boxableName` mechanism boxes `n`
+    * into a real heap cell and translates `&n` to that cell's own `Val.iref`
+    * whenever `n` is passed only to in-program functions or dereferenced
+    * directly (never to an external call) -- this function widens
+    * `closedIrefOutParam`'s TRUST of the callee's own parameter to match,
+    * so the callee's body may also safely read/write through it, not just
+    * the caller's argument expression translate correctly.
+    *
+    * Deliberately reimplemented here rather than calling `boxableName`
+    * directly: `boxableName`/`addressOfIsAggregate`/`addrShape` all read the
+    * per-METHOD mutable `localTypes`/`moduleScope`/`valueReceivers`/
+    * `ptrReceivers` vars, which reflect whichever method the main per-method
+    * translation loop happens to be visiting -- unsafe to read from
+    * `closedIrefOutParam`, itself a WHOLE-PROGRAM check with no re-entry
+    * into each call site's own calling method's translation context.
+    * Every fact this function needs instead comes from `x.method` directly
+    * (a plain CPG traversal, correct regardless of "current" processing
+    * state) -- the same discipline `irefArrayEligible`/
+    * `fieldReceiverAggregateType` above already follow, and the same fix
+    * this session already applied once for an identical class of gap
+    * (`genuineLocalNames`, built from `closureBindingId` rather than a
+    * per-method var, for exactly this "whole-program check cannot trust
+    * per-method state" reason). */
+  def scalarAddressOfEligible(x: AstNode): Boolean = {
+    def isScalar(ty: String): Boolean = {
+      val bt = bareType(ty)
+      !isClassType(ty) && !isPointerType(bt) &&
+      !arrayShape.findFirstMatchIn(bt).isDefined && !arrayShapeAny.findFirstMatchIn(bt).isDefined
+    }
+    x match {
+      case i: Identifier =>
+        val m  = i.method
+        val nm = i.name
+        nm != "this" && m.name != "<module>" && m.name != "<global>" &&
+        (m.parameter.l.exists(_.name == nm) ||
+         m.local.l.exists(l => l.name == nm && l.closureBindingId.isEmpty)) &&
+        isScalar(staticTypeOf(i))
+      case p: MethodParameterIn => isScalar(staticTypeOf(p))
+      case _ => false
+    }
+  }
+
   def closedIrefOutParam(fn: Method, paramIndex: Int): Boolean =
     if (takenAsValueFns.contains(fn.fullName)) false
     else {
@@ -3323,7 +3373,12 @@ import scala.annotation.tailrec
                 } ||
                 asField(x).exists { case (r, _) =>
                   fieldReceiverAggregateType(staticTypeOf(r)).exists(structTypeDeclOf(_).isDefined)
-                }
+                } ||
+                // `010-reach-90pct-hole-free` US3: `&n`, a plain scalar local
+                // or parameter -- see `scalarAddressOfEligible`'s own doc
+                // comment for the full soundness argument and why this is
+                // checked structurally here rather than reusing `boxableName`.
+                scalarAddressOfEligible(x)
               case _ => false
             }
           // `009-reduce-remaining-holes-4`: a BARE array-decay pass -- `foo(arr)`, no
@@ -3368,7 +3423,8 @@ import scala.annotation.tailrec
             val ok = asIndex(x).exists { case (r, _) => irefArrayEligible(r, declFile) } ||
                      asField(x).exists { case (r, _) =>
                        fieldReceiverAggregateType(staticTypeOf(r)).exists(structTypeDeclOf(_).isDefined)
-                     }
+                     } ||
+                     scalarAddressOfEligible(x)
             if (ok) Ok else Bad
           case _ => Bad
         }
