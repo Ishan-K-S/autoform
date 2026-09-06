@@ -927,6 +927,22 @@ import scala.annotation.tailrec
     * includes Java, Go, JS, TS and Kotlin). The constructor spelling `Cls::Cls`, the
     * implicit `this`, and stack object construction are C++ facts, not `cLike` facts. */
   var cppFile         = false
+  /** `010-reach-90pct-hole-free`: is a single-quoted literal in THIS file a numeric
+    * character/rune constant (C/C++/Java/Kotlin/Go: `'x'` is an integer, its codepoint)
+    * rather than an alternative string-quoting style (JS/TS: `'x'` and `"x"` are the
+    * SAME type, both `str`)? Deliberately narrower than `cLikeFile` -- confirmed live,
+    * this session, that `expr`'s literal dispatch had no distinct case for a bare
+    * single-quoted literal at all: it fell through to the generic `c.headOption.exists(ch
+    * => ch == '"' || ch == '\'') => str` case, silently treating `'x'` as the STRING
+    * `"x"` on every `cLikeFile` language, JS/TS correctly included but C/C++/Java/
+    * Kotlin/Go all WRONG. `*p == 'x'` (`strByte` returns the byte's own INTEGER value)
+    * then compares an int against a str, which `Val.beq` never treats as equal --
+    * silently, permanently false, with no hole anywhere marking it: a `char`-comparison
+    * loop that "translates" cleanly and always computes the wrong answer, exactly the
+    * "well-typed, hole-free, silently wrong" failure class Constitution Principle III
+    * exists to catch. Confirmed live via direct `applyFunc` execution: a byte-counting
+    * loop compiled with ZERO holes and returned 0 for every input. */
+  var charLiteralIsNumeric = false
   // The source file of the method being translated. `import` is resolved relative to it.
   var currentFile     = ""
   // Serial number for the flag variable `try/except/else` needs; nested `try`s in one
@@ -4112,6 +4128,33 @@ import scala.annotation.tailrec
     if (v.abs <= BigInt(2).pow(53)) ujson.Obj("k" -> "int", "v" -> v.toLong)
     else ujson.Obj("k" -> "int", "v" -> v.toString)
 
+  /** `010-reach-90pct-hole-free`: the integer value of a C/C++/Java/Kotlin/Go character
+    * (rune) literal's INNER text (already stripped of its surrounding `'...'`) -- see
+    * `charLiteralIsNumeric`'s own doc comment for why this exists at all. Handles a
+    * single plain character (its Unicode codepoint -- ASCII-range C source, the
+    * overwhelming common case, so codepoint IS byte value) and the standard C escape
+    * sequences: `\n \t \r \0 \\ \' \" \a \b \f \v`, octal (`\NNN`, 1-3 octal digits),
+    * and hex (`\xNN...`). Deliberately `None`, never a guess, for anything else --
+    * a multi-character literal (`'ab'`, its value is implementation-defined even in
+    * real C) or an escape this does not recognise: falls through to the existing
+    * `str` treatment's own honest labelling path below, exactly like every other
+    * "shape not recognised" case in this file. */
+  def charLiteralValue(inner: String): Option[Long] = {
+    val simpleEscapes = Map(
+      "\\n" -> 10L, "\\t" -> 9L, "\\r" -> 13L, "\\0" -> 0L, "\\\\" -> 92L,
+      "\\'" -> 39L, "\\\"" -> 34L, "\\a" -> 7L, "\\b" -> 8L, "\\f" -> 12L, "\\v" -> 11L
+    )
+    if (inner.length == 1 && inner.head != '\\') Some(inner.head.toLong)
+    else if (simpleEscapes.contains(inner)) Some(simpleEscapes(inner))
+    else if (inner.length >= 2 && inner.startsWith("\\x") &&
+             inner.drop(2).nonEmpty && inner.drop(2).forall(ch => ch.isDigit || "abcdefABCDEF".contains(ch)))
+      try Some(java.lang.Long.parseLong(inner.drop(2), 16)) catch { case _: NumberFormatException => None }
+    else if (inner.length >= 2 && inner.startsWith("\\") && inner.drop(1).forall(ch => ch >= '0' && ch <= '7') &&
+             inner.drop(1).length <= 3)
+      try Some(java.lang.Long.parseLong(inner.drop(1), 8)) catch { case _: NumberFormatException => None }
+    else None
+  }
+
   def expr(n: AstNode): ujson.Obj = unwrapMacro(n) match {
     case l: Literal =>
       val c0 = l.code.trim
@@ -4185,6 +4228,20 @@ import scala.annotation.tailrec
           // prefix the next character must be a quote.
           else if (pyFile && pyStringLit(c).isDefined)
             ujson.Obj("k" -> "str", "v" -> pyStringLit(c).get)
+          // `010-reach-90pct-hole-free`: `'x'` in C/C++/Java/Kotlin/Go is a NUMBER (the
+          // character/rune's own codepoint), not a one-letter string -- checked before
+          // the generic quoted-literal case just below, which would otherwise silently
+          // mistranslate it as `Val.str "x"`. See `charLiteralIsNumeric`'s own doc
+          // comment for the live-confirmed silent-wrong-answer bug this closes
+          // (`*p == 'x'` compiling with zero holes and always evaluating false, since
+          // `strByte` returns the byte's own integer value). A recognised escape or
+          // plain single character resolves to its codepoint; anything else (a
+          // multi-character literal, an escape this does not recognise) falls through
+          // to the ordinary string case below, unchanged from before this fix -- never
+          // a guess.
+          else if (charLiteralIsNumeric && c.length >= 3 && c.head == '\'' && c.last == '\'' &&
+                   charLiteralValue(unquoted).isDefined)
+            intLit(charLiteralValue(unquoted).get)
           else if (c.headOption.exists(ch => ch == '"' || ch == '\''))
             ujson.Obj("k" -> "str", "v" -> unquoted)
           else if (c.isEmpty) ujson.Obj("k" -> "unit")
@@ -6773,6 +6830,9 @@ import scala.annotation.tailrec
   // below as initializers, so they never inflate the function count either.
   lazy val cLikeExts = List(".c", ".h", ".cpp", ".cc", ".hpp", ".java", ".js", ".ts", ".kt", ".go")
   lazy val cppExts   = List(".c", ".h", ".cpp", ".cc", ".hpp")
+  // `010-reach-90pct-hole-free`: `cLikeExts` minus `.js`/`.ts` -- see
+  // `charLiteralIsNumeric`'s own doc comment for why those two are excluded.
+  lazy val charLiteralExts = List(".c", ".h", ".cpp", ".cc", ".hpp", ".java", ".kt", ".go")
 
   /** The name a method is exported under.
     *
@@ -7014,6 +7074,7 @@ import scala.annotation.tailrec
     currentClass = enclosingClassOf(m.fullName)
     cLikeFile    = cLikeExts.exists(e => m.filename.toLowerCase.endsWith(e))
     cppFile      = cppExts.exists(e => m.filename.toLowerCase.endsWith(e))
+    charLiteralIsNumeric = charLiteralExts.exists(e => m.filename.toLowerCase.endsWith(e))
     def fieldReceiverNames(op: String): Set[String] =
       m.body.ast.isCall.filter(_.methodFullName == op).l.flatMap { c =>
         val ks = kidsOf(c)
