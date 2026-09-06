@@ -5946,6 +5946,23 @@ import scala.annotation.tailrec
       Some((expr(n), ujson.Obj("k" -> "int", "v" -> 0)))
     case fa if asField(fa).isDefined =>
       Some((expr(fa), ujson.Obj("k" -> "int", "v" -> 0)))
+    // `010-reach-90pct-hole-free` US4: a call RHS (`zSql = sqlite3_value_text(...)`)
+    // was tried as a further seed shape here and REVERTED -- live-measured to
+    // regress two functions (`sqlite3PagerOpen`: new `op:assignment` hole,
+    // `t1CountStep`: new `op:indirection:scalar` hole). Root cause: the
+    // eligibility filter that guards `strCursorParams` population (`export_ast.sc`,
+    // near `strCursorParams = ... m.local.l ...`) uses `.find` on a local's
+    // defining assignments rather than requiring exactly one, so a local like
+    // `zPathname` with TWO assignments in different branches (one now seedable
+    // via a call RHS, matched first) qualifies for cursor tracking even though a
+    // later `zPathname[0] = 0` index-write elsewhere in the function apparently
+    // cannot be soundly handled once `zPathname` is cursor-tracked -- correctly
+    // surfacing as a NEW hole (not a wrong answer) rather than silently accepting
+    // the write, but still a real regression against the pre-change baseline.
+    // Reintroducing this needs the eligibility filter itself hardened first
+    // (require a single syntactic defining assignment, or verify no index/field
+    // WRITE through the name anywhere in the method) -- left for a future push,
+    // not attempted under this session's own time budget.
     case _ => None
   }
 
