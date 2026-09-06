@@ -4913,8 +4913,8 @@ import scala.annotation.tailrec
     //   to the address hole.
     else if (mfn == "<operator>.cast" && kids.size == 2) {
       val tty = staticTypeOf(kids(0))
-      // `009-reduce-remaining-holes-4`: casting an in-program FUNCTION REFERENCE to
-      // another function-pointer-shaped type is an identity, for the same reason
+      // `009-reduce-remaining-holes-4`: casting a FUNCTION REFERENCE to another
+      // function-pointer-shaped type is an identity, for the same reason
       // `&function` already is (the `fnIdentity` case in `<operator>.addressOf`
       // above): Core's `Val.fn` has no pointer-depth or declared-signature
       // distinction to preserve across the cast, so re-spelling the type changes
@@ -4925,16 +4925,55 @@ import scala.annotation.tailrec
       // `sqlite3_destructor_type`, below). Confirmed live: SQLite's own
       // `(sqlite3_destructor_type)sqlite3RowSetClear` (the `SQLITE_DYNAMIC` macro)
       // -- a real destructor function cast to its own registered-callback type.
-      // Restricted to an ACTUALLY in-program function (`methodByName`), matching
-      // `fnIdentity`'s own external-function guard for the identical reason. Two
-      // sibling macros at the SAME cast target type, `SQLITE_STATIC`/
-      // `SQLITE_TRANSIENT` (`(sqlite3_destructor_type)0`/`(sqlite3_destructor_type)
-      // -1`), are sentinel INTEGER values, not function references -- they
-      // correctly fall through to the unchanged logic below (landing on
-      // `op:cast:opaque-type`), since Core's `Val.fn` has no "null function" or
-      // "special sentinel function" to represent them as.
+      // `010-reach-90pct-hole-free`: NOT restricted to an in-program function --
+      // confirmed live that this was over-conservative, copied from `fnPtrVars`'s
+      // OWN external-function guard without actually needing it. That guard's own
+      // doc comment states plainly that `fnValue` "happily represents" an
+      // external/library function reference `today` -- its restriction is a
+      // DIFFERENT, narrower concern specific to POINTERCALL rewriting (not
+      // silently relabeling one hole shape as another, FR-004), not a soundness
+      // limit on `Val.fn` itself. `expr`'s own `MethodRef` dispatch (`case m:
+      // MethodRef => fnValue(m.methodFullName)`) is ALREADY unconditional -- so
+      // `expr(kids(1))` below already produces the right value for an external
+      // callee too, this case just needed to stop refusing to reach it. Confirmed
+      // live: SQLite's own `(sqlite3_syscall_ptr)close` (`os_unix.c`'s `aSyscall[]`
+      // table, overriding libc syscalls by name) -- `close` is never going to be
+      // CALLED through Core's own interpreter here (the table is read as data by
+      // SQLite's own VFS layer, not invoked via `Expr.call`), so an inert,
+      // never-resolving `Val.fn "close"` is the honest, correct value, exactly as
+      // safe as the in-program case already shipped. Two sibling macros at the
+      // SAME cast target type, `SQLITE_STATIC`/`SQLITE_TRANSIENT`
+      // (`(sqlite3_destructor_type)0`/`(sqlite3_destructor_type)-1`), are sentinel
+      // INTEGER values, not function references -- they correctly fall through to
+      // the unchanged logic below (landing on `op:cast:opaque-type`), since Core's
+      // `Val.fn` has no "null function" or "special sentinel function" to
+      // represent them as.
       kids(1) match {
-        case mr: MethodRef if methodByName.contains(mr.methodFullName) => expr(kids(1))
+        case mr: MethodRef => expr(kids(1))
+        // `010-reach-90pct-hole-free`: an EXTERNAL function referenced by BARE
+        // NAME, cast to a known function-pointer typedef -- confirmed live,
+        // `os_unix.c`'s own `aSyscall[]` table, `(sqlite3_syscall_ptr)close`
+        // (overriding libc syscalls by name for `sqlite3_vfs`'s own test-hook
+        // mechanism). Joern never emits a `MethodRef` for a name it cannot
+        // resolve to any known method -- an UNRESOLVED external function
+        // reference is instead a plain `Identifier`, indistinguishable at the
+        // node-type level from a real variable read. Two independent, narrow
+        // conditions are both required before trusting it as a function name
+        // rather than risking a real variable misread as one: the cast TARGET
+        // type must be a known function-pointer typedef
+        // (`functionPointerTypedefNames`, the exact same set `memberSizeofBytes`
+        // already trusts for the identical typedef shape), AND the identifier's
+        // own static type must be fully unresolved (`"ANY"` -- Joern found no
+        // declaration for it as a variable either, exactly what an
+        // unprototyped external function name looks like). A real local/global
+        // variable of unknown type would be rare enough on its own, and this
+        // file's own convention throughout is that `"ANY"` already means
+        // "no evidence found," not "assume the best case" -- so requiring BOTH
+        // signals together, rather than either alone, keeps this from ever
+        // mistaking an actual variable for a function name.
+        case i: Identifier if functionPointerTypedefNames.contains(bareType(tty)) &&
+                               staticTypeOf(i) == "ANY" =>
+          fnValue(i.name)
         case _ =>
           // `007-reduce-remaining-holes-2` US3: a pointer-to-pointer cast is a
           // transparent pass-through of the operand's own (already-correct)
@@ -5017,20 +5056,25 @@ import scala.annotation.tailrec
       // eligible in shape at THIS site can still be excluded overall because some
       // OTHER address-of site of the same name feeds an external call.
       val boxed = boxableName(kids(0)).filter(boxedLocals.contains)
-      // `004-function-pointer-tracking`: `&function` for an in-program function is
-      // ALSO an identity, for the same reason the aggregate case above is: Core's
-      // `Val.fn` has no notion of pointer depth distinguishing "the function" from
-      // "the address of the function" (a C function already decays to its own
-      // address for calling purposes), so `&add` is exactly what plain `add` already
-      // translates to (`expr()`'s existing `MethodRef` case, `fnValue`). Found
-      // necessary, not merely nice-to-have: without this, `op = &add;` still holes
-      // on `&add` ITSELF even once `op`'s later `pointerCall` sites correctly
-      // resolve (`fnPtrVars`) — and that hole aborts the function before any such
-      // call site is ever reached, per Core's own hole-propagation semantics.
-      // Restricted to an ACTUALLY in-program function (`methodByName`), matching
-      // `fnPtrVars`'s own external-function guard for the identical reason.
+      // `004-function-pointer-tracking`: `&function` is ALSO an identity, for the
+      // same reason the aggregate case above is: Core's `Val.fn` has no notion of
+      // pointer depth distinguishing "the function" from "the address of the
+      // function" (a C function already decays to its own address for calling
+      // purposes), so `&add` is exactly what plain `add` already translates to
+      // (`expr()`'s existing `MethodRef` case, `fnValue`). Found necessary, not
+      // merely nice-to-have: without this, `op = &add;` still holes on `&add`
+      // ITSELF even once `op`'s later `pointerCall` sites correctly resolve
+      // (`fnPtrVars`) — and that hole aborts the function before any such call
+      // site is ever reached, per Core's own hole-propagation semantics.
+      // `010-reach-90pct-hole-free`: NOT restricted to an in-program function --
+      // see the identical correction and its full reasoning at this same
+      // `MethodRef` pattern in `<operator>.cast`'s own case just above. `fnValue`
+      // (called via `expr(kids(0))` below, which reaches the SAME unconditional
+      // `case m: MethodRef => fnValue(...)` in `expr`'s own dispatch) already
+      // handles an external function reference correctly; only `fnIdentity`
+      // itself was refusing to reach it.
       val fnIdentity = kids(0) match {
-        case mr: MethodRef if methodByName.contains(mr.methodFullName) => true
+        case mr: MethodRef => true
         case _ => false
       }
       // `006-reduce-remaining-holes`, Story 5: `&a[i]`/`&s.f` once the receiver is
