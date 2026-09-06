@@ -147,6 +147,22 @@ def expr_shape(n):
     if k == "irefIndex": return ".irefIndex", [("e", f('a')), ("e", f('i'))]
     if k == "irefField": return ".irefField", [("e", f('a')), ("atom", lean_str(f('f')))]
     if k == "derefIref": return ".derefIref", [("e", f('p'))]
+    # `009-reduce-remaining-holes-4`: `*p`/`p[i]` on a `char*` byte-cursor -- read
+    # the byte at offset `b` of the base string `a`. See `Syntax.lean`'s own
+    # `Expr.strByte` doc comment for why this is a separate constructor from
+    # `.index` rather than a new case on it.
+    if k == "strByte": return ".strByte", [("e", f('a')), ("e", f('b'))]
+    # `009-reduce-remaining-holes-4`: the substring of `a` from offset `b`
+    # onward -- a byte cursor (`strByte`, above) handed WHOLE to another
+    # function partway through being walked. See `Syntax.lean`'s own
+    # `Expr.strFrom` doc comment. Missed on the first pass (found live: a real
+    # Colab run of the full, unbounded corpus hit `unknown expr node kind
+    # 'strFrom'` on `jim_strstr`, autosetup/jimsh0.c, the first real-corpus
+    # function to actually reach this shape) -- `strByte` alone was added here
+    # and verified via local fixtures, but `strFrom` was verified only via
+    # `lake env lean` fixtures and the exporter's own JSON output, never
+    # actually run through this renderer until a real corpus function used it.
+    if k == "strFrom": return ".strFrom", [("e", f('a')), ("e", f('b'))]
     # --- objects, containers, control ---
     if k == "field":  return ".field", [("e", f('a')), ("atom", lean_str(f('f')))]
     if k == "mcall":  return ".mcall", [("e", f('recv')), ("atom", lean_str(f('m'))), ("es", f('args'))]

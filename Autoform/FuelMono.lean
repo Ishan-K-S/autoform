@@ -196,6 +196,49 @@ private theorem fuelStep : ∀ k, FuelStep k := by
             cases r₁ <;> first
               | (cases hy; exact absurd rfl hne)
               | (rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
+        -- `009-reduce-remaining-holes-4`: `strByte a b` -- same shape as `irefIndex`:
+        -- discriminates on `a`'s own VALUE (only `.str` recurses into evaluating `b`)
+        -- before any further recursion, and the eventual byte-lookup is fuel-free.
+        | strByte a b =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ with
+            | exn v => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | hole l => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | outOfFuel => cases hy; exact absurd rfl hne
+            | val x =>
+                rw [ihE _ hctx _ _ _ _ _ hA (by simp)]
+                cases x
+                case str s =>
+                    dsimp only at hy ⊢
+                    rcases hB : evalExpr ctx k h₁ ρ b with ⟨h₂, r₂⟩
+                    rw [hB] at hy
+                    cases r₂ <;> first
+                      | (cases hy; exact absurd rfl hne)
+                      | (rw [ihE _ hctx _ _ _ _ _ hB (by simp)]; exact hy)
+                all_goals (dsimp only at hy ⊢; exact hy)
+        -- `009-reduce-remaining-holes-4`: `strFrom a b` -- identical shape to
+        -- `strByte` just above (same discrimination, same fuel-free tail).
+        | strFrom a b =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ with
+            | exn v => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | hole l => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | outOfFuel => cases hy; exact absurd rfl hne
+            | val x =>
+                rw [ihE _ hctx _ _ _ _ _ hA (by simp)]
+                cases x
+                case str s =>
+                    dsimp only at hy ⊢
+                    rcases hB : evalExpr ctx k h₁ ρ b with ⟨h₂, r₂⟩
+                    rw [hB] at hy
+                    cases r₂ <;> first
+                      | (cases hy; exact absurd rfl hne)
+                      | (rw [ihE _ hctx _ _ _ _ _ hB (by simp)]; exact hy)
+                all_goals (dsimp only at hy ⊢; exact hy)
         | binop op a b =>
             simp only [evalExpr] at hy ⊢
             rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩

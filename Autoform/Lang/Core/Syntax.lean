@@ -445,6 +445,43 @@ inductive Expr where
   unconditionally, to the unchanged `Heap.getField h r sel.key` -- no `Heap`-level
   change at all. -/
   | derefIref : Expr → Expr
+  /-- `009-reduce-remaining-holes-4`: read the byte at position `b` of the string `a`,
+  as an integer -- C's `*p`/`p[i]` on a `char*` walked as a byte cursor, which is
+  fundamentally NOT `Expr.index`'s existing meaning. `Expr.index` on a `.str` receiver
+  has no case in `evalExpr` at all today (confirmed by reading it directly): Python's
+  own `s[i]` returns a length-1 `Val.str` (matching CPython), but C's `*p` needs an
+  INTEGER byte value comparable via arithmetic (`*z == '"'`, `*z - '0'`) -- the two
+  languages want different return types from the identical `a[b]` syntax, so one
+  semantics cannot honestly serve both. Giving `Expr.index` a `.str` case that returns
+  an integer would silently mistranslate the (currently unsupported, so not yet relied
+  on by anything) Python shape; a separate constructor, emitted ONLY by the C-family
+  exporter path, keeps that choice explicit rather than baked into a single shared
+  node's semantics.
+
+  `Val.beq`/`applyBinop`/every existing `Val` match are untouched: the OPERAND and
+  RESULT are ordinary `Val.str`/`Val.int` values already known throughout Core, this
+  only adds one more way to produce an `Int` from a `Val.str`'s own content. Reads at
+  the string's own length (one past its last real character) yield `0`, matching C's
+  own implicit null terminator that a `Val.str` does not literally store; any other
+  out-of-range index is a hole, not a guessed value, since indexing past a C string's
+  terminator is undefined behaviour with no single well-defined answer to encode.
+  Indexes by Lean `String` codepoint, not raw UTF-8 byte -- identical for the ASCII
+  content this project's own string literals are built from, and stated here rather
+  than silently assumed. -/
+  | strByte : Expr → Expr → Expr
+  /-- `009-reduce-remaining-holes-4`: the substring of `a` starting at position `b`,
+  through its end -- Python's own `s[i:]`, and the value a C byte-cursor `char *z`
+  (`Expr.strByte`, just above) has to produce when it is passed WHOLE to another
+  function partway through being walked (`parseHhMmSs(zDate, p)` after `zDate` has
+  already advanced past the date portion -- SQLite's own dominant real shape for a
+  walked cursor, confirmed live: the great majority of `const char *` cursor
+  parameters are passed onward to a sub-parser at least once). Clamped like Lean's
+  own `List.drop`: a negative start is a hole (the exporter never has a genuine
+  reason to produce one -- a cursor only ever advances forward), but a start past
+  the string's own length is simply the empty string, exactly as `"abc"[10:]` is
+  `""` in Python and `s.drop 999` is `[]` in Lean -- no undefined behaviour to
+  guard against on that side, unlike `strByte`'s own out-of-range READ. -/
+  | strFrom : Expr → Expr → Expr
   deriving Repr, Inhabited
 
 /-- Statements. -/

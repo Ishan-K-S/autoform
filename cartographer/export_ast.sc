@@ -267,7 +267,62 @@ import scala.annotation.tailrec
     "preempt_disable", "preempt_enable")
 
 
-  def kidsOf(n: AstNode): List[AstNode] = n.astChildren.collect { case a: AstNode => a }.l
+  /** Joern's C frontend does not run a real preprocessor (see `run.sh`'s own note on
+    * `--define`): a `#define` macro is not textually substituted before parsing.
+    * Instead, every USE of one is wrapped in a synthetic CALL node named after the
+    * macro itself (`dispatchType == "INLINED"`), and Joern DOES fully parse the
+    * substituted expansion -- WITH the call site's own real arguments already
+    * plugged in for the macro's formal parameters, confirmed live for a 2-parameter
+    * case (`sqliteInt.h`'s `#define AtomicStore(PTR,VAL) (*(PTR) = (VAL))`, called as
+    * `AtomicStore(&db->u1.isInterrupted, 1)`, expands to the real
+    * `*(&db->u1.isInterrupted) = (1)`, not a template with `PTR`/`VAL` still free) --
+    * but files it as the sole child of an otherwise-unused `BLOCK` child of that
+    * wrapper, not as a sibling anyone already walking the AST would find. Left alone,
+    * every one of these (`SQLITE_OK` -> `0`, `sqlite3GlobalConfig` -> the real
+    * `sqlite3Config` global, `HasRowid(pTab)` -> `(pTab)->tabFlags & 0x80) == 0`, ...)
+    * falls through this file's generic "ordinary named call" handling and is exported
+    * as a fabricated call to a function that does not exist -- not a hole, a silently
+    * WRONG translation. Confirmed corpus-wide: 11,755 zero-parameter `INLINED`
+    * wrappers alone have exactly one child in that `BLOCK` and none nest (a macro
+    * expanding to another macro use), so unwrapping to that single child is always
+    * safe and always correct -- it is exactly what a real preprocessor would have
+    * handed the parser. (An EARLIER version of this comment claimed function-like
+    * macros were a separate, unsafe case whose `BLOCK` stays empty -- that was a bug
+    * in the diagnostic that found it, not a real Joern limitation: re-checked live,
+    * `MAX(a,b)`, `HasRowid(pTab)`, `IsView(pTab)`, `OptimizationDisabled(db,mask)` all
+    * carry a fully-substituted, single-child `BLOCK` exactly like the zero-parameter
+    * case, and this function already handles them today with no extra code, since
+    * the match below never actually looked at parameter count.)
+    *
+    * Also cancels `*(&e)` to plain `e`: dereferencing an address-of is definitionally
+    * a no-op (whatever lvalue `e` names, `*&e` names the identical one), and `&`
+    * requires an lvalue operand, so `e` can never itself carry a side effect this
+    * cancellation would risk duplicating. This exact shape is what the macro
+    * expansion above hands back for any WSD-style load/store macro
+    * (`AtomicStore`/`AtomicLoad`, and their SQLite siblings) once the real pointer
+    * argument is substituted in for the macro's own dereferenced parameter -- without
+    * it, `*(&db->u1.isInterrupted) = 1` looks like a raw, untracked pointer write and
+    * holes, when the macro was really just a stylised `db->u1.isInterrupted = 1`. */
+  def unwrapMacro(n: AstNode): AstNode = n match {
+    case c: Call if c.dispatchType == "INLINED" =>
+      c.astChildren.collect { case b: Block => b }.headOption
+        .map(_.astChildren.collect { case a: AstNode => a }.l)
+        .filter(_.size == 1)
+        .map(cs => unwrapMacro(cs.head))
+        .getOrElse(n)
+    case c: Call if c.methodFullName == "<operator>.indirection" =>
+      c.astChildren.collect { case a: AstNode => a }.l match {
+        case List(ao: Call) if ao.methodFullName == "<operator>.addressOf" =>
+          ao.astChildren.collect { case a: AstNode => a }.l match {
+            case List(inner) => unwrapMacro(inner)
+            case _            => n
+          }
+        case _ => n
+      }
+    case _ => n
+  }
+
+  def kidsOf(n: AstNode): List[AstNode] = n.astChildren.collect { case a: AstNode => a }.map(unwrapMacro).l
 
   /** A block's source text with its braces and any comments stripped, leaving only
     * what would actually execute. Distinguishes a genuinely empty `{}` body (or a
@@ -493,6 +548,28 @@ import scala.annotation.tailrec
   // function scopes count.
   val allMethods   = cpg.method.isExternal(false).l
   val methodByName = allMethods.map(m => m.fullName -> m).toMap
+
+  /** `009-reduce-remaining-holes-4`: every REAL, in-program function's own bare
+    * (unqualified) name -- the collision guard for translating a `pointerCall`
+    * whose callee is a bare VARIABLE (`op(...)`) as `Expr.call(varName, args)`
+    * directly, trusting `Semantics.lean`'s own EXISTING dynamic-dispatch
+    * fallback (`ctx.resolve f` fails for a variable name, then `ρ.get f` finds
+    * the `Val.fn` the variable actually holds -- confirmed live, via two
+    * standalone Lean fixtures run through the real interpreter this session,
+    * including one where the SAME variable holds two DIFFERENT functions
+    * depending on a runtime condition, matching SQLite's own real
+    * `xConstruct = isLegacy ? xCreate : xConnect` idiom exactly). That fallback
+    * is safe ONLY if `ctx.resolve(varName)` is GUARANTEED to fail -- and
+    * `Ctx.resolve` tries an EXACT name match first, then a unique SUFFIX match
+    * (`fullName.endsWith("." + varName)`) -- so a local variable whose OWN name
+    * happens to equal some REAL, unrelated function's bare name anywhere in the
+    * program would be silently resolved to THAT function instead of dispatching
+    * through the variable's own value. This set names every bare function name
+    * this program has, so the new `pointerCall` case can refuse to fire when
+    * the variable's name collides with one, falling through to the honest hole
+    * instead of risking exactly the silent-wrong-answer failure mode this
+    * project's whole history has fought against. */
+  lazy val anyFunctionBareName: Set[String] = allMethods.map(_.name).toSet
 
   /** Names a method binds itself: parameters plus identifier assignment targets — which
     * is exactly Python's rule (a name assigned anywhere in a body is local throughout),
@@ -830,6 +907,22 @@ import scala.annotation.tailrec
     * has been proved to be a structured forward jump. */
   var gotoAsBreak: Option[String] = None
 
+  /** `009-reduce-remaining-holes-4`: `methodBody`'s own multi-label generalization of
+    * `gotoAsBreak` above -- label name -> the RAW statement nodes from just after that
+    * label's own position to the end of the function body. A `goto` targeting a name
+    * present here translates as a fresh copy of that tail, re-translated in place
+    * (`seqOf(stmts(...))`), rather than as a `break` -- see `methodBody`'s own doc
+    * comment for why a single shared loop-wrapper cannot express more than one label
+    * (C's own `break` is exactly as single-level as `Stmt.brk`, so nesting wrappers
+    * cannot make a `break` cross more than its own innermost one) and why duplicating
+    * the tail is the sound, general alternative: this is a batch, one-time AST
+    * transform, so the only cost of duplication is generated-Lean size, never
+    * correctness -- each copy is independently, faithfully re-translated from the
+    * SAME source nodes `goto`'s own single-label sibling mechanism already reads.
+    * `Map.empty` everywhere except inside a function whose gotos have been proved
+    * (by `methodBody`) to be exactly this shape. */
+  var gotoTailStmts: Map[String, List[AstNode]] = Map.empty
+
   /** C and C++ specifically, as opposed to the whole `cLike` *dialect* family (which
     * includes Java, Go, JS, TS and Kotlin). The constructor spelling `Cls::Cls`, the
     * implicit `this`, and stack object construction are C++ facts, not `cLike` facts. */
@@ -862,6 +955,25 @@ import scala.annotation.tailrec
 
   /** Declared types of the locals and parameters of the method being translated. */
   var localTypes = Map.empty[String, String]
+
+  /** `009-reduce-remaining-holes-4`: names of the method's OWN genuine locals and
+    * parameters -- unlike `localTypes` (immediately above), this deliberately
+    * EXCLUDES a `Local` node whose `closureBindingId` is set. Found live, while
+    * chasing the `isGlobalWrite` bug just below: Joern's C frontend represents a
+    * function's reference to an OUTER-SCOPE (file-scope global) variable as a
+    * `Local` node in the REFERENCING method's own `m.local.l`, distinguished from
+    * a genuine local ONLY by carrying a `closureBindingId` (confirmed live:
+    * `bump()`'s own `m.local.l` contains `n` with `closureBindingId =
+    * Some("GlobalCheck.c:bump:n")`, even though `n` is declared nowhere inside
+    * `bump` at all) -- almost certainly the SAME machinery Joern uses to model a
+    * genuine closure capturing an outer variable in a language that has closures,
+    * reused for C's own (keyword-free) file-scope access. `localTypes` itself is
+    * left as-is (it is a whole-program`declared types` map used for type
+    * RECOVERY, where including a global's own already-correct type causes no
+    * harm), but `isGlobalWrite` needs the STRICTER distinction: whether `name` is
+    * a local Joern invented to represent an outer reference vs. one this method
+    * actually owns. */
+  var genuineLocalNames = Set.empty[String]
 
   /** Names this method selects a field off with `.`, and names it selects one off with
     * `->`. C's two spellings are a *syntactic* proof of what the name holds: `x.f`
@@ -951,6 +1063,13 @@ import scala.annotation.tailrec
     * unconditional prologue. */
   var boxedStructs = Map.empty[String, List[String]]
 
+  /** `009-reduce-remaining-holes-4`: `boxedStructs` name -> {array-typed member
+    * name -> resolved size}, for structs whose array-typed member(s) need a
+    * NESTED sub-array box in the prologue instead of a bare `unit` -- see the
+    * doc comment at this var's own population site (`emit`) for the full
+    * reasoning and the parameter-vs-local scope boundary. */
+  var boxedStructArrayMembers = Map.empty[String, Map[String, Int]]
+
   /** `006-reduce-remaining-holes`, Story 5: plain (unboxed) pointer-typed locals
     * PROVABLY, for their whole lifetime in this method, holding an interior
     * pointer VALUE -- `p = &a[i]`, `p = &s.f`, or `p = a` (array-to-pointer decay),
@@ -962,6 +1081,37 @@ import scala.annotation.tailrec
     * `binop` arithmetic (`applyBinop`'s new `Val.iref` arms) -- no allocation of
     * any kind for `p`. */
   var ptrIrefNames = Set.empty[String]
+
+  /** `009-reduce-remaining-holes-4`: `const char *z` parameters walked as a BYTE
+    * CURSOR -- `*z`, `z++`/`z--`/`z += n`/`z -= n`, and a bare `z == 0`/`z != 0` null
+    * check, and NOTHING else anywhere in the method (no plain `=` reassignment, no
+    * address-of, no field/index-access receiver use, and never passed as a bare
+    * argument to another call). SQLite's dominant string-scanning idiom
+    * (`identLength`'s own `for(n=0; *z; n++, z++)`, `parseYyyyMmDd`'s `zDate++`/
+    * `zDate += 10`) has no representation under the file's existing char*-as-`Val.str`
+    * convention, because a byte cursor needs to advance independently of the
+    * string's own (immutable) content.
+    *
+    * Represented WITHOUT touching `z`'s own binding at all: `z` keeps holding the
+    * ORIGINAL `Val.str` parameter value, unchanged, for the method's whole lifetime
+    * (so a bare `z == 0`/`z != 0` null check anywhere in the method keeps working via
+    * the EXISTING, untouched null-check machinery), and a fresh synthetic local
+    * `<name>$off` (a `$`-prefixed suffix, unspellable in C source, so it can never
+    * collide with a real name) tracks the current byte position, initialized to `0`
+    * by this method's own prologue. `*z` reads `Expr.strByte z z$off`
+    * (`Autoform.Lang.Core.Syntax`'s new constructor, built and Lean-verified this
+    * session specifically for this); `z++`/`z += n` become ordinary integer
+    * arithmetic on `z$off`, needing no Core semantics at all beyond what every other
+    * integer local already has.
+    *
+    * Deliberately excludes the "dual use" case -- a `char*` passed whole to another
+    * function (`strcmp(z, ...)`) part-way through being walked -- by disqualifying a
+    * parameter outright the moment it appears in ANY shape besides the ones named
+    * above: `strCursorEligible`'s own doc comment has the exact accounting. This is
+    * conservative BY CONSTRUCTION, not by estimation: a parameter this cannot fully
+    * account for every occurrence of falls through to the existing (unchanged)
+    * `cstr:pointer-arith`/`op:postIncrement:pointer`/... holes, never a guess. */
+  var strCursorParams = Set.empty[String]
 
   /** `(owning type, member name) -> member type`, for the whole program.
     *
@@ -1038,8 +1188,12 @@ import scala.annotation.tailrec
     * encodes, unchanged. */
   lazy val globalTypes: Map[String, String] = {
     val anonymous = Set("struct", "union", "")
+    // `009-reduce-remaining-holes-4`: `stripDuplicateSuffix`, the same fix
+    // `aggregateNames` needed this same push (its own doc comment has the full
+    // report) -- a member-bearing `TypeDecl` can be named `Foo<duplicate>N`
+    // while every real declaration in the program spells the tag `Foo`.
     val namedTypeDeclsWithMembers: Set[String] =
-      cpg.typeDecl.filter(_.member.nonEmpty).map(_.name).toSet
+      cpg.typeDecl.filter(_.member.nonEmpty).map(td => stripDuplicateSuffix(td.name)).toSet
     cpg.local.l
       .filter(_.method.name.headOption.contains("<global>"))
       .flatMap { l =>
@@ -1053,6 +1207,40 @@ import scala.annotation.tailrec
       .collect { case (nm, entries) if entries.map(_._2).distinct.size == 1 =>
         nm -> entries.head._2 }
   }
+
+  /** `009-reduce-remaining-holes-4`: a REAL, silent-wrong bug, found while
+    * investigating an unrelated `control:GOTO` question and confirmed live via
+    * `lake env lean` (`bump()`/`getN()` in a two-function fixture: `getN()`
+    * still read `0` after `bump()` ran `n = n + 1;`). Every one of `assignTo`'s
+    * four call sites decided `setGlobal` vs. plain `assign` with `moduleScope ||
+    * declaredGlobals.contains(name)` -- `declaredGlobals` is populated ONLY from
+    * Python's own `global x` statement (`globalDeclNames`, above), which C has
+    * no equivalent of: a C function reads and writes a file-scope variable by
+    * ORDINARY, keyword-free scoping. So for C, this condition was `false` for
+    * EVERY identifier assignment inside an ordinary (non-`<global>`) function,
+    * regardless of whether that name was a genuine local or a real file-scope
+    * global -- `n = n + 1;` inside `bump()` silently became a LOCAL env write,
+    * discarded the moment `bump()` returned, never touching the actual global
+    * heap object at all. The READ side has no matching bug: `expr`'s own
+    * `Identifier` case emits a plain `Expr.name`, uniform for local and global
+    * alike, and `evalExpr`'s own `.name` case (Semantics.lean) already
+    * correctly checks the local `Env` first and falls back to the globals heap
+    * object -- so a read of an untouched global was never wrong, only a WRITE
+    * back to one. `globalTypes`, just above, is the exact whole-program
+    * "recognized real C file-scope global" set this needs (every `Local` whose
+    * OWN `.method.name` is the synthetic `<global>` pseudo-method): a name in
+    * it, that is NOT ALSO a genuine local/parameter of the method being
+    * translated right now (`localTypes` -- ordinary C scoping means a
+    * same-named local/parameter always shadows a global, exactly the order
+    * `staticTypeOf`'s own `Identifier` case already applies for READS), can
+    * only be a real global write. Deliberately conservative: a C global this
+    * whole-program scan could not confidently resolve (an ambiguous multiply-
+    * declared name, `globalTypes`'s own doc comment has the exact exclusion)
+    * is left exactly as broken as before this fix -- never guessed at more
+    * broadly, matching every other whole-program recognition in this file. */
+  def isGlobalWrite(name: String): Boolean =
+    moduleScope || declaredGlobals.contains(name) ||
+    (cLikeFile && !genuineLocalNames.contains(name) && globalTypes.contains(name))
 
   def staticTypeOf(x: AstNode): String = {
     val direct = nodeType(x)
@@ -1100,24 +1288,162 @@ import scala.annotation.tailrec
     }
   }
 
-  def isCString(n: AstNode): Boolean = {
-    val ty = staticTypeOf(n).replace(" ", "")
-    ty.matches("""(const|volatile|signed|unsigned)*char(\*|\[.*\]).*""")
+  def isCStringType(ty: String): Boolean =
+    ty.replace(" ", "").matches("""(const|volatile|signed|unsigned)*char(\*|\[.*\]).*""")
+  def isCString(n: AstNode): Boolean = isCStringType(staticTypeOf(n))
+
+  /** `009-reduce-remaining-holes-4`: is parameter `paramName` of `m` eligible for
+    * `strCursorParams` tracking? Every occurrence of the name in the method body must
+    * be accounted for by exactly one of: the sole operand of `<operator>.indirection`
+    * (`*z`); the sole operand of `++`/`--` (`z++`, `--z`); the LHS of `z += n`/
+    * `z -= n`; a direct operand of `==`/`!=` (`z == 0`, matching the EXISTING,
+    * unchanged null-check path -- `z`'s own binding is never touched by this
+    * mechanism, so that comparison keeps meaning exactly what it already does); a
+    * positional argument to an ORDINARY NAMED call (`getDigits(zDate, ...)`,
+    * `parseHhMmSs(zDate, p)`) -- SQLite's own dominant real shape for a walked
+    * cursor, confirmed live: the great majority of `const char *` cursor parameters
+    * are handed to a sub-parser at least once. `argExpr` (below) renders exactly
+    * this last case as `Expr.strFrom z z$off` -- the remaining string from the
+    * cursor's own current position -- instead of the full original string, which is
+    * why the eligibility check and the ONE call-argument rendering site
+    * (`argExpr`/`argExprs`, used for every ordinary named call's arguments and
+    * nothing else -- never an operator, `mcall`, `alloc`, or `pointerCall`) must
+    * agree EXACTLY on which class of call qualifies: `!mfn.startsWith("<operator>")
+    * && mfn != "<unknownFullName>"`, the identical test this file already uses
+    * elsewhere to mean "an ordinary named call, not something else with a `Call`
+    * node's shape"; or (this session's local-cursor generalization) the sole
+    * operand of `<operator>.addition`/`.subtraction` whose OTHER operand is not
+    * itself string-typed (`z + n`/`n + z`/`z - n`) -- `callExpr`'s and
+    * `cursorBaseAndOffset`'s own matching translation case, which this bucket must
+    * count EXACTLY the same shapes as, or eligibility and translation drift apart
+    * (moved below `isCString`'s own definition, above, specifically so this bucket
+    * could call it directly rather than duplicating its logic).
+    *
+    * Any OTHER occurrence -- a plain `=` target/source, a field/index receiver, an
+    * `&z`, an argument to anything OTHER than an ordinary named call -- means at
+    * least one reference is unaccounted for, and the counts below will not match,
+    * correctly disqualifying the whole parameter.
+    *
+    * Counting occurrences (rather than walking the AST once and classifying each by
+    * its OWN parent) is deliberate: each bucket below counts the SPECIFIC identifier
+    * node it wraps (an `<operator>.indirection`/incrOp/augmented-assign/comparison/
+    * call-argument position has exactly one or two direct children per call node,
+    * each checked individually), so two DIFFERENT occurrences of `z` can never be
+    * double-counted into looking like one fully-accounted-for reference.
+    *
+    * `allowDefiningAssign`: local-variable generalization -- a LOCAL cursor
+    * candidate additionally needs its OWN single defining `=` (never `+=`/`-=`,
+    * which is `advances`' own bucket already) counted as one more accounted-for
+    * occurrence, exactly once. A plain parameter never passes `true` here (its
+    * `paramCursors` call site below never does), so this changes nothing about the
+    * existing parameter behavior: `defAssigns` is always `0` there, identical to
+    * the formula before this parameter existed. The RHS SHAPE of that one
+    * assignment is deliberately NOT checked here -- that is `cursorBaseAndOffset`'s
+    * job, at the population call site below, which is why that site filters
+    * candidates a second time after this one returns `true`. */
+  def strCursorEligible(m: Method, paramName: String, allowDefiningAssign: Boolean = false): Boolean = {
+    val allRefs = m.body.ast.isIdentifier.name(paramName).l
+    if (allRefs.isEmpty) false
+    else {
+      // `009-reduce-remaining-holes-4`: sees through any number of wrapping
+      // `<operator>.cast` layers -- `*(u8*)z`, SQLite's own recurring defensive-
+      // cast-before-dereference idiom -- so ONE such site does not disqualify the
+      // whole parameter over an occurrence `reads` would otherwise miss entirely.
+      // Inlined here (not shared with `rawNameThroughCast`, its counterpart on the
+      // read-translation side) because this script's forward-reference rule
+      // (`isNullLiteral`'s own doc comment has the full explanation) puts that def
+      // well below this one in the file's top-level body.
+      def identNameThroughCast(n: AstNode): Option[String] = n match {
+        case i: Identifier => Some(i.name)
+        case cst: Call if cst.methodFullName == "<operator>.cast" && kidsOf(cst).size == 2 =>
+          identNameThroughCast(kidsOf(cst)(1))
+        case _ => None
+      }
+      val reads = m.body.ast.isCall.filter(_.methodFullName == "<operator>.indirection").l
+        .count(c => kidsOf(c) match { case List(inner) => identNameThroughCast(inner).contains(paramName); case _ => false })
+      val incrs = m.body.ast.isCall.filter(c => incrOps.contains(c.methodFullName)).l
+        .count(c => kidsOf(c) match { case List(i: Identifier) => i.name == paramName; case _ => false })
+      val advances = m.body.ast.isCall.filter(c => c.methodFullName == "<operator>.assignmentPlus" ||
+                                                    c.methodFullName == "<operator>.assignmentMinus").l
+        .count(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == paramName; case _ => false })
+      val nullChecks = m.body.ast.isCall.filter(c => c.methodFullName == "<operator>.equals" ||
+                                                      c.methodFullName == "<operator>.notEquals").l
+        .count(c => kidsOf(c).exists { case i: Identifier => i.name == paramName; case _ => false })
+      val callArgs = m.body.ast.isCall.filter(c => !c.methodFullName.startsWith("<operator>") &&
+                                                    c.methodFullName != "<unknownFullName>").l
+        .map(c => kidsOf(c).count { k => aidx(k) >= 1 && (k match {
+          case i: Identifier => i.name == paramName; case _ => false }) })
+        .sum
+      // `009-reduce-remaining-holes-4`: `z[i]` -- C's own `*(z+i)`, read relative
+      // to `z`'s CURRENT offset (`expr()`'s matching `indexOps` case does exactly
+      // this). Only the RECEIVER position counts here; the index expression itself
+      // is translated normally and is not expected to name `paramName` again.
+      val indexReads = m.body.ast.isCall.filter(c => indexOps.contains(c.methodFullName)).l
+        .count(c => kidsOf(c) match {
+          case List(base, _) => base match { case i: Identifier => i.name == paramName; case _ => false }
+          case _ => false
+        })
+      val defAssigns =
+        if (!allowDefiningAssign) 0
+        else m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+          .count(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == paramName; case _ => false })
+      // `009-reduce-remaining-holes-4`: `z + n`/`n + z`/`z - n` -- see the doc
+      // comment above for why this must match `callExpr`'s/`cursorBaseAndOffset`'s
+      // own translation case exactly, operand-for-operand.
+      val arithOperands = m.body.ast.isCall.filter(c => c.methodFullName == "<operator>.addition" ||
+                                                          c.methodFullName == "<operator>.subtraction").l
+        .count(c => kidsOf(c) match {
+          case List(a, b) =>
+            val leftIsParam = a match { case i: Identifier => i.name == paramName; case _ => false }
+            val rightIsParam = b match { case i: Identifier => i.name == paramName; case _ => false }
+            (leftIsParam && !isCString(b)) ||
+            (c.methodFullName == "<operator>.addition" && rightIsParam && !isCString(a))
+          case _ => false
+        })
+      (reads + indexReads) > 0 &&
+      (reads + incrs + advances + nullChecks + callArgs + indexReads + defAssigns + arithOperands) == allRefs.size &&
+      (!allowDefiningAssign || defAssigns == 1)
+    }
   }
 
-  /** A null-literal spelling (`NULL`, `nullptr`, `null`, `None`, `nil`) -- the same set
-    * `expr`'s own literal dispatch recognises and renders as `Val.unit`. Used to let a
-    * `char*` null CHECK (`z == NULL`, `z != NULL`) through `callExpr`'s `cStringUnsafe`
-    * guard below: it needs no address/pointer-arithmetic semantics at all. `Val.beq`
+  /** A null-literal spelling (`NULL`, `nullptr`, `null`, `None`, `nil`, or a bare `0`) --
+    * the same set `expr`'s own literal dispatch recognises and renders as `Val.unit`,
+    * plus the integer spelling every one of those macros bottoms out to in C
+    * (`#define NULL 0` or `((void*)0)`) but which Joern hands back as its own distinct
+    * `Literal` node when the source itself just writes `0`. Used to let a `char*` null
+    * CHECK (`z == NULL`, `z == 0`, `z != 0`) through `callExpr`'s `cStringUnsafe` guard
+    * below: it needs no address/pointer-arithmetic semantics at all. `Val.beq`
     * (`Syntax.lean`) has an explicit wildcard `_, _ => false` for any two different `Val`
     * constructors, so `.str _ == .unit` evaluates to `false` (a real string is never
     * null) and `.unit == .unit` to `true` (both null) -- exactly the reasoning already
     * relied on for ordinary (non-string) pointer null checks, which never reach this
-    * guard at all since `isCString` only matches `char*`/`char[]`. */
+    * guard at all since `isCString` only matches `char*`/`char[]`.
+    *
+    * `== 0`/`!= 0` against a pointer is unambiguous in C -- `0` is a null-pointer
+    * constant in that position by the language standard, never an integer value being
+    * compared against an address -- so admitting it carries none of the ambiguity a
+    * bare non-zero literal or a second `char*` operand would. Live-CPG-sampled on
+    * SQLite: 276 of 314 still-holing `char*` `==`/`!=` sites (88%) are exactly this
+    * spelling, dwarfing the 38 genuine variable/content comparisons left as honest
+    * holes. */
+  /** `0`, `00`, `0x0`, with an optional sign and the usual `u`/`l` integer suffixes
+    * stripped -- every C spelling of the integer zero a pointer gets compared against.
+    * A self-contained check rather than a call to `parseIntLiteral`: that def sits far
+    * enough below this one in the file's top-level body that Scala's script-style
+    * forward-reference rule (a `def` may not reach past an intervening top-level `val`
+    * to one declared later) rejects the call outright. */
+  def isZeroLiteral(raw: String): Boolean = {
+    var t = raw.trim
+    if (t.startsWith("-") || t.startsWith("+")) t = t.drop(1)
+    t = t.reverse.dropWhile(ch => ch == 'u' || ch == 'U' || ch == 'l' || ch == 'L').reverse
+    t == "0" || t.matches("0[xX]0+") || (t.nonEmpty && t.forall(_ == '0'))
+  }
+
   def isNullLiteral(n: AstNode): Boolean = n match {
     case l: Literal =>
       val c = l.code.trim
-      c == "None" || c == "null" || c == "nil" || c == "nullptr" || c == "NULL"
+      c == "None" || c == "null" || c == "nil" || c == "nullptr" || c == "NULL" ||
+      isZeroLiteral(c)
     case _ => false
   }
 
@@ -1130,11 +1456,28 @@ import scala.annotation.tailrec
   // keep a hole whose label says *which* address shape it was.
 
   /** Strip cv-qualifiers and whitespace, so `const unsigned char *` compares equal to
-    * `unsigned char*`. */
+    * `unsigned char*`.
+    *
+    * `009-reduce-remaining-holes-4`: a trailing `.stripPrefix("static")`, for a
+    * DIFFERENT reason than the qualifier strips above -- confirmed live, Joern's
+    * own synthesized static type for a `static`-qualified local AGGREGATE
+    * declaration (`static struct unix_syscall {...} aSyscall[]` in `os_unix.c`,
+    * `static struct {...} aCmd[]` in `test2.c`) glues the storage-class keyword
+    * directly onto the struct name with NO separator at all --
+    * `"staticunix_syscall"`, not `"static unix_syscall"` -- so this was never a
+    * question of stripping " static " like the other qualifiers above; there is
+    * no space to find. Every lookup keyed by this string (`structTypeDeclOf`,
+    * `typeDeclsByName`, ...) failed outright as a result, taking the WHOLE
+    * aggregate's layout down with it (`op:sizeOf:opaque-type`) for a struct
+    * Joern's own CPG otherwise reports perfectly normally. Placed at the very
+    * end of the chain so it runs whether the original spelling had a space
+    * (`"static unix_syscall"`, collapsed to `"staticunix_syscall"` by the
+    * preceding `.replace(" ", "")` anyway) or never had one to begin with. */
   def bareType(ty: String): String =
     ty.replace("const ", "").replace("volatile ", "")
       .replace("struct ", "").replace("union ", "").replace("enum ", "")
       .replace(" ", "")
+      .stripPrefix("static")
 
   /** A pointer or an array — a value Core cannot represent, because it is an address.
     * `char[311]` is one of these: an array decays to a pointer. */
@@ -1161,7 +1504,21 @@ import scala.annotation.tailrec
     * The kernel's `s8`..`u64` and `__s8`..`__u64` **are** here: those spellings exist
     * precisely to name an exact width and mean the same thing on every target. `__le32`
     * and friends are not, because their value is byte-swapped as well as narrowed and
-    * only the narrowing would be modelled. */
+    * only the narrowing would be modelled.
+    *
+    * `009-reduce-remaining-holes-4` US2: `longlongint`/`unsignedlonglongint` (the
+    * four-word forms) are a distinct spelling from `longlong`/`unsignedlonglong`
+    * (three words) already above -- `bareType` only strips whitespace, so
+    * `"long long int"` and `"long long"` never collide. SQLite's own `sqlite_int64`/
+    * `sqlite_uint64` (and everything typedef'd from them: `i64`, `u64`, `Bitmask`,
+    * `Pgno`, `tRowcnt`, ...) resolve to exactly the four-word form once `sqlite3.h`
+    * is present in the parse (it is generated from `src/sqlite.h.in` and was
+    * missing from the raw `src/`-only checkout this session's sandbox parses --
+    * without it, Joern has no declaration for `sqlite_int64`/`sqlite_uint64` at
+    * all and reports every alias chain through them as `ANY`). Confirmed live: a
+    * local re-parse with a generated `sqlite3.h` added to the source tree resolves
+    * `sqlite_int64`/`sqlite_uint64` correctly, but the alias chain still landed on
+    * the missing four-word spelling until these two entries were added. */
   val intTypeNames: Map[String, String] = Map(
     "int8_t" -> "i8", "signedchar" -> "i8", "s8" -> "i8", "__s8" -> "i8",
     "uint8_t" -> "u8", "unsignedchar" -> "u8", "u8" -> "u8", "__u8" -> "u8",
@@ -1172,8 +1529,10 @@ import scala.annotation.tailrec
     "__s32" -> "i32",
     "uint32_t" -> "u32", "unsignedint" -> "u32", "unsigned" -> "u32", "u32" -> "u32",
     "__u32" -> "u32",
-    "int64_t" -> "i64", "longlong" -> "i64", "s64" -> "i64", "__s64" -> "i64",
-    "uint64_t" -> "u64", "unsignedlonglong" -> "u64", "u64" -> "u64", "__u64" -> "u64"
+    "int64_t" -> "i64", "longlong" -> "i64", "longlongint" -> "i64", "s64" -> "i64",
+    "__s64" -> "i64",
+    "uint64_t" -> "u64", "unsignedlonglong" -> "u64", "unsignedlonglongint" -> "u64",
+    "u64" -> "u64", "__u64" -> "u64"
   )
 
   /** Integer types whose width is a property of the **target data model**.
@@ -1239,7 +1598,39 @@ import scala.annotation.tailrec
       case (n, tds) if tds.map(td => bareType(td.aliasTypeFullName.get)).distinct.size == 1 =>
         n -> bareType(tds.head.aliasTypeFullName.get)
     }
-    byShort ++ byFull
+    val merged = byShort ++ byFull
+
+    // `009-reduce-remaining-holes-4` US4: Joern's OWN alias-field resolution is
+    // `ANY` for some simple typedef chains even though the RHS itself is
+    // perfectly resolvable elsewhere in this SAME table -- confirmed live:
+    // `typedef u32 Pgno;`, where `u32` ALREADY correctly resolves to `"unsigned
+    // int"` via ITS OWN typedef entry, yet `Pgno`'s own `aliasTypeFullName` is
+    // `ANY` regardless. This is a Joern-internal inconsistency (`typedef u16
+    // ht_slot;`, one line away in the SAME header, resolves fine), NOT the
+    // missing-header gap `sqlite3.h` generation fixed earlier this session --
+    // confirmed by the fact this persists even with `sqlite3.h` present.
+    // Text-parses the TypeDecl's own `.code` for the same simple
+    // `typedef RHS NAME;` shape (the SAME technique `anonymousNestedAggregate-
+    // Members` already uses for a different Joern gap) as a FALLBACK, used
+    // ONLY to replace an `ANY` entry, NEVER to override an alias the field
+    // already resolved -- that field can correctly expand a macro RHS (like
+    // `UINT32_TYPE`) this simple textual parse cannot, so a resolved field
+    // value always wins. Conservative in the same shape as every other
+    // text-parser in this file: a multi-declarator, array, or function-pointer
+    // RHS (`,`/`[`/`(` anywhere in it) does not match at all, and a short name
+    // whose declarations disagree stays unresolved -- never guessed. */
+    val fromCode: Map[String, String] = {
+      val pat = """^\s*typedef\s+([^,;\[\]()]+?)\s+([A-Za-z_]\w*)\s*;\s*$""".r
+      cpg.typeDecl.l.flatMap { td =>
+        td.code.trim match {
+          case pat(rhs, nm) if bareType(nm) == bareType(td.name) =>
+            Some(bareType(td.name) -> bareType(rhs))
+          case _ => None
+        }
+      }.groupBy(_._1).collect { case (n, vs) if vs.map(_._2).distinct.size == 1 => n -> vs.head._2 }
+    }
+    merged.map { case (k, v) => k -> (if (v == "ANY") fromCode.getOrElse(k, v) else v) } ++
+      fromCode.filterNot(kv => merged.contains(kv._1))
   }
 
   /** The fixed-width tag for `ty`, following typedefs, or `None`.
@@ -1283,9 +1674,25 @@ import scala.annotation.tailrec
     * `<operator>.cast`'s own, unrelated, already-correct behaviour for an
     * unrequested reason. `None` for anything this cannot resolve (an aggregate, an
     * opaque type, or a data-model-dependent type under an unspecified model). */
-  def scalarSizeofBytes(ty: String): Option[Int] =
-    if (Set("char", "signedchar", "unsignedchar").contains(bareType(ty))) Some(1)
-    else resolveIntType(ty).map(w => w.drop(1).toInt / 8)
+  /** `009-reduce-remaining-holes-4`: `float`/`double` join the literal-1-byte
+    * `char` family as the OTHER scalar widths that are not data-model
+    * dependent -- unlike `int`/`long`/a pointer (LP64 vs ILP32 vs LLP64,
+    * `dataModelTable`'s own reason for existing), IEEE-754 single/double
+    * precision is 4/8 bytes on every target this project's `dataModel`
+    * parameter distinguishes, so hardcoding them here carries none of the
+    * "guessing a width silently" risk `resolveIntType`'s own doc comment
+    * warns against for the genuinely model-dependent types. Missing until
+    * now: confirmed live, `sqlite3_value`'s own `union MemValue { double r;
+    * ... }` -- the ONE anonymous union `aggregateSizeofBytes` was built and
+    * "verified" against earlier this session -- never actually resolved,
+    * because `scalarSizeofBytes("double")` fell through to `resolveIntType`,
+    * which naturally does not recognise a floating-point spelling at all. */
+  def scalarSizeofBytes(ty: String): Option[Int] = bareType(ty) match {
+    case "char" | "signedchar" | "unsignedchar" => Some(1)
+    case "float"                                => Some(4)
+    case "double"                                => Some(8)
+    case t                                       => resolveIntType(t).map(w => w.drop(1).toInt / 8)
+  }
 
   /** `005-sizeof-constant-folding`: a pointer's `sizeof` is not a per-type fact at
     * all -- it is definitionally the target data model's own pointer width, the
@@ -1312,6 +1719,17 @@ import scala.annotation.tailrec
     * this project's own "measure, don't assume" standard applied to a scope
     * decision made mid-implementation, not just at planning time. */
   val arrayShape = """^(.+)\[(\d+)\]$""".r
+
+  /** `008-reduce-remaining-holes-3` US1's own broader counterpart to `arrayShape`
+    * above -- ANY bracket contents, not just a literal integer, so a macro-sized
+    * declarator (`MemPage *apOld[NB];`) can be recognized as array-SHAPED at all
+    * before `resolveMacroArraySize` (below) tries to resolve `NB` itself.
+    * Promoted to a top-level `lazy val` (was local to `boxedArrays`'s own
+    * per-method block) so `009-reduce-remaining-holes-4`'s
+    * `closedIrefOutParam`/`closedIrefOutParamsTransitive` can reuse it too --
+    * confirmed live this session that they needed exactly the same macro-size
+    * fallback `boxedArrays` already has and `arrayShape` alone does not. */
+  lazy val arrayShapeAny = """^(.+)\[(.+)\]$""".r
 
   /** `008-reduce-remaining-holes-3` US1: a local array's declared size, when
     * Joern's own type string does NOT carry a literal integer (`arrayShape`
@@ -1384,6 +1802,34 @@ import scala.annotation.tailrec
     } catch { case _: Exception => Map.empty }
   })
 
+  /** `009-reduce-remaining-holes-4` US4: whole-file text, cached per file --
+    * `anonymousNestedAggregateMemberSizes` needs REAL, untruncated source text
+    * for a large struct declaration; `TypeDecl.code` is silently capped by
+    * Joern itself (confirmed live: exactly 1000 characters for `sqlite3_value`'s
+    * own declaration, cutting its closing brace off mid-comment). Reuses the
+    * SAME `sourceRoot`-relative file-resolution `fileDefines` already
+    * established, not a new path-handling scheme. */
+  val fileLinesCache = scala.collection.mutable.Map.empty[String, List[String]]
+  def fileLines(relPath: String): List[String] = fileLinesCache.getOrElseUpdate(relPath, {
+    try {
+      val f = new java.io.File(relPath)
+      val resolved = if (f.isAbsolute) f else sourceRoot.map(r => new java.io.File(r, relPath)).getOrElse(f)
+      scala.io.Source.fromFile(resolved).getLines().toList
+    } catch { case _: Exception => Nil }
+  })
+
+  /** The real, untruncated source text of a TypeDecl's own declaration --
+    * `TypeDecl.code` is not reliable for this (see `fileLines`'s own doc
+    * comment). Reads a generous, bounded window (300 lines) forward from the
+    * TypeDecl's own starting line -- comfortably more than any real struct/
+    * union declaration in this corpus, and cheap since whole-file reads are
+    * cached per file, not re-read per TypeDecl. */
+  def typeDeclSourceWindow(td: TypeDecl): String = {
+    val lines = fileLines(td.filename)
+    val start = (td.lineNumber.map(_.intValue).getOrElse(1) - 1).max(0)
+    lines.slice(start, start + 300).mkString("\n")
+  }
+
   /** Resolve a raw array-size expression (the bracket contents Joern preserved
     * verbatim) against the declaring file's own macro table -- `IDENT`,
     * `IDENT + INTEGER`, or `IDENT - INTEGER` only. Anything else (a `sizeof`, a
@@ -1400,6 +1846,81 @@ import scala.annotation.tailrec
       }
     }
 
+  /** `009-reduce-remaining-holes-4`: a real, confirmed-live BUILD-BREAKING
+    * regression, not a hypothetical -- `boxFieldsExpr`'s nested-array encoding
+    * (one `List.cons`-style JSON entry per element) put an 8,192-element
+    * `boxFields` literal into ONE function's own generated Lean term
+    * (`sqlite3_vfslog_new`, a real full-corpus function whose struct has an
+    * 8KB buffer member), and Lean's elaborator hit `maximum recursion depth`
+    * on it, taking the WHOLE MODULE's build down (every function whose own
+    * definition references the failed one also fails to compile) -- a materially
+    * worse failure than a plain hole, since a hole degrades ONE function's own
+    * translation while this took out compilation entirely. `boxedArrays` (the
+    * pre-existing plain-local-array mechanism) has no analogous cap either, and
+    * apparently has never hit this in practice -- plausibly because a boxable
+    * LOCAL array this large is rare; a STRUCT MEMBER buffer sized for I/O
+    * (`char buf[4096]`/`[8192]`, common in this exact codebase) is not nearly
+    * as rare, which is exactly why this surfaced here first. Capped well below
+    * where it broke, not merely just under it -- this bound has no principled
+    * derivation from `maxRecDepth` (that value scales with FUNCTION COUNT, an
+    * unrelated axis this feature's own per-array recursion depth was never
+    * accounted against), so it is deliberately conservative rather than tuned
+    * to the exact failure threshold. */
+  // `009-reduce-remaining-holes-4`: tried raising this to 256 (still nearly two
+  // orders of magnitude below the 8,192-element size that actually broke the
+  // build via `maxRecDepth`, this file's own doc comment above has that
+  // incident) -- but on the FULL corpus, combined with this same push's own
+  // CPP_DEFINES fix (which alone already grew the corpus by 334 previously-
+  // invisible functions), 256 pushed a DIFFERENT resource limit: the Lean
+  // build was SIGKILL'd (exit 137, an OOM kill) rather than hitting a
+  // recursion-depth error. Reverted to the original, already-verified-safe 64
+  // rather than spend further time tuning a value between the two under this
+  // session's own time budget -- a real, deliberate, conservative choice, not
+  // an oversight if `boxedStructArrayMembers`'s own reach looks narrower than
+  // its raw occurrence count would suggest.
+  val maxBoxableArraySize = 64
+
+  /** the literal-integer-or-resolvable-macro size of a bare type string, for
+    * `boxedStructs`' array-typed MEMBER candidates -- mirrors `boxedArrays`' own
+    * inline two-step fallback (`arrayShape` first, then `arrayShapeAny` +
+    * `resolveMacroArraySize` on the same bracket contents) exactly, kept as its
+    * own top-level `def` rather than touching that already-proven, unrelated
+    * call site under this push's own time budget. `None` for a resolved size
+    * above `maxBoxableArraySize` -- see that val's own doc comment. */
+  def arraySizeOf(ty: String, filePath: String): Option[Int] = {
+    val bt = bareType(ty)
+    arrayShape.findFirstMatchIn(bt).map(_.group(2).toInt)
+      .orElse(arrayShapeAny.findFirstMatchIn(bt).flatMap(mt => resolveMacroArraySize(mt.group(2), filePath)))
+      .filter(_ <= maxBoxableArraySize)
+  }
+
+  /** `009-reduce-remaining-holes-4`: every NAME this corpus's own source defines as
+    * a function-pointer typedef (`typedef RETTYPE (*NAME)(ARGS...);`) -- confirmed
+    * live to matter for `memberSizeofBytes`: `os_unix.c`'s own `struct unix_syscall
+    * { ...; sqlite3_syscall_ptr pCurrent; sqlite3_syscall_ptr pDefault; }` has two
+    * members of this exact shape, and `isPointerType`/`sizeofBytes` recognize a
+    * pointer only from a literal `*` in the type's OWN spelling -- correct for a
+    * plain `T*`, but a function-pointer TYPEDEF's name carries no `*` at its own
+    * use site (the `*` is hidden inside the typedef's own definition), so every
+    * member of this shape silently failed, taking the whole aggregate's `sizeof`
+    * down with it (`op:sizeOf:opaque-type`) even though every OTHER member
+    * resolved fine. Same root cause `009`'s own earlier fix hit for a CAST target
+    * (`sqlite3_destructor_type`) -- fixed there narrowly (a `MethodRef` operand's
+    * own identity), fixed here narrowly too: a whole-corpus, one-time text scan
+    * (not per-file, since the typedef is typically declared in a DIFFERENT file,
+    * usually a shared header, than wherever it is USED as a member type) for the
+    * `(*NAME)(` declarator shape, reusing `fileLines`'s own cache so each file is
+    * still read exactly once regardless of how many typedefs it defines. A name
+    * this cannot find is simply absent from the set and falls through to the
+    * existing (correctly negative) `sizeofBytes` answer, unchanged. */
+  lazy val functionPointerTypedefNames: Set[String] = {
+    val pat = """typedef\b[^;{}]*?\(\s*\*\s*([A-Za-z_]\w*)\s*\)\s*\(""".r
+    cpg.file.name.l.filterNot(_ == "<empty>").distinct.flatMap { fname =>
+      try pat.findAllMatchIn(fileLines(fname).mkString("\n")).map(_.group(1)).toList
+      catch { case _: Exception => Nil }
+    }.toSet
+  }
+
   /** `005-sizeof-constant-folding`: byte count of a `sizeof` operand's type, trying
     * each resolvable shape in turn. The ARRAY check MUST run before the pointer
     * check, not after: `isPointerType` (used elsewhere in this file for the
@@ -1411,6 +1932,7 @@ import scala.annotation.tailrec
     * commute. */
   def sizeofBytes(ty: String): Option[Int] = bareType(ty) match {
     case arrayShape(elem, n) => sizeofBytes(elem).map(_ * n.toInt)
+    case t if functionPointerTypedefNames.contains(t) => pointerSizeofBytes
     case _                   => scalarSizeofBytes(ty).orElse(if (isPointerType(ty)) pointerSizeofBytes else None)
   }
 
@@ -1477,9 +1999,27 @@ import scala.annotation.tailrec
     * object. That is the exact failure mode this ledger exists to prevent, so a type we
     * merely *cannot classify* gets its own hole label (`opaque-type`) rather than the
     * benefit of the doubt. */
+  // `009-reduce-remaining-holes-4`: `stripDuplicateSuffix` -- WITHOUT this,
+  // `aggregateNames` has exactly the same bug `memberTypes` was already fixed
+  // for (its own doc comment has the full report): Joern's C frontend emits
+  // MULTIPLE `TypeDecl`s per struct when it parses the same declaration more
+  // than once across translation units, and the PLAIN, un-suffixed name is
+  // often the one with ZERO members, while a `<duplicate>N` sibling carries
+  // the real member list. `ds` (below) correctly includes that member-bearing
+  // duplicate, but without stripping its suffix here, `aggregateNames` gains
+  // an entry like `"Btree<duplicate>1"` while every real USE SITE in the
+  // program spells the type as plain `"Btree"` -- so the set never actually
+  // contains the name any lookup would ever ask for, and `isClassType`
+  // (this whole file's single aggregate-recognition gate, feeding `addrKind`,
+  // `boxedStructs`, `pointerStructFieldOperand`, `fieldReceiverAggregateType`,
+  // and everything built on any of those) falls through to `false` for a
+  // struct this really does know the full layout of. A real, live,
+  // previously-undiagnosed gap, not a hypothetical: found while diagnosing
+  // `op:cast:opaque-type` (778), whose own doc comment names exactly this
+  // "type gap, not a semantics gap" as its reason for existing.
   lazy val aggregateNames: Set[String] = {
     val ds = cpg.typeDecl.l.filter(td => td.member.nonEmpty || td.method.nonEmpty)
-    (ds.map(_.fullName) ++ ds.map(_.name)).map(bareType).toSet ++ fieldOwnerTypes
+    (ds.map(_.fullName) ++ ds.map(_.name)).map(n => bareType(stripDuplicateSuffix(n))).toSet ++ fieldOwnerTypes
   }
 
   /** Types the *program itself* selects a field off. `x.f` or `p->f` is a proof that `x`
@@ -1526,6 +2066,28 @@ import scala.annotation.tailrec
          aggregateNames.contains(b)
   }
 
+  /** `009-reduce-remaining-holes-4` US4: the resolvable aggregate name behind
+    * `ty` when `ty` is EITHER an object type directly OR a POINTER to one --
+    * `isClassType` deliberately excludes pointers (`&obj` needs the DISTINCTION
+    * to decide identity-vs-location-model elsewhere in this file), but a field-
+    * access RECEIVER'S own aggregate-ness is a different question: `p->f` and
+    * `x.f` are the SAME operation once the receiver's VALUE is already a
+    * `Val.ref` -- which a struct POINTER already is, by this file's own
+    * established "object identity" convention (`&obj` where `obj` has class
+    * type is the identity -- `Val.ref` is already a heap address), no less than
+    * a boxed VALUE-typed local is. Confirmed live this session to matter:
+    * `closedIrefOutParam`'s own `asField` check required `isClassType(ty)` on
+    * the receiver's RAW type, which is FALSE for `BtCursor *pCur` (a pointer)
+    * -- meaning the far MORE common C idiom (`p->field`, a pointer receiver)
+    * was silently never eligible at all, only the rarer `s.field` (a value-
+    * typed struct receiver) ever passed. */
+  def fieldReceiverAggregateType(ty: String): Option[String] = {
+    val b = bareType(ty)
+    if (isClassType(ty)) Some(b)
+    else if (b.endsWith("*") && isClassType(b.dropRight(1))) Some(b.dropRight(1))
+    else None
+  }
+
   // ---- `006-reduce-remaining-holes`, Story 4: struct/union `sizeof` ----------
 
   /** Every `TypeDecl` of the program, by its bare (tag-stripped) name -- `cpg.typeDecl`
@@ -1544,9 +2106,189 @@ import scala.annotation.tailrec
   /** The `TypeDecl` actually carrying `ty`'s members, if this program has one --
     * `.find(_.member.nonEmpty)` skips a forward-only declaration in favour of the
     * real definition, mirroring `structTypeDeclOf`'s own callers' need for a member
-    * LIST, not merely a name. */
-  def structTypeDeclOf(ty: String): Option[TypeDecl] =
-    typeDeclsByName.get(bareType(ty)).flatMap(_.find(_.member.nonEmpty))
+    * LIST, not merely a name.
+    *
+    * `009-reduce-remaining-holes-4` US4: chases `typeAliases` -- the SAME table
+    * `resolveIntType` already walks for scalar typedefs -- when the direct name has
+    * no member-bearing `TypeDecl` of its own. Confirmed live: SQLite's `Mem` (its
+    * core value struct) is `typedef struct sqlite3_value Mem;` -- Joern records
+    * `Mem` itself as a 0-member typedef entry, with the real 10-member struct filed
+    * under `sqlite3_value`, and `typeAliases` already has `Mem -> sqlite3_value`
+    * from being built for exactly this purpose. The loop mirrors `resolveIntType`'s
+    * own bounded-by-`seen` structure exactly (a self-referential alias exists in
+    * this table already, per that function's own doc comment) -- reused, not
+    * duplicated, per FR-003. */
+  def structTypeDeclOf(ty: String): Option[TypeDecl] = {
+    var t      = bareType(ty)
+    var seen   = Set.empty[String]
+    var result = Option.empty[TypeDecl]
+    var go     = true
+    while (go) {
+      typeDeclsByName.get(t).flatMap(_.find(_.member.nonEmpty)) match {
+        case found @ Some(_) => result = found; go = false
+        case None =>
+          if (seen.contains(t) || isPointerType(t) || t.contains("(")) go = false
+          else {
+            seen += t
+            typeAliases.get(t) match {
+              case Some(n) => t = n
+              case None    => go = false
+            }
+          }
+      }
+    }
+    result
+  }
+
+  /** `009-reduce-remaining-holes-4`: `structTypeDeclOf`'s own alias-chase, but
+    * falling back to ANY `TypeDecl` under the resolved name -- including one
+    * with an EMPTY member list -- when no variant has one. Deliberately a
+    * SEPARATE function, not a change to `structTypeDeclOf` itself: that
+    * function's own `.find(_.member.nonEmpty)` gate is load-bearing for ITS
+    * other callers (`boxedStructs`'s own candidate computation, in particular,
+    * reads `td.member.l.map(_.name)` directly -- returning an EMPTY-MEMBER
+    * `TypeDecl` there would register a struct-boxing candidate with a spuriously
+    * empty field list, a real regression risk, not a hypothetical one). This
+    * one exists purely so `aggregateSizeofBytes` can hand a same-named,
+    * zero-member `TypeDecl` to `structFieldSizesFromText`'s text-based fallback
+    * -- confirmed live to matter: `os_unix.c`'s own `struct unix_syscall`
+    * reports ZERO members under every name variant Joern gives it, so
+    * `structTypeDeclOf` itself would never hand back a `TypeDecl` for it at
+    * all, text-fallback or not. */
+  def structTypeDeclOfAny(ty: String): Option[TypeDecl] =
+    structTypeDeclOf(ty).orElse(typeDeclsByName.get(bareType(ty)).flatMap(_.headOption))
+
+  /** `009-reduce-remaining-holes-4`: the field NAMES of a top-level struct/union
+    * declaration, IN ORDER -- needed to positionally match a C aggregate
+    * initializer's (`<operator>.arrayInitializer`) children back to the field
+    * they populate. Exists because `TypeDecl.member` is unreliable for a
+    * function-pointer-heavy struct: confirmed live, `sqlite3_module` has 27
+    * real fields in `sqlite3.h`, but the CPG's own structural data reports
+    * exactly one (`iVersion`). Reads the real file text
+    * (`typeDeclSourceWindow`, the same truncation workaround
+    * `aggregateSizeofBytes`/`hasPackingAttribute` already rely on), extracts
+    * the body between the FIRST top-level `{` and its balanced `}`, and reads
+    * one field name per `;`-terminated segment -- either a function-pointer
+    * declarator's own `(*NAME)` group, or a plain trailing identifier before
+    * an optional `[...]`. A struct containing a NESTED brace (an anonymous
+    * union/struct member), a multi-declarator line (`int a, b;`), or a
+    * bitfield is never matched -- none of those can be safely read by this
+    * scheme -- and any single segment this cannot cleanly read a name from
+    * bails the WHOLE struct to `None`: a member order this cannot prove
+    * correct must never silently mis-align a later field. */
+  /** `009-reduce-remaining-holes-4`: a TypeDecl's own top-level `{...}` body
+    * text, real-file-sourced (`typeDeclSourceWindow`) and found by genuine
+    * brace-depth tracking rather than regex backtracking -- the shared first
+    * step `structFieldOrder` and `anonymousNestedAggregates` both need, so
+    * a struct's own boundary is computed (and cached) exactly once no matter
+    * how many different things are read out of it. `None` when the window
+    * has no `{` at all, or its braces never balance within the window --
+    * both stay exactly the `None` either caller already returns for those
+    * cases. */
+  lazy val structBodyTextCache = scala.collection.mutable.Map.empty[String, Option[String]]
+  def structBodyText(td: TypeDecl): Option[String] =
+    structBodyTextCache.getOrElseUpdate(td.fullName, {
+      val text = typeDeclSourceWindow(td)
+      val braceOpen = text.indexOf('{')
+      if (braceOpen < 0) None
+      else {
+        var depth = 0
+        var i = braceOpen
+        var closeIdx = -1
+        while (i < text.length && closeIdx < 0) {
+          text.charAt(i) match {
+            case '{' => depth += 1
+            case '}' => depth -= 1; if (depth == 0) closeIdx = i
+            case _   =>
+          }
+          i += 1
+        }
+        if (closeIdx < 0) None else Some(text.substring(braceOpen + 1, closeIdx))
+      }
+    })
+
+  lazy val structFieldOrderCache = scala.collection.mutable.Map.empty[String, Option[List[String]]]
+  def structFieldOrder(td: TypeDecl): Option[List[String]] =
+    structFieldOrderCache.getOrElseUpdate(td.fullName, {
+      structBodyText(td) match {
+        case None => None
+        case Some(body) =>
+          if (body.contains("{")) None
+          else {
+            val cleaned = body.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
+            val segments = cleaned.split(";").map(_.trim).filter(_.nonEmpty)
+            val fnPtrName = """\(\s*\*\s*([A-Za-z_]\w*)\s*\)""".r
+            val plainName = """^.*[\s\*]([A-Za-z_]\w*)(?:\s*\[[^\]]*\])?$""".r
+            val names = segments.map { seg =>
+              // A function-pointer field's own argument list is riddled with commas
+              // (`int (*xCreate)(sqlite3*, void*, int, ...)`) -- those are not the
+              // multi-declarator/bitfield shapes this must refuse, so the comma/colon
+              // bail applies only to the plain-field fallback, never before trying the
+              // function-pointer pattern first.
+              fnPtrName.findFirstMatchIn(seg).map(_.group(1)).orElse {
+                if (seg.contains(",") || seg.contains(":")) None
+                else seg match { case plainName(nm) => Some(nm); case _ => None }
+              }
+            }
+            if (names.nonEmpty && names.forall(_.isDefined)) Some(names.map(_.get).toList) else None
+          }
+      }
+    })
+
+  /** Whether a NAMED field of a struct is declared with a `*` in front of it --
+    * `char *z;`, `const void *pPayload;`, a function-pointer field
+    * (`int (*xOpen)(...)`, always pointer-shaped by construction) -- read from the
+    * SAME real, brace-balanced source text `structFieldOrder` already parses, not
+    * `Member.typeFullName`.
+    *
+    * Exists because Joern's own member type resolution silently misses this for a
+    * real, common shape: confirmed live, `Token.z`/`Column.zCnName`/`IdList_item.
+    * zName` and 482 raw call sites like them corpus-wide report `Member.
+    * typeFullName == "ANY"` for a field that is, in the actual struct definition,
+    * plainly `const char *`. Every one of those 482 sites is a cast reinterpreting
+    * an already-pointer-shaped field as a DIFFERENT pointer type
+    * (`(void*)pColDef->z`, `(u8*)pPage1->aData`) -- a representation-preserving
+    * no-op under Core's heap model exactly like any other pointer-to-pointer cast
+    * (`castOperandIsPointerShaped`'s own doc comment has the full argument), but
+    * `isPointerType("ANY")` answers `false` and the cast holes on a type gap, not
+    * a real semantics gap.
+    *
+    * Answers `None` (not `false`) when the field cannot be found or the struct's
+    * body cannot be safely segmented at all (a nested brace, `structFieldOrder`'s
+    * own bail conditions) -- callers must treat that as "unproven," never as a
+    * negative answer, so a struct this scheme cannot read never gets miscounted as
+    * "confirmed not a pointer." */
+  def fieldTypeHasPointerFromText(td: TypeDecl, field: String): Option[Boolean] =
+    structBodyText(td).filterNot(_.contains("{")).flatMap { body =>
+      val cleaned = body.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
+      val segments = cleaned.split(";").map(_.trim).filter(_.nonEmpty)
+      val fnPtrName = """\(\s*\*\s*([A-Za-z_]\w*)\s*\)""".r
+      val plainName = """^.*[\s\*]([A-Za-z_]\w*)(?:\s*\[[^\]]*\])?$""".r
+      segments.collectFirst {
+        case seg if fnPtrName.findFirstMatchIn(seg).exists(_.group(1) == field) => true
+        case seg if !seg.contains(",") && !seg.contains(":") &&
+                    (seg match { case plainName(nm) => nm == field; case _ => false }) =>
+          seg.contains("*")
+      }
+    }
+
+  /** `castOperandIsPointerShaped`'s own check, extended to a field/index-access
+    * operand whose FIELD's type Joern could not resolve but the real struct
+    * source text (`fieldTypeHasPointerFromText`, just above) confirms is a
+    * pointer -- see that function's own doc comment for why this case exists and
+    * is sound. Kept as a SEPARATE function rather than folded into
+    * `castOperandIsPointerShaped` itself: that def sits well before
+    * `fieldReceiverAggregateType`/`structTypeDeclOfAny`/
+    * `fieldTypeHasPointerFromText` in this file's own top-level body, and this
+    * script's forward-reference rule (`isNullLiteral`'s own doc comment has the
+    * full explanation) would reject the call from there. */
+  def castFieldOperandPointerShaped(operand: AstNode): Boolean =
+    asField(operand).exists { case (recv, field) =>
+      fieldReceiverAggregateType(staticTypeOf(recv))
+        .flatMap(structTypeDeclOfAny)
+        .flatMap(fieldTypeHasPointerFromText(_, field))
+        .getOrElse(false)
+    }
 
   /** A bitfield member (research.md §4): `typeFullName` alone stays the plain base
     * type (`int x : 3` has `typeFullName=int`), so the width survives only in the
@@ -1558,15 +2300,31 @@ import scala.annotation.tailrec
   val bitfieldSuffix = """:\s*\d+\s*$""".r
   def isBitfieldMember(m: Member): Boolean = bitfieldSuffix.findFirstIn(m.code).isDefined
 
-  /** A struct-level packing/alignment attribute, visible verbatim on `TypeDecl.code`
-    * (research.md §4). Disqualifies the whole struct unconditionally -- not
-    * narrowed to specifically `packed`/`aligned`, the same conservative-by-
-    * construction choice `005`'s own `modelDependentNames` gate already made,
-    * because distinguishing a layout-affecting attribute from an unrelated one
-    * (`__attribute__((deprecated))`) would need a hardcoded allowlist that could
-    * misclassify an attribute never tested against a live corpus. */
-  def hasPackingAttribute(td: TypeDecl): Boolean =
-    td.code.contains("__attribute__") || td.code.contains("#pragma pack")
+  /** A struct-level packing/alignment attribute, visible verbatim on the
+    * declaration's own source text (research.md §4). Disqualifies the whole
+    * struct unconditionally -- not narrowed to specifically `packed`/`aligned`,
+    * the same conservative-by-construction choice `005`'s own
+    * `modelDependentNames` gate already made, because distinguishing a
+    * layout-affecting attribute from an unrelated one (`__attribute__
+    * ((deprecated))`) would need a hardcoded allowlist that could misclassify
+    * an attribute never tested against a live corpus.
+    *
+    * `009-reduce-remaining-holes-4` US4: reads `typeDeclSourceWindow(td)` (the
+    * REAL, untruncated source), not `td.code` directly -- confirmed live this
+    * session that `TypeDecl.code` is silently capped by Joern at 1000
+    * characters, and a packing attribute trailing a LARGE struct declaration
+    * (`} __attribute__((packed));`) could fall past that cutoff. Getting this
+    * SPECIFIC check wrong is not merely a missed hole the way the sizing gap
+    * this same truncation caused elsewhere was: a packed struct wrongly
+    * classified as unpacked would let `aggregateSizeofBytes` compute a size
+    * using ordinary (wrong) alignment rules and return it as if resolved --
+    * silently wrong, not honestly holed, exactly the failure mode Constitution
+    * Principle III exists to prevent. Fixed alongside the sizing gap rather
+    * than left as a latent risk once the same root cause was found. */
+  def hasPackingAttribute(td: TypeDecl): Boolean = {
+    val src = typeDeclSourceWindow(td)
+    src.contains("__attribute__") || src.contains("#pragma pack")
+  }
 
   /** A member's own size: `sizeofBytes` for a scalar/pointer/array-of-scalar member,
     * recursing into `aggregateSizeofBytes` below for a member that is itself an
@@ -1585,6 +2343,36 @@ import scala.annotation.tailrec
     * a sized array, so `char[]` silently fell through to the POINTER width (8),
     * not `None` -- exactly the "well-typed, hole-free, silently wrong" failure
     * mode this whole project exists to catch, caught here before it shipped. */
+  /** Cross-session bug report, `009-reduce-remaining-holes-4`: a live cycle-guard
+    * for `aggregateSizeofBytes`, tracking which `TypeDecl`s are currently ON THE
+    * STACK of an in-progress size computation. `aggregateSizeofBytes` ->
+    * `structFieldSizesFromText` -> `segmentSizes` -> `memberSizeofBytes` ->
+    * `aggregateSizeofBytes` is a real recursive chain, and none of it is
+    * memoized against RE-ENTRANCY the way `structBodyTextCache`/
+    * `structFieldOrderCache` cache their OWN, non-recursive results. A struct
+    * cannot genuinely contain itself by value in valid C, so a real cycle here
+    * is always a MISRESOLUTION (a duplicate-`TypeDecl` variant, or a text-parsed
+    * member-type string that happens to read back to a type already being
+    * sized higher up the same call stack) -- not reproduced against this
+    * session's own `src/`-only bounded corpus, but reported from a separate
+    * session's run of this notebook's own full, UNBOUNDED corpus (`ext/`/
+    * `test/`/`tool/` included, a materially larger surface this session's local
+    * sandbox has never parsed) as a real `StackOverflowError` crashing the whole
+    * transpiler run. Falling back to `None` (the existing `op:sizeOf:object`
+    * hole) the moment a cycle is detected is strictly safer than crashing --
+    * exactly the "hole, not a guess, and never a crash" standard every other
+    * fallback in this file already holds itself to -- and costs nothing for the
+    * overwhelming non-cyclic case: the guard is released the moment each type's
+    * OWN computation finishes, so an unrelated LATER request for the same type
+    * (not nested inside a live cycle) still resolves normally.
+    *
+    * Declared HERE, before `memberSizeofBytes` rather than immediately above
+    * `aggregateSizeofBytes` itself, for the same script-level forward-reference
+    * reason `isNullLiteral`'s own doc comment explains: `memberSizeofBytes`
+    * (just below) already forward-references `aggregateSizeofBytes`, and this
+    * `val` sitting between the two would otherwise block that. */
+  val sizeofInProgress = scala.collection.mutable.Set.empty[String]
+
   def memberSizeofBytes(ty: String): Option[Int] = bareType(ty) match {
     case t if t.endsWith("[]")  => None
     case arrayShape(elem, n)    => memberSizeofBytes(elem).map(_ * n.toInt)
@@ -1601,12 +2389,207 @@ import scala.annotation.tailrec
     * `op:sizeOf:object` hole, unrelabelled, exactly as today -- when the struct
     * itself carries a packing attribute, has no member list this program can see,
     * or any one member is a bitfield or has its own unresolvable size. */
-  def aggregateSizeofBytes(ty: String): Option[Int] =
-    structTypeDeclOf(ty).flatMap { td =>
-      if (hasPackingAttribute(td)) None
+  /** `009-reduce-remaining-holes-4` US4: Joern's C frontend never records a
+    * member list for an ANONYMOUS nested union/struct member -- confirmed live,
+    * this session, by direct query against every name variant reachable
+    * (`unionMemValue`, the qualified `sqlite3_value.MemValue`, ...): every one
+    * has zero members, under any name. What it DOES carry is the outer
+    * aggregate's own `.code`, the real, verbatim source text of the whole
+    * declaration -- confirmed to include the nested block's own member lines,
+    * not just the outer members (checked directly against `sqlite3_value`'s own
+    * `union MemValue { double r; i64 i; ...  } u;`). This is a genuinely NEW
+    * mechanism (source-text parsing), not a same-tier reuse of `resolveIntType`/
+    * `structTypeDeclOf`/etc -- deliberately conservative in exchange: every
+    * member line in the nested block must match a single, simple `TYPE NAME;`
+    * declarator with no comma, bracket, paren, colon, or brace of its own
+    * (multi-declarator, array, function-pointer, bitfield, and doubly-nested
+    * shapes all bail to `None` rather than being misparsed) -- a member this
+    * cannot classify correctly must stay an honest hole, never a guessed byte
+    * count (Constitution Principle III). Regex backtracking (not manual brace
+    * counting) finds the correct CLOSING brace even when the block's own
+    * members happen to contain braces themselves, because the pattern requires
+    * the member NAME to immediately follow it -- but the explicit no-brace check
+    * on every extracted segment below is what actually protects against a
+    * doubly-nested block's own inner members being silently absorbed, since
+    * those inner lines would otherwise still individually look like valid
+    * (wrong) `TYPE NAME;` declarators. */
+  /** `009-reduce-remaining-holes-4` US4 (dominance-push follow-on): an ARRAY-
+    * shaped member of the nested block, `TYPE NAME[SIZE_EXPR];` -- confirmed
+    * live to be the DOMINANT real shape once the plain-scalar case above was
+    * fixed (`Bitvec`/`Table`/`Walker`'s own anonymous unions all hold a
+    * fixed-size array in every arm: `BITVEC_TELEM aBitmap[BITVEC_NELEM];`,
+    * `Bitvec *apSub[BITVEC_NPTR];`, ...). `SIZE_EXPR` is resolved via
+    * `resolveMacroArraySize` -- the SAME macro-size table this file already
+    * builds for exactly this purpose (`boxedArrays`'s own local-array sizing)
+    * -- reused here, not duplicated, exactly as `resolveIntType`/
+    * `structTypeDeclOf`'s own alias-chase was reused rather than rebuilt
+    * earlier this session. A size expression that table cannot resolve (a
+    * `sizeof`, a multi-term expression, an unlisted macro) yields `None` for
+    * this ONE member, which -- per `sizes.forall(_.isDefined)` below --
+    * conservatively fails the WHOLE nested block rather than silently
+    * skipping just that member. */
+  lazy val nestedArrayDeclLine = """^(.*[\s\*])([A-Za-z_]\w*)\[([^\[\]]*)\]$""".r
+
+  /** `009-reduce-remaining-holes-4`: EVERY top-level anonymous union/struct
+    * member of `td`'s own body, found in ONE linear brace-depth-tracked scan
+    * over `structBodyText(td)` -- `memberName -> (isUnion, innerBodyText)`.
+    * Supersedes the original per-member-name approach (a fresh regex search
+    * for `"union {...} " + memberName + ";"` against the whole 300-line
+    * `typeDeclSourceWindow`, re-run once per member), which had two real
+    * gaps this fixes: it re-anchored at the START of the window every time,
+    * so it silently found only the FIRST anonymous aggregate in a struct
+    * with more than one -- confirmed live, `Expr`'s own `u`/`x`/`w`/`y`
+    * (four separate anonymous unions): only `u`, the first, ever resolved,
+    * because the lazy `(.*?)` searching for `x`'s own closing `} x;` had no
+    * way to stop at `u`'s closing `} u;` first and so swallowed `u`'s entire
+    * block into what it thought was `x`'s body -- caught the SAME safe way
+    * every other misparse here is, the swallowed content's own embedded `{`
+    * failing a segment's no-brace check and correctly bailing `x` to `None`
+    * rather than computing a wrong size, but at the cost of `x`/`w`/`y`
+    * never resolving at all. And unbounded reuse of the whole 300-line
+    * window (rather than `td`'s own `{...}` span alone) risked reading a
+    * LATER, unrelated declaration's own same-named block by coincidence --
+    * this scan stays inside `structBodyText(td)`, which is already bounded
+    * to this one struct by real brace matching, so neither gap can recur.
+    * A block whose close is not immediately followed by `IDENT;` (a nested
+    * aggregate that is itself typedef'd, or any other shape this does not
+    * recognise) is simply not recorded and scanning continues past it --
+    * not a failure, the same "not the shape we handle" non-match every
+    * other lookup here already treats as absence, not error. */
+  lazy val anonymousNestedAggregatesCache = scala.collection.mutable.Map.empty[String, Map[String, (Boolean, String)]]
+  def anonymousNestedAggregates(td: TypeDecl): Map[String, (Boolean, String)] =
+    anonymousNestedAggregatesCache.getOrElseUpdate(td.fullName, {
+      structBodyText(td) match {
+        case None => Map.empty
+        case Some(body) =>
+          val kwPat  = """\b(union|struct)\s*(?:[A-Za-z_]\w*\s*)?\{""".r
+          val nameAt = """^\s*([A-Za-z_]\w*)\s*;""".r
+          var result = Map.empty[String, (Boolean, String)]
+          var pos    = 0
+          var stop   = false
+          while (!stop) {
+            kwPat.findFirstMatchIn(body.substring(pos)) match {
+              case None => stop = true
+              case Some(m) =>
+                val kw      = m.group(1)
+                val absOpen = pos + m.end - 1
+                var depth = 0
+                var i = absOpen
+                var closeIdx = -1
+                while (i < body.length && closeIdx < 0) {
+                  body.charAt(i) match {
+                    case '{' => depth += 1
+                    case '}' => depth -= 1; if (depth == 0) closeIdx = i
+                    case _   =>
+                  }
+                  i += 1
+                }
+                if (closeIdx < 0) stop = true
+                else {
+                  val innerBody = body.substring(absOpen + 1, closeIdx)
+                  nameAt.findPrefixMatchOf(body.substring(closeIdx + 1)) match {
+                    case Some(nm) =>
+                      result += nm.group(1) -> (kw == "union", innerBody)
+                      pos = closeIdx + 1 + nm.end
+                    case None =>
+                      pos = closeIdx + 1
+                  }
+                }
+            }
+          }
+          result
+      }
+    })
+
+  /** `009-reduce-remaining-holes-4`: the per-segment size-classification rules
+    * `anonymousNestedAggregateMemberSizes` already established, factored out so
+    * `structFieldSizesFromText` below can apply the SAME rules to a top-level
+    * struct's own body instead of an inner nested aggregate's -- an array field
+    * (`resolveMacroArraySize` on its bracket contents), a plain scalar/pointer
+    * field (`memberSizeofBytes` on its type text -- this is what makes a
+    * function-pointer TYPEDEF field resolve correctly here, via
+    * `functionPointerTypedefNames`, without this function needing to know
+    * anything about function pointers itself), or anything this cannot cleanly
+    * read (a bitfield, a multi-declarator, a nested brace) bailing the WHOLE
+    * body to `None` rather than silently skipping just that one segment. */
+  def segmentSizes(rawBody: String, filePath: String): Option[List[Int]] = {
+    val body = rawBody.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
+    val segments = body.split(";").map(_.trim).filter(_.nonEmpty)
+    val declLine = """^(.*[\s\*])([A-Za-z_]\w*)$""".r
+    if (segments.isEmpty) None
+    else {
+      val sizes = segments.map { seg =>
+        seg match {
+          case nestedArrayDeclLine(tyPart, _, sizeExpr) if !tyPart.exists(",(){}:".contains(_)) =>
+            val n =
+              if (sizeExpr.trim.matches("""\d+""")) Some(sizeExpr.trim.toInt)
+              else resolveMacroArraySize(sizeExpr, filePath)
+            n.flatMap(nn => memberSizeofBytes(tyPart.trim).map(_ * nn))
+          case _ if seg.exists(",[(){}:".contains(_)) => None
+          case declLine(tyPart, _) => memberSizeofBytes(tyPart.trim)
+          case _ => None
+        }
+      }
+      if (sizes.forall(_.isDefined)) Some(sizes.map(_.get).toList) else None
+    }
+  }
+
+  def anonymousNestedAggregateMemberSizes(td: TypeDecl, memberName: String,
+                                           isUnion: Boolean): Option[List[Int]] =
+    anonymousNestedAggregates(td).get(memberName).filter(_._1 == isUnion)
+      .flatMap { case (_, rawBody) => segmentSizes(rawBody, td.filename) }
+
+  /** `009-reduce-remaining-holes-4`: when a top-level struct/union's OWN
+    * `TypeDecl.member` list is completely empty -- confirmed live, `os_unix.c`'s
+    * `struct unix_syscall { const char *zName; sqlite3_syscall_ptr pCurrent;
+    * sqlite3_syscall_ptr pDefault; }` reports ZERO members under every name
+    * variant Joern gives it (`unix_syscall`, the erroneous `staticunix_syscall`
+    * `bareType` now also resolves, even the array-shaped `[]` sibling) -- this
+    * is a strictly worse version of the SAME gap `structFieldOrder`/
+    * `vtableFieldsOf` were already built to work around for a
+    * function-pointer-heavy struct, not a new phenomenon. Applies `segmentSizes`
+    * (the SAME per-segment rules `anonymousNestedAggregateMemberSizes` already
+    * uses for an inner nested aggregate) to the struct's own top-level,
+    * brace-matched body (`structBodyText`) instead. */
+  def structFieldSizesFromText(td: TypeDecl): Option[List[Int]] =
+    structBodyText(td).flatMap(body => segmentSizes(body, td.filename))
+
+  /** `009-reduce-remaining-holes-4` US4: the byte size of an anonymous nested
+    * union/struct member, via `anonymousNestedAggregateMemberSizes` above, using
+    * the SAME layout arithmetic `aggregateSizeofBytes` already uses for a
+    * normal, Joern-visible aggregate -- reused directly, not duplicated. */
+  def anonymousNestedAggregateSize(td: TypeDecl, memberName: String, isUnion: Boolean): Option[Int] =
+    anonymousNestedAggregateMemberSizes(td, memberName, isUnion).flatMap { szs =>
+      if (szs.isEmpty) None
+      else if (isUnion) Some(szs.max)
       else {
+        var offset   = 0
+        var maxAlign = 1
+        szs.foreach { sz =>
+          if (sz > maxAlign) maxAlign = sz
+          offset = ((offset + sz - 1) / sz) * sz; offset += sz
+        }
+        Some(((offset + maxAlign - 1) / maxAlign) * maxAlign)
+      }
+    }
+
+  def aggregateSizeofBytes(ty: String): Option[Int] =
+    structTypeDeclOfAny(ty).flatMap { td =>
+      if (hasPackingAttribute(td) || !sizeofInProgress.add(td.fullName)) None
+      else try {
         val members = td.member.l
-        if (members.isEmpty) None
+        if (members.isEmpty)
+          structFieldSizesFromText(td).map { szs =>
+            val isUnion = td.code.trim.startsWith("union")
+            var offset = 0
+            var maxAlign = 1
+            szs.foreach { sz =>
+              if (sz > maxAlign) maxAlign = sz
+              if (!isUnion) { offset = ((offset + sz - 1) / sz) * sz; offset += sz }
+            }
+            val raw = if (isUnion) szs.max else offset
+            ((raw + maxAlign - 1) / maxAlign) * maxAlign
+          }
         else {
           val isUnion = td.code.trim.startsWith("union")
           var offset = 0
@@ -1616,12 +2599,34 @@ import scala.annotation.tailrec
           members.foreach { m =>
             if (ok) {
               if (isBitfieldMember(m)) ok = false
-              else memberSizeofBytes(m.typeFullName) match {
-                case Some(sz) if sz > 0 =>
-                  if (sz > maxAlign) maxAlign = sz
-                  if (isUnion) { if (sz > maxSize) maxSize = sz }
-                  else { offset = ((offset + sz - 1) / sz) * sz; offset += sz }
-                case _ => ok = false
+              else {
+                val direct = memberSizeofBytes(m.typeFullName)
+                // `009-reduce-remaining-holes-4` US4: try BOTH keywords rather than
+                // gating on `bareType(m.typeFullName) == "union"/"struct"` -- confirmed
+                // live that Joern does not consistently spell an anonymous nested
+                // aggregate's OWN typeFullName as the bare keyword; it sometimes
+                // synthesizes a tag from the member name instead (`sqlite3_value`'s
+                // own `union MemValue { ... } u;` reports `u`'s typeFullName as
+                // `unionMemValue`, not `union` -- the literal-keyword-only check above
+                // silently never even attempted the anonymous-block parser for this
+                // exact struct, the ONE this whole mechanism was built and verified
+                // against, because that verification checked the OUTPUT (a resolved
+                // size) rather than re-confirming the GATE fired for every intended
+                // case). `anonymousNestedAggregateSize`'s own regex requires the
+                // LITERAL keyword be present in `td.code`'s real source text either
+                // way, so trying both is safe -- at most one can ever match a given
+                // member name in a well-formed C struct.
+                val resolved =
+                  if (direct.isDefined) direct
+                  else anonymousNestedAggregateSize(td, m.name, isUnion = true)
+                         .orElse(anonymousNestedAggregateSize(td, m.name, isUnion = false))
+                resolved match {
+                  case Some(sz) if sz > 0 =>
+                    if (sz > maxAlign) maxAlign = sz
+                    if (isUnion) { if (sz > maxSize) maxSize = sz }
+                    else { offset = ((offset + sz - 1) / sz) * sz; offset += sz }
+                  case _ => ok = false
+                }
               }
             }
           }
@@ -1631,7 +2636,7 @@ import scala.annotation.tailrec
             Some(((raw + maxAlign - 1) / maxAlign) * maxAlign)
           }
         }
-      }
+      } finally sizeofInProgress.remove(td.fullName)
     }
 
   /** A hole label naming what kind of address defeated us, so the ledger separates
@@ -1661,8 +2666,18 @@ import scala.annotation.tailrec
     if (b.isEmpty || b == "ANY")   "unknown-type"
     else if (isPointerType(b))     "pointer"
     else if (isClassType(ty))      "object"
+    // `009-reduce-remaining-holes-4` US4: `resolveIntType`'s own alias chain (already
+    // extended, US2) is more thorough than this function's own fixed `scalarTypedefs`
+    // set -- confirmed live: SQLite's own `i64`/`i16`/`i8`/`Pgno`/`LogEst`/... (a
+    // scalar typedef chain resolved through `typeAliases`, not a hardcoded name) were
+    // reaching `opaque-type` here even after `op:cast:opaque-type` (which DOES call
+    // `resolveIntType`) had already stopped holing on them, because this function
+    // never consulted that machinery at all -- two parallel "is it a scalar" checks
+    // silently disagreeing. Checked AFTER `scalarTypedefs`, not instead of it: that
+    // fixed set is still cheaper for its own members and `resolveIntType` alone
+    // doesn't cover every name in it.
     else if (isArithType(b) || scalarTypedefs.contains(b) ||
-             nonClassScalars.contains(b))  "scalar"
+             nonClassScalars.contains(b) || resolveIntType(ty).isDefined)  "scalar"
     // A name, but no evidence for what is behind it. This is a *type* gap, not a
     // semantics gap, and it is closed by a better frontend rather than by a location
     // model — which is why it must not be filed under either of the other two.
@@ -1692,6 +2707,24 @@ import scala.annotation.tailrec
     case i: Identifier        => Some(i.name)
     case p: MethodParameterIn => Some(p.name)
     case _                    => None
+  }
+
+  /** `009-reduce-remaining-holes-4`: `rawLocalOrParamName`, seeing through any number
+    * of wrapping `<operator>.cast` layers -- `*(u8*)z`, SQLite's own recurring
+    * defensive-cast-before-dereference idiom (forcing an unsigned comparison,
+    * avoiding a signed-`char` sign-extension bug), which otherwise made `z` in
+    * `*(u8*)z` invisible to `strCursorParams` eligibility -- one occurrence
+    * unaccounted for, disqualifying the WHOLE cursor parameter over a single-site
+    * cast Core's OWN cast handling (`castOperandIsPointerShaped`) already treats as
+    * a no-op anyway. Kept SEPARATE from `rawLocalOrParamName` itself rather than
+    * changing that def's own behaviour: `ptrIrefNames`/`ptrAliases`/
+    * `closedOutParams` all key off the strict, no-cast version, and widening it
+    * under them without separately re-verifying each is not a change to make
+    * casually. Only `strCursorParams`'s own read-side checks use this. */
+  def rawNameThroughCast(n: AstNode): Option[String] = n match {
+    case cst: Call if cst.methodFullName == "<operator>.cast" && kidsOf(cst).size == 2 =>
+      rawNameThroughCast(kidsOf(cst)(1))
+    case other => rawLocalOrParamName(other)
   }
 
   /** `003-box-address-taken-locals`: if `n` (the sole operand of an `&`) is eligible
@@ -1796,6 +2829,79 @@ import scala.annotation.tailrec
   def boxedStructFieldOperand(n: AstNode): Option[(String, String)] =
     asField(n).flatMap { case (recv, f) =>
       rawLocalOrParamName(recv).map(localName).filter(boxedStructs.contains).map(_ -> f)
+    }
+
+  /** `&p->f` where `p` is a PLAIN local/parameter already POINTER-typed to a
+    * known struct -- distinct from `boxedStructFieldOperand` above, which is
+    * `006` Story 5's own scheme for boxing a VALUE-typed struct LOCAL (with
+    * its own "never escapes to a call" scope boundary). No boxing applies
+    * here at all: `p`'s own binding is ALREADY a `Val.ref` (a struct pointer
+    * IS its own address, this file's own "object identity" convention, the
+    * same reasoning `fieldReceiverAggregateType` above documents), so `&p->f`
+    * needs nothing more than reading `p`'s own name straight into `irefField`
+    * -- no registration, no escape analysis, because there is no separate box
+    * whose lifetime or escape could matter. */
+  def pointerStructFieldOperand(n: AstNode): Option[(String, String)] =
+    asField(n).flatMap { case (recv, f) =>
+      rawLocalOrParamName(recv).map(localName).flatMap { nm =>
+        fieldReceiverAggregateType(staticTypeOf(recv)).flatMap(structTypeDeclOf).map(_ => nm -> f)
+      }
+    }
+
+  /** `009-reduce-remaining-holes-4`: `&s.arr[i]` -- an ARRAY-TYPED member of a
+    * BOXED struct LOCAL, indexed -- the aggregate counterpart of
+    * `boxedArrayIndexOperand`/`boxedStructFieldOperand` above, for the ONE
+    * shape neither covers: a field that is ITSELF an array. Live-measured this
+    * push to be the single largest sub-pattern behind `op:addressOf:element:
+    * scalar` (557 of 1479 sampled occurrences receive their array through a
+    * field access, more than any other single shape including a plain local
+    * array). Requires `f` to be one of `nm`'s own recognized array members
+    * (`boxedStructArrayMembers`, populated in `emit` alongside `boxedStructs`
+    * itself, and -- critically -- already excluding any struct boxed only as a
+    * PARAMETER, so this can never fire for a member whose real incoming
+    * contents were never actually copied in). Translates (at the call site,
+    * `callExpr`'s own `<operator>.addressOf` case) to `Expr.irefIndex` over
+    * `Expr.field(name(nm), f)` -- reading the nested sub-array's own `Val.ref`
+    * out of `nm`'s box first, then indexing into THAT, exactly mirroring how a
+    * real nested allocation would be reached. */
+  def boxedStructArrayIndexOperand(n: AstNode): Option[(String, String, AstNode)] =
+    asIndex(n).flatMap { case (recv, idx) =>
+      asField(recv).flatMap { case (base, f) =>
+        rawLocalOrParamName(base).map(localName).flatMap { nm =>
+          boxedStructArrayMembers.get(nm).filter(_.contains(f)).map(_ => (nm, f, idx))
+        }
+      }
+    }
+
+  /** `009-reduce-remaining-holes-4`: `&p->arr[i]` -- the POINTER counterpart of
+    * `boxedStructArrayIndexOperand` above, exactly as `pointerStructFieldOperand`
+    * is to `boxedStructFieldOperand`: `p` is a PLAIN pointer to a KNOWN struct
+    * type, needing no boxing of `p` itself (its own value already IS its
+    * address) -- only `arr`'s own array-ness need be confirmed, via the SAME
+    * whole-program `memberTypes` map `pointerStructFieldOperand`'s own
+    * eligibility already reads types from, plus `arraySizeOf` to confirm `arr`
+    * itself resolves to a real, known size (an unresolvable size -- a `sizeof`,
+    * a VLA, an unknown macro -- correctly keeps the existing hole instead of
+    * guessing). Translation is identical in shape to the boxed-local case: `p`
+    * is already `Val.ref`, so `Expr.field(name(p), f)` already reads the SAME
+    * kind of nested sub-array `Val.ref` a boxed local's own prologue would have
+    * built, PROVIDED that struct's own allocation (wherever it happened) went
+    * through `boxedStructArrayMembers`' matching nesting -- true for any
+    * instance ultimately reached from a local this file boxes; an instance
+    * from `malloc`, a global, or the caller's own OUTER caller falls back to
+    * the existing hole, exactly as an ordinary local array does when its own
+    * origin cannot be proven. */
+  def pointerStructArrayIndexOperand(n: AstNode): Option[(String, String, AstNode)] =
+    asIndex(n).flatMap { case (recv, idx) =>
+      asField(recv).flatMap { case (base, f) =>
+        rawLocalOrParamName(base).map(localName).flatMap { nm =>
+          fieldReceiverAggregateType(staticTypeOf(base)).flatMap(structTypeDeclOf).flatMap { td =>
+            memberTypes.get((stripDuplicateSuffix(bareType(td.fullName)), f))
+              .flatMap(mty => arraySizeOf(mty, currentFile))
+              .map(_ => (nm, f, idx))
+          }
+        }
+      }
     }
 
   /** `003-box-address-taken-locals`, Increment B: every call site in the whole
@@ -1954,6 +3060,191 @@ import scala.annotation.tailrec
       }
     }
 
+  /** `009-reduce-remaining-holes-4` US4: `closedOutParam`'s own whole-program
+    * discipline, extended across MULTIPLE levels of PARAMETER FORWARDING --
+    * `bar(..., pRC)` where `pRC` is itself a parameter of the CALLING function,
+    * received (transitively) from that caller's own `&local`-taking caller further
+    * up. Confirmed live, this session: `ptrmapPut`'s `pRC` parameter fails
+    * `closedOutParam` outright because one of its 20 call sites (`btree.c:1622`)
+    * passes a bare `pRC` -- itself a parameter of the enclosing function, forwarded
+    * unchanged, not a fresh `&local` -- while every other call site passes `&rc`.
+    * `assign:lhs:indirection`'s own dominant shape (research.md §4/T022's own
+    * diagnosis): this is that exact pattern, generalized.
+    *
+    * The forwarded case is semantically just as safe as the base case, not merely
+    * plausible: Core represents `&local` as the identity `Val.ref` of the boxed
+    * local (`boxRef`/`addressOfIsAggregate`'s own reasoning), so a parameter bound
+    * to that value and passed onward UNCHANGED (no re-`&`, no computation, no
+    * arithmetic) carries the exact SAME `Val.ref` at every hop -- `boxField(nm)` on
+    * ANY name bound to it, at ANY point in the chain, reads/writes the correct heap
+    * cell, because it is the identical value the whole way down. The one thing that
+    * MUST hold at every hop, and is exactly what `classify` below checks: the
+    * forwarding argument is a BARE, uncomputed identifier reference to a parameter --
+    * anything else (an expression, an array element, a different variable, a
+    * dereference) is not proven to carry the same ref and disqualifies that hop
+    * (and therefore the whole pair) outright, never guessed past.
+    *
+    * A whole-program, monotone fixed point over `(calleeFullName, paramIndex)`
+    * pairs: a pair is closed once EVERY call site of that callee passes, at that
+    * position, EITHER `closedOutParam`'s own base case (`&localVar`) OR a bare
+    * reference to a parameter of the CALLING function that is ITSELF already known
+    * closed. Bounded (not recursive) at a small fixed round count, matching
+    * `fnPtrVars`'s own "bounded rather than recursive" precedent elsewhere in this
+    * file -- a real forwarding chain in source is never more than a handful of
+    * calls deep, and a cycle (mutual forwarding) simply never joins `closed`,
+    * correctly staying excluded rather than looping. */
+  /** `009-reduce-remaining-holes-4` US4 (dominance push): is `n` a null-pointer-
+    * constant literal (`0`, `NULL`, or the common `((void *)0)` spelling) -- the
+    * "caller does not want this output" idiom (`sqlite3BtreeMovetoUnpacked(...,
+    * 0)`), distinct from a genuine `&local` argument. */
+  def isNullPointerLiteral(n: AstNode): Boolean = n match {
+    case l: Literal => Set("0", "NULL", "((void *)0)").contains(l.code.trim)
+    case _          => false
+  }
+
+  /** `009-reduce-remaining-holes-4` US4 (dominance push): does `fn`'s own body
+    * null-guard EVERY dereference of its parameter `paramName` -- every
+    * `<operator>.indirection`/`indirectFieldAccess`/`indirectIndexAccess` site
+    * whose operand is `paramName` is reached only after a real CFG dominator
+    * that tests `paramName` against null (`paramName != 0`/`!= NULL`,
+    * `paramName == 0`/`== NULL` on the negative branch is equally a guard since
+    * `Semantics.lean`'s own `if` never runs a branch its own condition rules
+    * out, `!paramName`, or a bare `if (paramName)` truthiness check)? Uses
+    * Joern's real CFG dominator analysis (`CfgNode.dominatedBy`), not a
+    * syntactic/textual approximation -- sized and verified live before this was
+    * written: sampled 45 candidate parameters gated only by a null-literal
+    * argument at some call site, and every one of the 45 passed this exact
+    * check (100%, not a cherry-picked few), giving confidence the predicate
+    * is neither too loose (would have let a genuinely-unguarded case through
+    * on some OTHER parameter) nor uselessly strict (would have rejected all 45).
+    * A parameter with zero dereferences at all is vacuously safe -- there is
+    * nothing to guard. */
+  def calleeNullGuardsParam(fn: Method, paramName: String): Boolean = {
+    val derefs: List[CfgNode] =
+      (fn.ast.isCall.filter(_.methodFullName == "<operator>.indirection").l
+         .filter(c => kidsOf(c) match { case List(i: Identifier) => i.name == paramName; case _ => false })
+       ++ fn.ast.isCall.filter(c => c.methodFullName == "<operator>.indirectFieldAccess" ||
+                                     c.methodFullName == "<operator>.indirectIndexAccess").l
+         .filter(c => kidsOf(c).headOption.exists { case i: Identifier => i.name == paramName; case _ => false })
+      ).asInstanceOf[List[CfgNode]]
+    if (derefs.isEmpty) true
+    else {
+      val nullChecks: List[CfgNode] =
+        (fn.ast.isCall.filter(c =>
+           (c.methodFullName == "<operator>.equals" || c.methodFullName == "<operator>.notEquals") &&
+           kidsOf(c).exists { case i: Identifier => i.name == paramName; case _ => false } &&
+           kidsOf(c).exists(isNullPointerLiteral)
+         ).l
+         ++ fn.ast.isCall.filter(_.methodFullName == "<operator>.logicalNot").l
+              .filter(c => kidsOf(c).exists { case i: Identifier => i.name == paramName; case _ => false })
+         ++ fn.ast.isIdentifier.filter(_.name == paramName).l
+        ).asInstanceOf[List[CfgNode]]
+      derefs.forall { d =>
+        val doms = d.dominatedBy.l.toSet
+        nullChecks.exists(doms.contains)
+      }
+    }
+  }
+
+  lazy val closedOutParamsTransitive: Set[(String, Int)] = {
+    sealed trait ArgShape
+    case object Ok extends ArgShape
+    case object Bad extends ArgShape
+    case object NullLit extends ArgShape
+    case class Fwd(callerFn: String, callerIdx: Int) extends ArgShape
+
+    def classify(arg: AstNode): ArgShape = arg match {
+      case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+        kidsOf(addr) match {
+          case List(n) if addrShape(n) == "local" =>
+            val ty = staticTypeOf(n)
+            if (!isClassType(ty) && addrKind(ty) != "unknown-type") Ok else Bad
+          case _ => Bad
+        }
+      case n if isNullPointerLiteral(n) => NullLit
+      // A bare parameter reference, forwarded as-is -- resolve which parameter (and
+      // of which method) it names by looking it up on ITS OWN enclosing method, not
+      // the callee's. (A bare identifier that is NOT a parameter -- checked live,
+      // this session: overwhelmingly an ORDINARY by-value local passed to an
+      // ordinary scalar parameter, not a forwarded pointer -- a local singly
+      // assigned `&x` and then forwarded turned out not to occur in this corpus at
+      // all despite looking plausible; that variant was tried and dropped rather
+      // than kept as dead weight.)
+      case i: Identifier =>
+        i.method.parameter.l.find(_.name == i.name) match {
+          case Some(p) => Fwd(p.method.fullName, p.index)
+          case None    => Bad
+        }
+      case p: MethodParameterIn => Fwd(p.method.fullName, p.index)
+      case _ => Bad
+    }
+
+    val callsByCallee: Map[String, List[Call]] = allCalls.groupBy(_.methodFullName)
+    val candidates: List[(String, Int)] =
+      methodByName.values.filterNot(m => takenAsValueFns.contains(m.fullName))
+        .filter(m => callsByCallee.contains(m.fullName))
+        .flatMap(m => m.parameter.l.map(p => (m.fullName, p.index))).toList
+
+    val shapesByPair: Map[(String, Int), List[ArgShape]] =
+      candidates.map { case (fn, idx) =>
+        val sites = callsByCallee.getOrElse(fn, Nil)
+        (fn, idx) -> sites.map(c => kidsOf(c).find(aidx(_) == idx).map(classify).getOrElse(Bad))
+      }.toMap
+
+    // Computed once per pair, only for pairs that actually see a `NullLit` site
+    // (the dominance check itself is not free) -- `true` for a pair without one.
+    val nullGuarded: Map[(String, Int), Boolean] =
+      shapesByPair.collect {
+        case ((fn, idx), shapes) if shapes.exists { case NullLit => true; case _ => false } =>
+          val guarded = methodByName.get(fn).flatMap(_.parameter.find(_.index == idx))
+            .exists(p => calleeNullGuardsParam(methodByName(fn), p.name))
+          (fn, idx) -> guarded
+      }
+
+    var closed  = Set.empty[(String, Int)]
+    var changed = true
+    var round   = 0
+    while (changed && round < 8) {
+      changed = false
+      round += 1
+      for ((key, shapes) <- shapesByPair if shapes.nonEmpty && !closed.contains(key)) {
+        // `009-reduce-remaining-holes-4`: a DIRECTLY self-recursive forward (`fn`
+        // calling itself, forwarding its OWN out-parameter unchanged -- confirmed
+        // live, `wherePartIdxExpr`'s own recursive call on `pMask`) can never
+        // bootstrap through the plain `Fwd(cfn,ci) => closed.contains((cfn,ci))`
+        // rule below: `key` is not yet in `closed` on ANY round before it is
+        // added, so a self-edge checking membership of its OWN pair is checking
+        // something that by definition cannot be true yet, on every round --
+        // not merely slow to converge, structurally unable to. This is sound to
+        // trust anyway, PROVIDED at least one call site is independent of this
+        // one (the `hasIndependentSite` guard): that independent site is the
+        // base case an inductive proof over the recursion would use, and
+        // Core's translation asks nothing more of a recursive function than
+        // that its own body decide correctly which case it is in -- there is
+        // no requirement anywhere in this file that a function calling itself
+        // apply extra scrutiny beyond an ordinary call. A function with NO
+        // independent site at all would have to be reached by some mechanism
+        // outside `allCalls` entirely (a function pointer -- already excluded
+        // from `candidates` via `takenAsValueFns` above) to run at all, so it
+        // is dead code either way; the guard costs nothing and keeps the
+        // self-trust narrow rather than blanket.
+        val hasIndependentSite = shapes.exists {
+          case Fwd(cfn, ci) => (cfn, ci) != key
+          case _            => true
+        }
+        val ok = hasIndependentSite && shapes.forall {
+          case Ok                          => true
+          case Bad                         => false
+          case NullLit                     => nullGuarded.getOrElse(key, false)
+          case Fwd(cfn, ci) if (cfn, ci) == key => true
+          case Fwd(cfn, ci)                => closed.contains((cfn, ci))
+        }
+        if (ok) { closed += key; changed = true }
+      }
+    }
+    closed
+  }
+
   /** `007-reduce-remaining-holes-2`: `closedOutParam`'s own discipline, generalized
     * from a whole-object scalar out-parameter to an INTERIOR-pointer one -- a
     * parameter receiving `&r[idx]`/`&r.f` (the address of one ELEMENT or FIELD of an
@@ -1970,6 +3261,26 @@ import scala.annotation.tailrec
     * `boxedArrays`/`boxedStructs`'s own per-method computation (each caller's
     * eligibility to KEEP `r` boxed despite this call, decided separately below,
     * depends on this purely-structural result, never the reverse). */
+  /** `009-reduce-remaining-holes-4` US4: is `r`'s own static type array-shaped --
+    * `arrayShape` (a literal integer size) first, and when that fails,
+    * `arrayShapeAny` + `resolveMacroArraySize` on `r`'s OWN declaring file
+    * (`declFile`, the file of the CALL SITE this array reference came from,
+    * which is where the local's own declaration -- and the macro that sizes it
+    * -- necessarily live too). Confirmed live to matter: `MemPage *apOld[NB];`
+    * (`btree.c`'s own `balance_nonroot`) -- `getAndInitPage`'s own `ppPage`
+    * out-parameter failed `closedIrefOutParam` outright on exactly this one
+    * call site (`&apOld[i]`) even though its other three call sites (`&pCur->
+    * pPage`, a field-address shape) already passed -- the SAME whole-program,
+    * one-outlier-site failure pattern this session's other transitive/dominance
+    * fixes have each closed for a DIFFERENT shape; this is the array-shape one.
+    * `resolveMacroArraySize` itself is the SAME machinery `boxedArrays` already
+    * built and this file already reuses elsewhere -- not a new mechanism. */
+  def irefArrayEligible(r: AstNode, declFile: String): Boolean = {
+    val bt = bareType(staticTypeOf(r))
+    arrayShape.findFirstMatchIn(bt).isDefined ||
+    arrayShapeAny.findFirstMatchIn(bt).exists(m => resolveMacroArraySize(m.group(2), declFile).isDefined)
+  }
+
   def closedIrefOutParam(fn: Method, paramIndex: Int): Boolean =
     if (takenAsValueFns.contains(fn.fullName)) false
     else {
@@ -1980,18 +3291,134 @@ import scala.annotation.tailrec
             kidsOf(addr) match {
               case List(x) =>
                 asIndex(x).exists { case (r, _) =>
-                  arrayShape.findFirstMatchIn(bareType(staticTypeOf(r))).isDefined
+                  irefArrayEligible(r, c.method.filename) ||
+                  // `009-reduce-remaining-holes-4`: `&s.arr[i]`/`&p->arr[i]` at
+                  // the CALL SITE -- the array-typed-struct-MEMBER counterpart
+                  // of the two shapes already here, checked purely structurally
+                  // (this call site's own static types), matching this whole
+                  // function's own "no per-caller precomputed state" discipline.
+                  // Reuses `memberTypes`/`arraySizeOf` exactly as
+                  // `pointerStructArrayIndexOperand` does for the SAME shape's
+                  // single-function eligibility -- this is its cross-function
+                  // counterpart. The ARGUMENT expression itself already
+                  // translates correctly regardless of this check (`callExpr`'s
+                  // own `<operator>.addressOf` dispatch, extended the same
+                  // push): all this widens is whether `fn`'s OWN parameter may
+                  // be TRUSTED, for its whole body, to be `Val.iref`.
+                  asField(r).exists { case (base, f) =>
+                    fieldReceiverAggregateType(staticTypeOf(base)).flatMap(structTypeDeclOf).exists { td =>
+                      memberTypes.get((stripDuplicateSuffix(bareType(td.fullName)), f))
+                        .exists(mty => arraySizeOf(mty, c.method.filename).isDefined)
+                    }
+                  }
                 } ||
                 asField(x).exists { case (r, _) =>
-                  val ty = staticTypeOf(r)
-                  isClassType(ty) && structTypeDeclOf(ty).isDefined
+                  fieldReceiverAggregateType(staticTypeOf(r)).exists(structTypeDeclOf(_).isDefined)
                 }
               case _ => false
             }
+          // `009-reduce-remaining-holes-4`: a BARE array-decay pass -- `foo(arr)`, no
+          // `&` at all -- is semantically `&arr[0]`, exactly as safe as the explicit
+          // form just above, when `arr`'s own static type is array-shaped
+          // (`irefArrayEligible`, the SAME check). Restricted to a genuine LOCAL
+          // array by construction, not merely by convention: a C array PARAMETER
+          // always decays to a plain pointer type at its own declaration, so its
+          // static type never retains bracket syntax for `irefArrayEligible` to
+          // match in the first place -- a bare parameter reaching here always fails
+          // this check and correctly falls through to `case _ => false` below,
+          // unaffected. Confirmed live: `sqlite3ClearStatTables`'s own
+          // `sqlite3_snprintf(sizeof(zTab), zTab, ...)` -- `zTab` a genuine
+          // `char zTab[24]` local, passed bare to an in-program callee.
+          case bare @ (_: Identifier | _: MethodParameterIn) =>
+            irefArrayEligible(bare, c.method.filename)
           case _ => false
         }
       }
     }
+
+  /** `009-reduce-remaining-holes-4` US4: `closedOutParamsTransitive`'s own
+    * parameter-forwarding fixed point, applied to `closedIrefOutParam`'s INTERIOR-
+    * pointer base case instead of `closedOutParam`'s whole-object one -- the same
+    * "a parameter receiving an already-safe pointer VALUE, forwarded unchanged, is
+    * just as safe as receiving it fresh" argument, since `p`'s own binding is the
+    * identical `Val.iref` at every hop regardless of how many forwarding calls it
+    * passed through. See `closedOutParamsTransitive`'s own doc comment for the full
+    * argument and the fixed-point's shape -- this is that same structure verbatim,
+    * with only the base-case predicate swapped. */
+  lazy val closedIrefOutParamsTransitive: Set[(String, Int)] = {
+    sealed trait ArgShape
+    case object Ok extends ArgShape
+    case object Bad extends ArgShape
+    case class Fwd(callerFn: String, callerIdx: Int) extends ArgShape
+
+    def classify(arg: AstNode): ArgShape = arg match {
+      case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+        kidsOf(addr) match {
+          case List(x) =>
+            val declFile = addr.file.name.headOption.getOrElse("")
+            val ok = asIndex(x).exists { case (r, _) => irefArrayEligible(r, declFile) } ||
+                     asField(x).exists { case (r, _) =>
+                       fieldReceiverAggregateType(staticTypeOf(r)).exists(structTypeDeclOf(_).isDefined)
+                     }
+            if (ok) Ok else Bad
+          case _ => Bad
+        }
+      // `009-reduce-remaining-holes-4`: a BARE array-decay pass, checked BEFORE the
+      // generic `Identifier`/`MethodParameterIn` forwarding cases below -- see
+      // `closedIrefOutParam`'s own matching case for the full reasoning (a C array
+      // PARAMETER always decays to a plain pointer at its own declaration, so this
+      // can only ever fire for a genuine local array, never intercept a real
+      // forwarded parameter).
+      case bare @ (_: Identifier | _: MethodParameterIn)
+          if irefArrayEligible(bare, bare.file.name.headOption.getOrElse("")) => Ok
+      case i: Identifier =>
+        i.method.parameter.l.find(_.name == i.name) match {
+          case Some(p) => Fwd(p.method.fullName, p.index)
+          case None    => Bad
+        }
+      case p: MethodParameterIn => Fwd(p.method.fullName, p.index)
+      case _ => Bad
+    }
+
+    val callsByCallee: Map[String, List[Call]] = allCalls.groupBy(_.methodFullName)
+    val candidates: List[(String, Int)] =
+      methodByName.values.filterNot(m => takenAsValueFns.contains(m.fullName))
+        .filter(m => callsByCallee.contains(m.fullName))
+        .flatMap(m => m.parameter.l.map(p => (m.fullName, p.index))).toList
+
+    val shapesByPair: Map[(String, Int), List[ArgShape]] =
+      candidates.map { case (fn, idx) =>
+        val sites = callsByCallee.getOrElse(fn, Nil)
+        (fn, idx) -> sites.map(c => kidsOf(c).find(aidx(_) == idx).map(classify).getOrElse(Bad))
+      }.toMap
+
+    var closed  = Set.empty[(String, Int)]
+    var changed = true
+    var round   = 0
+    while (changed && round < 8) {
+      changed = false
+      round += 1
+      for ((key, shapes) <- shapesByPair if shapes.nonEmpty && !closed.contains(key)) {
+        // Same self-recursion generalization as `closedOutParamsTransitive` above,
+        // applied to the iref world -- see that copy's own doc comment for the
+        // full reasoning (a self-`Fwd` can never bootstrap through plain set
+        // membership, and trusting it is sound exactly when some OTHER,
+        // independent call site establishes the actual base case).
+        val hasIndependentSite = shapes.exists {
+          case Fwd(cfn, ci) => (cfn, ci) != key
+          case _            => true
+        }
+        val ok = hasIndependentSite && shapes.forall {
+          case Ok                               => true
+          case Bad                              => false
+          case Fwd(cfn, ci) if (cfn, ci) == key => true
+          case Fwd(cfn, ci)                     => closed.contains((cfn, ci))
+        }
+        if (ok) { closed += key; changed = true }
+      }
+    }
+    closed
+  }
 
   /** `004-function-pointer-tracking`: the name of the variable a `pointerCall`'s
     * callee (the child at `argumentIndex == -1`) reads, if it is one of the two
@@ -2014,6 +3441,23 @@ import scala.annotation.tailrec
     }
   }
 
+  /** `009-reduce-remaining-holes-4`: sees through any number of wrapping
+    * `<operator>.cast` layers before a `pointerCall`'s callee is classified --
+    * `os_unix.c`'s own dominant remaining `pointerCall` shape (confirmed live:
+    * every one of 40 solo-blocked functions, `robust_open`/`unixSync`/the whole
+    * `ts_*` family), where EVERY syscall wrapper is a zero-parameter macro
+    * (`#define osOpen ((int(*)(const char*,int,int))aSyscall[0].pCurrent)`) whose
+    * expansion -- correctly reconstructed by `unwrapMacro` -- is a CAST of a
+    * struct-field-on-array-element to a function-pointer type, not a bare field
+    * access. Without unwrapping this, `pointerCallCalleeField`/
+    * `pointerCallFieldDynamic` never even look at the field access underneath,
+    * since their own top-level match requires the callee to BE one directly. */
+  def stripCastsForPointerCall(n: AstNode): AstNode = n match {
+    case cst: Call if cst.methodFullName == "<operator>.cast" && kidsOf(cst).size == 2 =>
+      stripCastsForPointerCall(kidsOf(cst)(1))
+    case other => other
+  }
+
   /** The `(ownerType, fieldName)` a `pointerCall`'s callee reads, when it is a
     * field access (`p->f(...)`/`p.f(...)`) whose receiver's static type Joern
     * actually resolved -- `pointerCallCalleeVar`'s own struct-field exclusion,
@@ -2023,7 +3467,7 @@ import scala.annotation.tailrec
     * unresolved): there is no owner type to look a target up against, and this
     * must stay a hole exactly as it already does today. */
   def pointerCallCalleeField(c: Call): Option[(String, String)] =
-    kidsOf(c).find(aidx(_) == -1).flatMap {
+    kidsOf(c).find(aidx(_) == -1).map(stripCastsForPointerCall).flatMap {
       case fa: Call if fieldOps.contains(fa.methodFullName) =>
         asField(fa).flatMap { case (recv, field) =>
           val owner = stripDuplicateSuffix(
@@ -2032,6 +3476,218 @@ import scala.annotation.tailrec
         }
       case _ => None
     }
+
+  /** `009-reduce-remaining-holes-4`: `p->pModule->xOpen(args)` -- a `pointerCall`
+    * whose callee is a struct FIELD, this label's own dominant real shape
+    * (measured, an earlier session: ~80% of all sites) -- dispatched
+    * DYNAMICALLY, reusing the EXACT mechanism `<operator>.call`'s own
+    * variable-fallback already relies on in `Semantics.lean`: `ctx.resolve f`
+    * fails for a name that names no real function, and `ρ.get f` then finds
+    * whatever `Val.fn` is ACTUALLY bound to it. Reads the field ONCE into a
+    * fresh temp (`freshExprVTemp`), then dispatches through the temp exactly
+    * as an ordinary function-pointer-variable call already would -- NO NEW
+    * `Expr`/`Val` CONSTRUCTOR, no `Semantics.lean`/`FuelMono.lean` change at
+    * all, because the temp assignment plus a same-name `Expr.call` is already
+    * a legal Core program, not a new primitive.
+    *
+    * Verified against the real Lean interpreter this session (not merely
+    * reasoned about): a standalone fixture built a `Module` heap object whose
+    * `xOpen` field held `Val.fn "add"`, a `Vtab` object whose `pModule` field
+    * pointed at it, and ran `tmp := p.pModule.xOpen; tmp(3, 4)` through
+    * `runFunc`'s own real evaluator -- `EResult.val (Val.int 7)`, exactly
+    * `add(3, 4)`, confirming the field's OWN function value is what actually
+    * gets invoked, not a guess.
+    *
+    * Returns the prelude (the receiver's own, plus the new temp assignment)
+    * and the resulting call expression, so this can only be used from a
+    * PRELUDE-AWARE caller (`exprV`) -- there is a genuine statement here that
+    * plain `expr` has nowhere to put. */
+  def pointerCallFieldDynamic(c: Call, realArgs: List[AstNode]): Option[(List[ujson.Obj], ujson.Obj)] =
+    kidsOf(c).find(aidx(_) == -1).map(stripCastsForPointerCall).collect {
+      case fa: Call if fieldOps.contains(fa.methodFullName) => fa
+    }.flatMap { fa =>
+      asField(fa).map { case (recv, field) =>
+        val (recvPrelude, recvExpr) = exprV(recv)
+        val tmp = freshExprVTemp()
+        val fieldRead  = ujson.Obj("k" -> "field", "a" -> recvExpr, "f" -> field)
+        val assignTmp  = ujson.Obj("k" -> "assign", "x" -> tmp, "e" -> fieldRead)
+        (recvPrelude :+ assignTmp, ujson.Obj("k" -> "call", "f" -> tmp, "args" -> exprs(realArgs)))
+      }
+    }
+
+  /** `009-reduce-remaining-holes-4`: `fn`'s own mangled full name -> every
+    * `(ownerType, fieldName)` a whole-program scan of `<operator>.assignment`
+    * calls found it positionally assigned into, via `structFieldOrder`
+    * zipped against an `<operator>.arrayInitializer` RHS (SQLite's own
+    * shape for `static sqlite3_module fooModule = { 0, fooCreate, ...
+    * fooOpen, ... };`). Ordinary function-pointer field assignment
+    * (`p->f = someFn;`) is `fieldFnTargets`'s job, not this one -- that scan
+    * requires whole-program agreement on a SINGLE target per field, which a
+    * genuinely polymorphic method table (many modules, each assigning a
+    * DIFFERENT function to the very same field name) never satisfies. This
+    * scan needs no such agreement: it records every (owner, field) any
+    * function is ever placed at, and `closedOutParamViaVtableTransitive`
+    * below judges safety from the call sites, not from uniqueness of the
+    * assignment. */
+  lazy val vtableFieldsOf: Map[String, Set[(String, String)]] = {
+    val out = scala.collection.mutable.Map[String, Set[(String, String)]]().withDefaultValue(Set.empty)
+    val assigns = allCalls.filter(_.methodFullName == "<operator>.assignment")
+    def targetFn(n: AstNode): Option[String] = n match {
+      case mr: MethodRef => Some(mr.methodFullName)
+      case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+        kidsOf(addr) match { case List(mr: MethodRef) => Some(mr.methodFullName); case _ => None }
+      case _ => None
+    }
+    for (a <- assigns) {
+      kidsOf(a) match {
+        case List(lhs, rhs: Call) if rhs.methodFullName == "<operator>.arrayInitializer" =>
+          val owner = stripDuplicateSuffix(bareType(staticTypeOf(lhs)))
+          if (owner.nonEmpty && owner != "ANY" && !isPointerType(owner)) {
+            structTypeDeclOf(owner).flatMap(structFieldOrder).foreach { fields =>
+              fields.zip(kidsOf(rhs)).foreach { case (fieldName, child) =>
+                targetFn(child).filter(methodByName.contains).foreach { rawFn =>
+                  val nm = mangledFullName(rawFn)
+                  out(nm) = out(nm) + ((owner, fieldName))
+                }
+              }
+            }
+          }
+        case _ =>
+      }
+    }
+    out.toMap
+  }
+
+  /** `009-reduce-remaining-holes-4`: `closedOutParam`'s own "every call site
+    * passes `&local`" precondition, extended to VIRTUAL DISPATCH -- a
+    * function whose ONLY callers reach it indirectly through a shared
+    * method-table field (`sqlite3_module.xOpen`, ...), never by its own
+    * name. `closedOutParam` requires `allCalls.filter(_.methodFullName ==
+    * fn.fullName)` to be non-empty -- for one of these it always is EMPTY
+    * (every real call site is a `<operator>.pointerCall` reading the field,
+    * not a direct call to this specific implementation), so `closedOutParam`
+    * can never prove one closed no matter how safe its callers actually are.
+    * Confirmed live: dozens of `assign:lhs:indirection`'s single-blocking-
+    * label functions are exactly this shape (`statOpen`, `echoRowid`,
+    * `unixFetch`, ...), each with zero direct call sites in the whole
+    * program.
+    *
+    * The soundness argument is different from, but no weaker than,
+    * `closedOutParam`'s own: every function assigned into the SAME struct
+    * field shares that field's exact C function-pointer TYPE (the compiler
+    * enforces this at the assignment), so a dispatch call THROUGH that field
+    * is valid evidence for every implementation the field might hold at
+    * runtime, not just whichever one this particular translation is
+    * currently looking at. If EVERY dispatch call through `(owner, field)`,
+    * anywhere in the program, passes a genuine `&local` at this parameter
+    * position, `fn`'s own out-parameter is exactly as safe as
+    * `closedOutParam`'s base case -- regardless of which implementation is
+    * actually invoked at runtime.
+    *
+    * A function `vtableFieldsOf` cannot place in any known field (an
+    * ordinary function, or one assigned only into a struct this cannot
+    * text-parse) simply has no entries here and falls through to
+    * `closedOutParam`'s existing, correctly negative, answer unchanged.
+    *
+    * Generalized the same way `closedOutParamsTransitive` generalizes
+    * `closedOutParam`: a dispatch call site's argument is not always a fresh
+    * `&local` -- confirmed live, `sqlite3OsFileSize`'s own body reads
+    * `id->pMethods->xFileSize(id, pSize)`, forwarding its OWN `pSize`
+    * parameter unchanged rather than taking a new address. That forward is
+    * exactly as safe as a genuine `&local` PROVIDED `sqlite3OsFileSize`'s own
+    * parameter is itself already known closed -- by the ordinary, direct-call
+    * route (`closedOutParam`/`closedOutParamsTransitive`), since
+    * `sqlite3OsFileSize` is called by name like any other function, not
+    * itself a vtable target. `classify`/the bounded fixed point below mirror
+    * `closedOutParamsTransitive` verbatim, with two differences: call sites
+    * come from `vtableFieldsOf`'s dispatch fields instead of a direct-name
+    * lookup, and a `Fwd` resolves against `closedOutParamsTransitive`/
+    * `closedOutParam` (the direct-call world) OR this same set (chained
+    * vtable forwarding), not `closedOutParamsTransitive` alone -- the two
+    * closure worlds meet exactly at a `Fwd` edge, never merged into one
+    * fixed point, so neither one's own termination bound is disturbed by the
+    * other. */
+  lazy val closedOutParamViaVtableTransitive: Set[(String, Int)] = {
+    sealed trait ArgShape
+    case object Ok extends ArgShape
+    case object Bad extends ArgShape
+    case object NullLit extends ArgShape
+    case class Fwd(callerFn: String, callerIdx: Int) extends ArgShape
+
+    def classify(arg: AstNode): ArgShape = arg match {
+      case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+        kidsOf(addr) match {
+          case List(n) if addrShape(n) == "local" =>
+            val ty = staticTypeOf(n)
+            if (!isClassType(ty) && addrKind(ty) != "unknown-type") Ok else Bad
+          case _ => Bad
+        }
+      case n if isNullPointerLiteral(n) => NullLit
+      case i: Identifier =>
+        i.method.parameter.l.find(_.name == i.name) match {
+          case Some(p) => Fwd(p.method.fullName, p.index)
+          case None    => Bad
+        }
+      case p: MethodParameterIn => Fwd(p.method.fullName, p.index)
+      case _ => Bad
+    }
+
+    val pcalls = allCalls.filter(_.methodFullName == "<operator>.pointerCall")
+    val callsByField: Map[(String, String), List[Call]] =
+      pcalls.flatMap(c => pointerCallCalleeField(c).map(_ -> c)).groupBy(_._1).view.mapValues(_.map(_._2)).toMap
+
+    val candidates: List[(String, Int)] =
+      vtableFieldsOf.keys.toList.flatMap { fn =>
+        methodByName.get(fn).toList.flatMap(m => m.parameter.l.map(p => (fn, p.index)))
+      }
+
+    val shapesByPair: Map[(String, Int), List[ArgShape]] =
+      candidates.map { case (fn, idx) =>
+        val fields = vtableFieldsOf.getOrElse(fn, Set.empty)
+        val sites  = fields.toList.flatMap(f => callsByField.getOrElse(f, Nil))
+        (fn, idx) -> sites.map(c => kidsOf(c).find(aidx(_) == idx).map(classify).getOrElse(Bad))
+      }.toMap
+
+    val nullGuarded: Map[(String, Int), Boolean] =
+      shapesByPair.collect {
+        case ((fn, idx), shapes) if shapes.exists { case NullLit => true; case _ => false } =>
+          val guarded = methodByName.get(fn).flatMap(_.parameter.find(_.index == idx))
+            .exists(p => calleeNullGuardsParam(methodByName(fn), p.name))
+          (fn, idx) -> guarded
+      }
+
+    def directlyClosed(fn: String, idx: Int): Boolean =
+      closedOutParamsTransitive.contains((fn, idx)) ||
+      methodByName.get(fn).exists(m => closedOutParam(m, idx))
+
+    var closed  = Set.empty[(String, Int)]
+    var changed = true
+    var round   = 0
+    while (changed && round < 8) {
+      changed = false
+      round += 1
+      for ((key, shapes) <- shapesByPair if shapes.nonEmpty && !closed.contains(key)) {
+        // Same self-recursion generalization as `closedOutParamsTransitive`'s own
+        // copy -- see its doc comment for the full reasoning. Here a self-`Fwd`
+        // is checked BEFORE `directlyClosed` for the same pair, since neither
+        // `closed` nor the direct-call world can ever independently prove a
+        // PURELY self-referential vtable-dispatch parameter closed.
+        val hasIndependentSite = shapes.exists {
+          case Fwd(cfn, ci) => (cfn, ci) != key
+          case _            => true
+        }
+        val ok = hasIndependentSite && shapes.forall {
+          case Ok                               => true
+          case Bad                              => false
+          case NullLit                          => nullGuarded.getOrElse(key, false)
+          case Fwd(cfn, ci) if (cfn, ci) == key => true
+          case Fwd(cfn, ci)                     => closed.contains((cfn, ci)) || directlyClosed(cfn, ci)
+        }
+        if (ok) { closed += key; changed = true }
+      }
+    }
+    closed
+  }
 
   /** `Expr.name nm` -- the box's own reference, e.g. what `&x` evaluates to once `x`
     * is boxed, or what a boxed local's declared-type-preserving reference looks like. */
@@ -2305,7 +3961,7 @@ import scala.annotation.tailrec
     if (v.abs <= BigInt(2).pow(53)) ujson.Obj("k" -> "int", "v" -> v.toLong)
     else ujson.Obj("k" -> "int", "v" -> v.toString)
 
-  def expr(n: AstNode): ujson.Obj = n match {
+  def expr(n: AstNode): ujson.Obj = unwrapMacro(n) match {
     case l: Literal =>
       val c0 = l.code.trim
       // String-literal prefixes: L"x" (wide), u8"x", u"x", U"x". The prefix selects an
@@ -2516,6 +4172,16 @@ import scala.annotation.tailrec
         // a shape we have not seen and must not guess at.
         case _          => hole("op:starredUnpack-arity")
       }
+    // `009-reduce-remaining-holes-4`: `z` passed WHOLE to another function, `z` a
+    // tracked byte cursor (`strCursorParams`) -- the value the callee should
+    // receive is the REMAINING string from `z`'s own current position, not the
+    // original whole string `expr(other)` would give it. See
+    // `strCursorEligible`'s own doc comment for why THIS function specifically is
+    // the one and only rendering site that needs to agree with its accounting.
+    case i: Identifier if strCursorParams.contains(localName(i.name)) =>
+      val nm = localName(i.name)
+      ujson.Obj("k" -> "strFrom", "a" -> ujson.Obj("k" -> "name", "v" -> nm),
+                "b" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")))
     case other => expr(other)
   }
 
@@ -2737,7 +4403,27 @@ import scala.annotation.tailrec
     case other => ("plain", None, other)
   }
 
-  /** `<operator>.arrayInitializer`, which is **two unrelated constructs** sharing a name.
+  /** Shared by both `arrayInit` branches below: given a list of element VALUE nodes
+    * (already unwrapped from any `Block`, or raw for a nested group -- `initElement`'s
+    * own pattern match does not care which), classify and build `Expr.listE`/
+    * `Expr.dictE`, or the matching hole. Extracted so `009-reduce-remaining-holes-4`
+    * US3's nested-group path (below) reuses this exactly rather than duplicating it. */
+  def classifyInitElements(vals: List[AstNode]): ujson.Obj = {
+    val es = vals.map(initElement)
+    val kinds = es.map(_._1).distinct
+    if (kinds == List("plain"))
+      ujson.Obj("k" -> "listE", "items" -> ujson.Arr.from(es.map(e => expr(e._3))))
+    else if (kinds == List("field"))
+      ujson.Obj("k" -> "dictE", "pairs" -> ujson.Arr.from(es.map { e =>
+        ujson.Arr(ujson.Obj("k" -> "str", "v" -> e._2.get), expr(e._3))
+      }))
+    else if (kinds.contains("index")) hole("op:arrayInitializer:index-designator")
+    else if (kinds.contains("shape")) hole("op:arrayInitializer:element-shape")
+    else hole("op:arrayInitializer:mixed-designators")
+  }
+
+  /** `<operator>.arrayInitializer`, which is **three unrelated constructs** sharing a
+    * name.
     *
     * 1. A brace initializer, `{ ... }`: each child is a BLOCK wrapping one element.
     *    - all-positional  -> `Expr.listE`. A C array is an ordered sequence of values and
@@ -2750,31 +4436,54 @@ import scala.annotation.tailrec
     *      kernel's `static struct x foo = { .a = 1 }` tables mean something.
     *    - anything mixed, or an index designator anywhere -> a hole naming which.
     *
-    * 2. An array **declarator**: `u8 buf[NH_KEY_WORDS]` arrives as an arrayInitializer
+    * 2. `009-reduce-remaining-holes-4` US3: a NESTED group -- `{ {1,2,3}, {4,5,6} }`
+    *    (array-of-array/array-of-struct), including a macro-expanded struct-literal row
+    *    (`FUNCTION(...)`-style tables in `func.c`, confirmed live: their macro expansion
+    *    still surfaces as a real `<operator>.arrayInitializer` AST node, only the source
+    *    `.code` stays the macro-call text). Unlike (1), Joern does NOT Block-wrap these
+    *    children -- confirmed live across 30+ sample sites in `alter.c`/`analyze.c`/
+    *    `complete.c`/`date.c`/`func.c`, both the plain-literal-table shape research.md
+    *    §3 predicted AND a macro-driven struct-row shape whose own elements are full
+    *    subexpressions (a bit-OR of flags, a `MethodRef` function value, a pointer-
+    *    arithmetic offset trick) -- so this branch reuses `classifyInitElements` directly
+    *    on the RAW children (no unwrap), which sends each element through the SAME
+    *    `expr()` this file already uses everywhere else (`MethodRef` -> `fnValue`, a
+    *    binop -> `Expr.binop`, ...). A further-nested child (array-of-array-of-array) is
+    *    itself an `<operator>.arrayInitializer` `Call`, which `expr()` already dispatches
+    *    back through `arrayInit` (`callExpr`'s existing `<operator>.arrayInitializer`
+    *    case) -- so arbitrary depth recurses with no new mechanism, per FR-003. An
+    *    element `expr()` cannot translate gets ITS OWN honest, specifically-named hole
+    *    (`expr()`'s own catch-all, `hole("expr:" + other.label)`) rather than the whole
+    *    group falling back to the declarator's blanket label (spec.md Acceptance
+    *    Scenario 3) -- confirmed safe live: `expr()` has no un-holed default case, so an
+    *    unrecognized element can only ever produce a labeled hole, never a crash or a
+    *    silent guess.
+    *
+    *    Requiring 2+ raw children before taking this branch is deliberate, not
+    *    incidental: a SINGLE non-Block child is the one shape genuinely ambiguous
+    *    between this nested case (a one-element brace group, `{0}`) and construct 3
+    *    below (a bare declarator, whose lone child is the size) -- Joern gives both the
+    *    identical AST shape, and this project does not guess between them. That
+    *    ambiguity can only arise at the outermost, un-nested position: once already
+    *    inside a confirmed multi-element nested group (i.e. already past this check),
+    *    a lone-child SUB-node can only be a one-element group, never a declarator's
+    *    size, so recursion through `expr()`/`arrayInit` resolves it correctly without
+    *    re-checking.
+    *
+    * 3. An array **declarator**: `u8 buf[NH_KEY_WORDS]` arrives as an arrayInitializer
     *    whose single child is the *size*, in statement position. It is a declaration, not
     *    a value, and modelling it needs the size model this project does not have — so it
     *    keeps a hole, but under `op:arrayDecl:size`, which says what it actually is
     *    rather than filing it with the initializers it has nothing to do with. */
   def arrayInit(kids: List[AstNode]): ujson.Obj =
     if (kids.isEmpty) hole("op:arrayInitializer:zero-init")
-    else if (!kids.forall(_.isInstanceOf[Block])) hole("op:arrayDecl:size")
-    else {
+    else if (kids.forall(_.isInstanceOf[Block])) {
       val inner = kids.map(b => kidsOf(b))
       if (!inner.forall(_.size == 1)) hole("op:arrayInitializer:element-shape")
-      else {
-        val es = inner.map(_.head).map(initElement)
-        val kinds = es.map(_._1).distinct
-        if (kinds == List("plain"))
-          ujson.Obj("k" -> "listE", "items" -> ujson.Arr.from(es.map(e => expr(e._3))))
-        else if (kinds == List("field"))
-          ujson.Obj("k" -> "dictE", "pairs" -> ujson.Arr.from(es.map { e =>
-            ujson.Arr(ujson.Obj("k" -> "str", "v" -> e._2.get), expr(e._3))
-          }))
-        else if (kinds.contains("index")) hole("op:arrayInitializer:index-designator")
-        else if (kinds.contains("shape")) hole("op:arrayInitializer:element-shape")
-        else hole("op:arrayInitializer:mixed-designators")
-      }
+      else classifyInitElements(inner.map(_.head))
     }
+    else if (kids.size > 1) classifyInitElements(kids)
+    else hole("op:arrayDecl:size")
 
   def callExpr(c: Call): ujson.Obj = {
     val kids = kidsOf(c)
@@ -2790,7 +4499,40 @@ import scala.annotation.tailrec
     // semantics at all, unlike every other `cStringUnsafe` shape.
     val isNullCheck = (mfn == "<operator>.equals" || mfn == "<operator>.notEquals") &&
                        kids.exists(isNullLiteral)
-    if (cLikeFile && kids.size == 2 && kids.exists(isCString) &&
+    // `009-reduce-remaining-holes-4`: `z + n`/`z - n`/`n + z`, `z` a tracked byte
+    // cursor (`strCursorParams`) -- C's own `z + n` is a NEW pointer value, `n`
+    // positions past `z`'s CURRENT offset, which `Expr.strFrom` names exactly
+    // (the substring from that position onward). SQLite's own extremely common
+    // "compute a shifted view, give it a new name" idiom (`zTail = zStr + 10;`),
+    // and reused directly by the local-cursor-variable seeding below (a local's
+    // own defining assignment is translated by calling this same `expr()`
+    // dispatch on its RHS, so `p = zStr + 10;` picks this up with no separate
+    // mechanism). Checked BEFORE the general `cStringUnsafe` guard just below,
+    // which would otherwise hole this unconditionally (both operands' types
+    // still look like "a char* plus an int" to that check).
+    if (cLikeFile && (mfn == "<operator>.addition" || mfn == "<operator>.subtraction") &&
+             kids.size == 2 &&
+             rawLocalOrParamName(kids(0)).map(localName).exists(strCursorParams.contains) &&
+             !isCString(kids(1))) {
+      val nm = rawLocalOrParamName(kids(0)).map(localName).get
+      val op = if (mfn == "<operator>.addition") "+" else "-"
+      ujson.Obj("k" -> "strFrom", "a" -> ujson.Obj("k" -> "name", "v" -> nm),
+                "b" -> ujson.Obj("k" -> "binop", "op" -> op,
+                                 "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")),
+                                 "b" -> expr(kids(1))))
+    }
+    // `n + z` -- addition commutes; subtraction has no symmetric case (`n - z`
+    // is not pointer arithmetic in C at all).
+    else if (cLikeFile && mfn == "<operator>.addition" && kids.size == 2 &&
+             rawLocalOrParamName(kids(1)).map(localName).exists(strCursorParams.contains) &&
+             !isCString(kids(0))) {
+      val nm = rawLocalOrParamName(kids(1)).map(localName).get
+      ujson.Obj("k" -> "strFrom", "a" -> ujson.Obj("k" -> "name", "v" -> nm),
+                "b" -> ujson.Obj("k" -> "binop", "op" -> "+",
+                                 "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")),
+                                 "b" -> expr(kids(0))))
+    }
+    else if (cLikeFile && kids.size == 2 && kids.exists(isCString) &&
         cStringUnsafe.contains(mfn) && !isNullCheck)
       hole(cStringUnsafe(mfn))
     else if (binops.contains(mfn) && kids.size == 2)
@@ -2803,6 +4545,46 @@ import scala.annotation.tailrec
       }
     else if (unops.contains(mfn) && kids.size == 1)
       ujson.Obj("k" -> "unop", "op" -> unops(mfn), "a" -> expr(kids(0)))
+    // `009-reduce-remaining-holes-4`: `z[i]`, `z` a tracked byte cursor
+    // (`strCursorParams`) -- C's own `z[i]` is exactly `*(z+i)`, so this reads the
+    // byte at `z`'s CURRENT offset plus `i`, not literal position `i` from the
+    // string's own start -- matching real pointer arithmetic once `z` has already
+    // advanced any distance. Checked BEFORE the boxed-array case just below (a
+    // char* cursor and a boxed array are never the same name).
+    else if (indexOps.contains(mfn) && kids.size == 2 &&
+             rawLocalOrParamName(kids(0)).map(localName).exists(strCursorParams.contains)) {
+      val nm = rawLocalOrParamName(kids(0)).map(localName).get
+      ujson.Obj("k" -> "strByte", "a" -> ujson.Obj("k" -> "name", "v" -> nm),
+                "b" -> ujson.Obj("k" -> "binop", "op" -> "+",
+                                 "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")),
+                                 "b" -> expr(kids(1))))
+    }
+    // `009-reduce-remaining-holes-4`: a cross-session bug report -- `p[i]`, `p` a
+    // plain pointer PROVABLY holding an interior pointer VALUE directly
+    // (`ptrIrefNames`), was falling all the way through to the generic `indexOps`
+    // case below, which reads `p` as an ordinary VALUE via `expr(kids(0))` and
+    // wraps it in a plain `Expr.index` -- but `Expr.index`'s own `evalExpr` case
+    // has no arm for a `.iref` receiver at all (only `.list`/`.tuple`/`.dict`),
+    // so at RUNTIME this silently hits Core's OWN internal `index:unsupported`
+    // hole instead of the value `p[i]` actually names -- a function containing
+    // this shape was STATICALLY exported with no hole marker anywhere (it "type-
+    // checked" per this file's own ledger) while being WRONG the moment it
+    // actually ran. Confirmed live, reproduced independently of any escape-
+    // analysis question: `readAt(int *p, int j) { return p[j]; }`, called ONLY
+    // as `readAt(&arr[1], 0)` -- a single, unambiguous, non-"mixed" escape --
+    // exhibits the identical silent gap, so the fix belongs here, in `p[i]`'s
+    // own translation, not in `nameEscapesSafely`'s escape-shape bookkeeping.
+    // `p[i]` is exactly `*(p+i)` in C, and `applyBinop`'s `Val.iref + Val.int`
+    // arm (proven sound, Story 5) already does exactly this arithmetic -- so this
+    // reuses it verbatim rather than inventing anything new. Checked BEFORE the
+    // boxed-array case just below (a `ptrIrefNames` name and a `boxedArrays` name
+    // are never the same one).
+    else if (indexOps.contains(mfn) && kids.size == 2 &&
+             rawLocalOrParamName(kids(0)).map(localName).exists(ptrIrefNames.contains)) {
+      val nm = rawLocalOrParamName(kids(0)).map(localName).get
+      ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "binop", "op" -> "+",
+        "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> expr(kids(1))))
+    }
     // `006-reduce-remaining-holes`, Story 5: `a[i]`, `a` a recognized boxed array
     // -- reads through the box (`irefIndex`+`derefIref`) rather than the ordinary
     // `Expr.index`/`Val.list` machinery, which a heap-boxed array does not use.
@@ -2813,6 +4595,19 @@ import scala.annotation.tailrec
       ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
         "a" -> ujson.Obj("k" -> "name", "v" -> rawLocalOrParamName(kids(0)).map(localName).get),
         "i" -> expr(kids(1))))
+    // `009-reduce-remaining-holes-4`: `s.arr[i]`/`p->arr[i]` READ -- the PLAIN
+    // (non-address-of) read-side counterpart of `structArrIref` (`callExpr`'s
+    // own `<operator>.addressOf` case) and its write-side twin in `assignTo`,
+    // same push. `c` here IS the index-access call itself, matching exactly how
+    // `boxedArrayIndexOperand`/its own callers are invoked elsewhere.
+    else if (indexOps.contains(mfn) && kids.size == 2 &&
+             (boxedStructArrayIndexOperand(c).isDefined || pointerStructArrayIndexOperand(c).isDefined)) {
+      val (structName, f, idxNode) =
+        boxedStructArrayIndexOperand(c).orElse(pointerStructArrayIndexOperand(c)).get
+      ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
+        "a" -> ujson.Obj("k" -> "field", "a" -> ujson.Obj("k" -> "name", "v" -> structName), "f" -> f),
+        "i" -> expr(idxNode)))
+    }
     else if (indexOps.contains(mfn) && kids.size == 2)
       ujson.Obj("k" -> "index", "a" -> expr(kids(0)), "b" -> expr(kids(1)))
     else if (fieldOps.contains(mfn))
@@ -2883,30 +4678,73 @@ import scala.annotation.tailrec
     //   to the address hole.
     else if (mfn == "<operator>.cast" && kids.size == 2) {
       val tty = staticTypeOf(kids(0))
-      // `007-reduce-remaining-holes-2` US3: a pointer-to-pointer cast is a transparent
-      // pass-through of the operand's own (already-correct) translation -- see
-      // `castOperandIsPointerShaped`'s own doc comment for why this is sound under
-      // Core's structural heap model. An operand that is NOT confirmed pointer-shaped
-      // (most commonly an integer-to-pointer cast, e.g. `(int*)0`) has no `Ref`/`iref`
-      // to pass through and gets its own narrower, honestly-named hole instead of
-      // silently folding into the identity translation.
-      if (castTargetIsPointer(kids(0), tty)) {
-        if (castOperandIsPointerShaped(kids(1))) expr(kids(1))
-        else hole("op:cast:pointer:int-to-pointer")
-      }
-      else resolveIntType(tty) match {
-        case Some(w) => ujson.Obj("k" -> "unop", "op" -> ("cast:" + w),
-                                  "a" -> expr(kids(1)))
-        case None =>
-          if (bareType(tty) == "void")
-            (if (pureExpr(kids(1))) ujson.Obj("k" -> "unit") else expr(kids(1)))
-          // The width is known to be a function of the target and the target was not
-          // stated. Distinct from `op:cast:scalar`, which is a missing *model*, and from
-          // `op:cast:opaque-type`, which is a missing *type*: this one is closed by
-          // naming a data model, not by a better frontend.
-          else if (modelDependentNames.contains(bareType(tty)))
-            hole("op:cast:model-dependent")
-          else hole("op:cast:" + addrKind(tty))
+      // `009-reduce-remaining-holes-4`: casting an in-program FUNCTION REFERENCE to
+      // another function-pointer-shaped type is an identity, for the same reason
+      // `&function` already is (the `fnIdentity` case in `<operator>.addressOf`
+      // above): Core's `Val.fn` has no pointer-depth or declared-signature
+      // distinction to preserve across the cast, so re-spelling the type changes
+      // nothing about the value. Checked BEFORE `castTargetIsPointer` below,
+      // because what matters here is that the OPERAND names a real function, not
+      // whether the target type's own surface syntax looks pointer-shaped (a
+      // function-pointer TYPEDEF's own name usually does not -- see
+      // `sqlite3_destructor_type`, below). Confirmed live: SQLite's own
+      // `(sqlite3_destructor_type)sqlite3RowSetClear` (the `SQLITE_DYNAMIC` macro)
+      // -- a real destructor function cast to its own registered-callback type.
+      // Restricted to an ACTUALLY in-program function (`methodByName`), matching
+      // `fnIdentity`'s own external-function guard for the identical reason. Two
+      // sibling macros at the SAME cast target type, `SQLITE_STATIC`/
+      // `SQLITE_TRANSIENT` (`(sqlite3_destructor_type)0`/`(sqlite3_destructor_type)
+      // -1`), are sentinel INTEGER values, not function references -- they
+      // correctly fall through to the unchanged logic below (landing on
+      // `op:cast:opaque-type`), since Core's `Val.fn` has no "null function" or
+      // "special sentinel function" to represent them as.
+      kids(1) match {
+        case mr: MethodRef if methodByName.contains(mr.methodFullName) => expr(kids(1))
+        case _ =>
+          // `007-reduce-remaining-holes-2` US3: a pointer-to-pointer cast is a
+          // transparent pass-through of the operand's own (already-correct)
+          // translation -- see `castOperandIsPointerShaped`'s own doc comment for
+          // why this is sound under Core's structural heap model. An operand that
+          // is NOT confirmed pointer-shaped (most commonly an integer-to-pointer
+          // cast, e.g. `(int*)0`) has no `Ref`/`iref` to pass through and gets its
+          // own narrower, honestly-named hole instead of silently folding into the
+          // identity translation.
+          //
+          // `009-reduce-remaining-holes-4`: `(T*)0` -- a typed null-pointer
+          // constant, C's standard idiom for "no object of this type" -- is
+          // checked FIRST: live-CPG-sampled at 369 of the corpus's own
+          // `castTargetIsPointer` sites with a non-pointer-shaped operand, dwarfing
+          // every other shape. `isNullLiteral` (widened earlier this session to
+          // accept a bare `0`, not just the spelled-out `NULL`) is exactly the
+          // right test: the value this cast produces is Core's own `Val.unit`
+          // regardless of which pointer type it is spelled as, the same reasoning
+          // `expr`'s own `NULL`-literal case already relies on.
+          //
+          // `castFieldOperandPointerShaped` covers the SECOND-largest shape (482
+          // sites): a field/index-access operand whose OWN field type Joern could
+          // not resolve, but the real struct source text confirms is already a
+          // pointer (`(void*)pColDef->z`, `(u8*)pPage1->aData`) -- see that
+          // function's own doc comment.
+          if (castTargetIsPointer(kids(0), tty)) {
+            if (isNullLiteral(kids(1))) ujson.Obj("k" -> "unit")
+            else if (castOperandIsPointerShaped(kids(1)) || castFieldOperandPointerShaped(kids(1)))
+              expr(kids(1))
+            else hole("op:cast:pointer:int-to-pointer")
+          }
+          else resolveIntType(tty) match {
+            case Some(w) => ujson.Obj("k" -> "unop", "op" -> ("cast:" + w),
+                                      "a" -> expr(kids(1)))
+            case None =>
+              if (bareType(tty) == "void")
+                (if (pureExpr(kids(1))) ujson.Obj("k" -> "unit") else expr(kids(1)))
+              // The width is known to be a function of the target and the target was
+              // not stated. Distinct from `op:cast:scalar`, which is a missing
+              // *model*, and from `op:cast:opaque-type`, which is a missing *type*:
+              // this one is closed by naming a data model, not by a better frontend.
+              else if (modelDependentNames.contains(bareType(tty)))
+                hole("op:cast:model-dependent")
+              else hole("op:cast:" + addrKind(tty))
+          }
       }
     }
     // `&x`.
@@ -2966,10 +4804,21 @@ import scala.annotation.tailrec
       // would otherwise fall straight through every case below to the generic
       // `op:addressOf:element`/`:field` hole.
       val arrIref = boxedArrayIndexOperand(kids(0))
-      val structIref = boxedStructFieldOperand(kids(0))
+      val structIref = boxedStructFieldOperand(kids(0)).orElse(pointerStructFieldOperand(kids(0)))
+      // `009-reduce-remaining-holes-4`: `&s.arr[i]`/`&p->arr[i]` -- an
+      // ARRAY-typed struct member, indexed. Checked alongside (not instead of)
+      // the two above: `arrIref` needs a BARE name receiver, `structIref` needs
+      // a scalar member, so neither can ever match this shape (a field access
+      // wrapped in an index access) in the first place -- no ordering risk.
+      val structArrIref = boxedStructArrayIndexOperand(kids(0)).orElse(pointerStructArrayIndexOperand(kids(0)))
       if (arrIref.isDefined) {
         val (arrName, idxNode) = arrIref.get
         ujson.Obj("k" -> "irefIndex", "a" -> ujson.Obj("k" -> "name", "v" -> arrName),
+                  "i" -> expr(idxNode))
+      } else if (structArrIref.isDefined) {
+        val (structName, f, idxNode) = structArrIref.get
+        ujson.Obj("k" -> "irefIndex",
+                  "a" -> ujson.Obj("k" -> "field", "a" -> ujson.Obj("k" -> "name", "v" -> structName), "f" -> f),
                   "i" -> expr(idxNode))
       } else if (structIref.isDefined) {
         val (structName, f) = structIref.get
@@ -3002,6 +4851,19 @@ import scala.annotation.tailrec
       // unlike the `ptrAliases`/`closedOutParams` box-field reads just below.
       if (nm.exists(ptrIrefNames.contains))
         ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "name", "v" -> nm.get))
+      // `009-reduce-remaining-holes-4`: `*z`/`*(u8*)z`, `z` a tracked byte cursor
+      // (`strCursorParams`) -- read the byte at `z`'s own current offset.
+      // `rawNameThroughCast` (not the strict `nm` above) so a defensive cast
+      // between the `*` and `z` (SQLite's own recurring `*(u8*)z` idiom) does not
+      // hide the name from this check -- `strCursorParams` membership is exactly
+      // as safe to recognize through a cast as `ptrIrefNames`/`ptrAliases` already
+      // are left un-widened for, since a byte read does not depend on the cast's
+      // target type the way an `iref` dereference's selector might.
+      else if (rawNameThroughCast(kids(0)).map(localName).exists(strCursorParams.contains)) {
+        val cnm = rawNameThroughCast(kids(0)).map(localName).get
+        ujson.Obj("k" -> "strByte", "a" -> ujson.Obj("k" -> "name", "v" -> cnm),
+                  "b" -> ujson.Obj("k" -> "name", "v" -> (cnm + "$off")))
+      }
       else {
         val target = nm.flatMap(ptrAliases.get) orElse nm.filter(closedOutParams.contains)
         target.map(boxField).getOrElse(hole("op:indirection:" + addrKind(staticTypeOf(kids(0)))))
@@ -3116,7 +4978,8 @@ import scala.annotation.tailrec
           // (ambiguous, external, an array element, or the general shape) falls
           // through to the unchanged generic hole just below, exactly as today.
           pointerCallCalleeVar(c).flatMap(fnPtrVars.get)
-            .orElse(pointerCallCalleeField(c).flatMap(fieldFnTargets.get)) match {
+            .orElse(pointerCallCalleeField(c).flatMap(fieldFnTargets.get))
+            .orElse(pointerCallCalleeVar(c).filterNot(anyFunctionBareName.contains)) match {
             case Some(target) => ujson.Obj("k" -> "call", "f" -> target, "args" -> exprs(realArgs))
             case None          => hole("op:" + opLabel(mfn))
           }
@@ -3435,15 +5298,35 @@ import scala.annotation.tailrec
 
   /** Run `f` with `gotoAsBreak` cleared, and restore it afterwards.
     *
-    * Used when descending into a loop body. `methodBody` has already proved that no
-    * `goto` sits inside a loop, so this changes nothing today; it is here so that if that
-    * proof is ever weakened, the failure is a `control:GOTO` hole rather than a `break`
-    * that silently leaves the wrong loop. */
+    * Used when descending into a loop body. `singleLabelOk`'s own `while(true){...;
+    * brk}` encoding is genuinely UNSOUND for a `goto` inside a loop -- `Stmt.brk`
+    * only exits the INNERMOST loop it is lexically inside, so a `goto` nested one
+    * level deeper than the synthetic wrapper would only escape that inner loop,
+    * landing in the wrong place -- so `gotoAsBreak` must never fire once execution
+    * has descended into a real loop, and `methodBody`'s own `singleLabelOk` check
+    * (`!insideLoop(g)`) already guarantees no goto using this mechanism sits inside
+    * one; this clears it anyway, so that if that proof is ever weakened, the
+    * failure is a `control:GOTO` hole rather than a `break` that silently leaves
+    * the wrong loop.
+    *
+    * `009-reduce-remaining-holes-4`, loop-nesting generalization: `gotoTailStmts`
+    * is deliberately NOT cleared here anymore (it was, originally, for the
+    * identical defense-in-depth reason `gotoAsBreak` still is). `multiLabelOk`'s
+    * own mechanism -- splicing a copy of a label's tail in place of the `goto`,
+    * guaranteed (by `tailAlwaysExits`) to bottom out in an unconditional `return`
+    * -- is SOUND regardless of how many loops/switches the `goto` is nested
+    * inside (`Stmt.ret` propagates through `.loop`/`.forIn`/`.breakBlock`
+    * unchanged; only `.brk` gets caught -- confirmed directly against
+    * `Semantics.lean`'s own `execStmt`). Clearing it here would have silently
+    * reintroduced the exact `control:GOTO` hole this whole generalization exists
+    * to remove, for every goto nested inside a loop -- found live, this session,
+    * the moment a loop-nested-goto fixture kept holing despite `multiLabelOk`
+    * itself evaluating `true`. */
   def outsideLoopScope[A](f: => A): A = {
-    val saved = gotoAsBreak
-    gotoAsBreak = None
+    val savedBreak = gotoAsBreak
+    gotoAsBreak    = None
     val r = f
-    gotoAsBreak = saved
+    gotoAsBreak   = savedBreak
     r
   }
 
@@ -3533,13 +5416,98 @@ import scala.annotation.tailrec
   }
 
   /** Assignment, including the augmented forms, to any of the three target shapes. */
+  /** `009-reduce-remaining-holes-4`: given the RHS of what MIGHT be a local cursor
+    * variable's single defining assignment, the `(base, offset)` pair to seed it
+    * with -- `p`'s own string binding, and `p$off`'s starting value -- or `None` if
+    * this RHS shape isn't one this mechanism can safely seed. Three shapes: `q ± n`/
+    * `n + q` (`q` an ALREADY-tracked cursor: `p` aliases `q`'s own original string,
+    * `p$off` starts at `q`'s CURRENT offset shifted by `n` -- a SNAPSHOT taken now,
+    * not an ongoing reference, since `p$off` is a fresh, independent Core local from
+    * this point on, exactly like every other plain local); or a plain (non-cursor)
+    * identifier/field access (`p` starts at position `0` of whatever ordinary value
+    * that expression currently holds -- `expr`'s own ordinary translation already
+    * handles either shape correctly as a value; C's own type system has already
+    * verified it is char*-compatible, since this is a plain `=` into a
+    * `char*`-declared local). Sees through any number of wrapping `<operator>.cast`
+    * layers first (`p = (char*)zStr;`), the same idiom
+    * `stripCastsForPointerCall`/`isNullLiteral` already see through elsewhere here.
+    *
+    * Deliberately excludes a BARE cursor identifier as RHS (`p = q;`, `q` already
+    * tracked, no arithmetic) -- not for a semantic reason (the `n = 0` case of the
+    * arithmetic shapes above would be the obvious answer) but a soundness one:
+    * `strCursorEligible` has no bucket accounting for "`q` appears as the bare RHS
+    * of some OTHER identifier's assignment" for `q` ITSELF, so admitting that shape
+    * here without ALSO adding and correctly gating that bucket would let `q` stay
+    * eligible while `p`'s OWN eligibility might independently fail for an unrelated
+    * reason, in which case `p` would fall through to the ordinary (non-cursor)
+    * case below -- `expr(q)`, `q`'s ORIGINAL, offset-0 string -- silently wrong if
+    * `q` had already advanced. Out of scope for the same reason local-to-local
+    * chains are (see the population call site below): correctly making it safe
+    * needs a fixed-point over eligibility this first version does not do. Missing
+    * this shape only means fewer locals qualify, never a wrong translation of one
+    * that does.
+    *
+    * Used identically at TWO sites that must never disagree: the population filter
+    * below (as a plain `.isDefined` guard -- ONLY a local whose one defining
+    * assignment has a seedable RHS may ever enter `strCursorParams` at all) and
+    * `assignTo`'s own matching case (which calls `.get` on the exact same input,
+    * guaranteed non-empty by that population-time guard already having run). */
+  def cursorBaseAndOffset(n: AstNode): Option[(ujson.Obj, ujson.Obj)] = n match {
+    case cst: Call if cst.methodFullName == "<operator>.cast" && kidsOf(cst).size == 2 =>
+      cursorBaseAndOffset(kidsOf(cst)(1))
+    case c: Call if (c.methodFullName == "<operator>.addition" || c.methodFullName == "<operator>.subtraction") &&
+                     kidsOf(c).size == 2 &&
+                     rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(strCursorParams.contains) &&
+                     !isCString(kidsOf(c)(1)) =>
+      val nm = rawLocalOrParamName(kidsOf(c)(0)).map(localName).get
+      val op = if (c.methodFullName == "<operator>.addition") "+" else "-"
+      Some((ujson.Obj("k" -> "name", "v" -> nm),
+            ujson.Obj("k" -> "binop", "op" -> op,
+                      "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")), "b" -> expr(kidsOf(c)(1)))))
+    case c: Call if c.methodFullName == "<operator>.addition" && kidsOf(c).size == 2 &&
+                     rawLocalOrParamName(kidsOf(c)(1)).map(localName).exists(strCursorParams.contains) &&
+                     !isCString(kidsOf(c)(0)) =>
+      val nm = rawLocalOrParamName(kidsOf(c)(1)).map(localName).get
+      Some((ujson.Obj("k" -> "name", "v" -> nm),
+            ujson.Obj("k" -> "binop", "op" -> "+",
+                      "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")), "b" -> expr(kidsOf(c)(0)))))
+    case _ if rawLocalOrParamName(n).exists(nm => !strCursorParams.contains(localName(nm))) =>
+      Some((expr(n), ujson.Obj("k" -> "int", "v" -> 0)))
+    case fa if asField(fa).isDefined =>
+      Some((expr(fa), ujson.Obj("k" -> "int", "v" -> 0)))
+    case _ => None
+  }
+
   def assignTo(lhs: AstNode, rhs: AstNode, aug: Option[String]): ujson.Obj = {
     val (prelude, rhsE) = valueOf(rhs)
+    // `009-reduce-remaining-holes-4`: a PLAIN (non-augmented) `asIndex` target whose
+    // index (or receiver) itself carries a value-producing side effect -- `arr[i++]
+    // = v`, SQLite's own extremely common "append and advance" idiom (`z[iOut++] =
+    // c`, `p->zBuf[p->nUsed++] = c`, `db->aVTrans[db->nVTrans++] = pVTab`) -- needs
+    // populating BEFORE the `asIndex` case below runs, since a plain assignment has
+    // no double-evaluation risk to guard against (unlike the augmented form: see
+    // that case's own `pureNode` gate, kept unchanged) and so is free to thread a
+    // prelude the same way `valueOf(rhs)` above already does for the RHS. Declared
+    // here, not inline in the `case` below, because `core`'s own `match` only
+    // produces the FINAL statement, and this needs to reach the function's own
+    // trailing `seqOf(prelude :+ core)`.
+    var indexPrelude = List.empty[ujson.Obj]
     def combine(cur: => ujson.Obj): ujson.Obj = aug match {
       case None     => rhsE
       case Some(op) => ujson.Obj("k" -> "binop", "op" -> op, "a" -> cur, "b" -> rhsE)
     }
     val core = lhs match {
+      // `009-reduce-remaining-holes-4`: `z += n`/`z -= n`, `z` a tracked byte cursor
+      // (`strCursorParams`) -- advances `z$off` by `n`, an ordinary integer local,
+      // leaving `z`'s own binding untouched. Checked BEFORE the general `cstr:
+      // pointer-arith` guard just below for the identical reason `incrStmt`'s own
+      // `strCursorParams` case is: `isCString(lhs)` would otherwise hole this first.
+      case i: Identifier if (aug.contains("+") || aug.contains("-")) &&
+                             strCursorParams.contains(localName(i.name)) =>
+        val offNm = localName(i.name) + "$off"
+        ujson.Obj("k" -> "assign", "x" -> offNm,
+                  "e" -> ujson.Obj("k" -> "binop", "op" -> aug.get,
+                                   "a" -> ujson.Obj("k" -> "name", "v" -> offNm), "b" -> rhsE))
       // `s += n` on a `char*` advances a pointer; see `cStringUnsafe`. The augmented form
       // never reaches `callExpr`, so it is guarded here too.
       case _ if cLikeFile && aug.isDefined && (isCString(lhs) || isCString(rhs)) =>
@@ -3564,10 +5532,39 @@ import scala.annotation.tailrec
       case i: Identifier if boxedArrays.contains(localName(i.name)) ||
                              boxedStructs.contains(localName(i.name)) =>
         skip
+      // `009-reduce-remaining-holes-4`: a LOCAL cursor variable's own single
+      // defining assignment (`strCursorParams`'s local-variable generalization,
+      // above) -- seeds BOTH halves of the pair at once, since unlike a PARAMETER
+      // cursor (already bound before the method's first statement, needing only
+      // its `$off` prologue) a local has no value at all until this exact
+      // statement runs. `aug.isEmpty` because a cursor local's `+=`/`-=` is
+      // already the EARLIER, unchanged case above (`z += n`); by the time THAT
+      // case's guard has already failed, `aug` being non-empty here would mean
+      // some OTHER augmented op entirely, which `cursorBaseAndOffset` (built only
+      // for a plain defining `=`) was never checked against at population time --
+      // excluded here defensively even though `strCursorEligible`'s own
+      // occurrence-accounting already guarantees a cursor local's only
+      // augmented-assignment-shaped occurrences (if any) are `+=`/`-=`, already
+      // spoken for by that earlier case. `cursorBaseAndOffset(rhs).isDefined` is
+      // guaranteed true here (the population-time filter already required it for
+      // ANY name that made it into `strCursorParams` as a local), but is checked
+      // again rather than assumed, so a parameter's name (which also lives in
+      // `strCursorParams`, but by construction never has a plain-`=` occurrence at
+      // all, per `strCursorEligible`'s default `allowDefiningAssign = false`)
+      // falls straight through to the ordinary case below instead of matching
+      // here vacuously.
+      case i: Identifier if aug.isEmpty && strCursorParams.contains(localName(i.name)) &&
+                             cursorBaseAndOffset(rhs).isDefined =>
+        val nm = localName(i.name)
+        val (base, off) = cursorBaseAndOffset(rhs).get
+        seqOf(List(ujson.Obj("k" -> "assign", "x" -> nm, "e" -> base),
+                   ujson.Obj("k" -> "assign", "x" -> (nm + "$off"), "e" -> off)))
       case i: Identifier =>
-        // At module scope, and for a name a `global` statement rebound, an assignment
-        // writes the module-level frame rather than creating a local.
-        val k = if (moduleScope || declaredGlobals.contains(i.name)) "setGlobal" else "assign"
+        // At module scope, for a name a `global` statement rebound, or (C-like
+        // files) a name that's a recognized file-scope global and not a local/
+        // parameter of THIS method, an assignment writes the module-level frame
+        // rather than creating a local -- see `isGlobalWrite`'s own doc comment.
+        val k = if (isGlobalWrite(i.name)) "setGlobal" else "assign"
         ujson.Obj("k" -> k, "x" -> localName(i.name),
                   "e" -> combine(ujson.Obj("k" -> "name", "v" -> localName(i.name))))
       // `*p = v` where `p` is PROVABLY, for its whole lifetime in this method, an
@@ -3601,6 +5598,23 @@ import scala.annotation.tailrec
         if (aug.isDefined && !pureNode(r)) holeS("assign:aug-impure-receiver")
         else ujson.Obj("k" -> "setField", "r" -> expr(r), "f" -> f,
                        "v" -> combine(ujson.Obj("k" -> "field", "a" -> expr(r), "f" -> f)))
+      // `009-reduce-remaining-holes-4`: `p[i] = v`, `p` a `ptrIrefNames`-tracked
+      // plain pointer -- write-side counterpart of `callExpr`'s matching read
+      // case (this same push; see its own doc comment for the cross-session bug
+      // report and the full reasoning). Without this, `p[i] = v` fell to the
+      // generic `asIndex` case below, emitting `Stmt.setIndex` against `p` read
+      // as an ordinary VALUE -- `setIndex`'s own value-semantics-container model
+      // has no case for a `.iref` receiver either, so this was the identical
+      // silent-wrong-at-runtime gap as the read side, just for a write. Checked
+      // BEFORE the boxed-array case just below (never the same name).
+      case ia if asIndex(ia).isDefined &&
+                 rawLocalOrParamName(asIndex(ia).get._1).map(localName).exists(ptrIrefNames.contains) =>
+        val (a, b) = asIndex(ia).get
+        val nm = rawLocalOrParamName(a).map(localName).get
+        val p = ujson.Obj("k" -> "binop", "op" -> "+",
+                          "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> expr(b))
+        ujson.Obj("k" -> "setDerefIref", "p" -> p,
+                  "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> p)))
       // `006-reduce-remaining-holes`, Story 5: `a[i] = v`, `a` a recognized boxed
       // array -- write side of `callExpr`'s matching `indexOps` read case.
       // Checked BEFORE the generic `asIndex` case just below.
@@ -3612,16 +5626,42 @@ import scala.annotation.tailrec
                           "i" -> expr(b))
         ujson.Obj("k" -> "setDerefIref", "p" -> p,
                   "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> p)))
-      case ia if asIndex(ia).isDefined =>
+      // `009-reduce-remaining-holes-4`: `s.arr[i] = v`/`p->arr[i] = v` -- the
+      // PLAIN (non-address-of) write-side counterpart of the `structArrIref`
+      // case `callExpr`'s own `<operator>.addressOf` dispatch already has (this
+      // same push). Reuses the IDENTICAL two eligibility helpers -- no new
+      // analysis, just the write side of the SAME already-verified mechanism.
+      case ia if asIndex(ia).isDefined &&
+                 (boxedStructArrayIndexOperand(ia).isDefined || pointerStructArrayIndexOperand(ia).isDefined) =>
+        val (structName, f, idxNode) =
+          boxedStructArrayIndexOperand(ia).orElse(pointerStructArrayIndexOperand(ia)).get
+        val p = ujson.Obj("k" -> "irefIndex",
+                          "a" -> ujson.Obj("k" -> "field", "a" -> ujson.Obj("k" -> "name", "v" -> structName), "f" -> f),
+                          "i" -> expr(idxNode))
+        ujson.Obj("k" -> "setDerefIref", "p" -> p,
+                  "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> p)))
+      case ia if asIndex(ia).isDefined && aug.isDefined =>
         val (a, b) = asIndex(ia).get
-        if (aug.isDefined && !(pureNode(a) && pureNode(b))) holeS("assign:aug-impure-target")
+        if (!(pureNode(a) && pureNode(b))) holeS("assign:aug-impure-target")
         else ujson.Obj("k" -> "setIndex", "r" -> expr(a), "i" -> expr(b),
                        "v" -> combine(ujson.Obj("k" -> "index", "a" -> expr(a), "b" -> expr(b))))
+      // Plain (non-augmented) form of the case just above: no double-evaluation
+      // risk (`combine` never forces its lazy argument when `aug` is `None`, so
+      // `a`/`b` are each read exactly once either way), so this is free to thread
+      // a prelude through `exprV` rather than requiring purity outright -- see
+      // `indexPrelude`'s own doc comment above for why SQLite's `arr[i++] = v`
+      // idiom needed exactly this.
+      case ia if asIndex(ia).isDefined =>
+        val (a, b) = asIndex(ia).get
+        val (pa, ae) = exprV(a)
+        val (pb, be) = exprV(b)
+        indexPrelude = pa ++ pb
+        ujson.Obj("k" -> "setIndex", "r" -> ae, "i" -> be, "v" -> rhsE)
       case c: Call if c.methodFullName.startsWith("<operator>") =>
         holeS("assign:lhs:" + c.methodFullName.stripPrefix("<operator>."))
       case other => holeS("assign:lhs:" + other.label)
     }
-    seqOf(prelude :+ core)
+    seqOf(prelude ++ indexPrelude :+ core)
   }
 
   /** `global a, b` — the names it rebinds. */
@@ -3654,8 +5694,17 @@ import scala.annotation.tailrec
     // any other scalar local -- `p`'s own binding holds the value directly.
     if (rawLocalOrParamName(tgt).map(localName).exists(ptrIrefNames.contains)) {
       val nm = rawLocalOrParamName(tgt).map(localName).get
-      val k = if (moduleScope || declaredGlobals.contains(nm)) "setGlobal" else "assign"
+      val k = if (isGlobalWrite(nm)) "setGlobal" else "assign"
       ujson.Obj("k" -> k, "x" -> nm, "e" -> bump(ujson.Obj("k" -> "name", "v" -> nm)))
+    }
+    // `009-reduce-remaining-holes-4`: `z++`/`z--`, `z` a tracked byte cursor
+    // (`strCursorParams`) -- bumps `z$off`, an ordinary integer local, leaving `z`'s
+    // own binding (the original string) untouched. Checked before the general
+    // pointer-target guard just below for the identical reason `ptrIrefNames` is:
+    // `isCString(tgt)` would otherwise hole this immediately.
+    else if (rawLocalOrParamName(tgt).map(localName).exists(strCursorParams.contains)) {
+      val offNm = rawLocalOrParamName(tgt).map(localName).get + "$off"
+      ujson.Obj("k" -> "assign", "x" -> offNm, "e" -> bump(ujson.Obj("k" -> "name", "v" -> offNm)))
     }
     else if (isPointerType(staticTypeOf(tgt)) || isCString(tgt)) holeS("op:" + opName + ":pointer")
     else tgt match {
@@ -3666,7 +5715,7 @@ import scala.annotation.tailrec
         val nm = localName(i.name)
         ujson.Obj("k" -> "setField", "r" -> boxRef(nm), "f" -> "v", "v" -> bump(boxField(nm)))
       case i: Identifier =>
-        val k = if (moduleScope || declaredGlobals.contains(i.name)) "setGlobal" else "assign"
+        val k = if (isGlobalWrite(i.name)) "setGlobal" else "assign"
         ujson.Obj("k" -> k, "x" -> localName(i.name),
                   "e" -> bump(ujson.Obj("k" -> "name", "v" -> localName(i.name))))
       case fa if asField(fa).isDefined =>
@@ -3715,6 +5764,15 @@ import scala.annotation.tailrec
     case fa if asField(fa).isDefined =>
       val (r, f) = asField(fa).get
       Some(ujson.Obj("k" -> "field", "a" -> expr(r), "f" -> f))
+    // `009-reduce-remaining-holes-4`: consistent with `assignTo`'s/`callExpr`'s
+    // own `ptrIrefNames` read (this same push) -- a plain `index` read would
+    // silently mistranslate identically to the `boxedArrays` case just below.
+    case ia if asIndex(ia).isDefined &&
+               rawLocalOrParamName(asIndex(ia).get._1).map(localName).exists(ptrIrefNames.contains) =>
+      val (a, b) = asIndex(ia).get
+      val nm = rawLocalOrParamName(a).map(localName).get
+      Some(ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "binop", "op" -> "+",
+        "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> expr(b))))
     // `006-reduce-remaining-holes`, Story 5: consistent with `assignTo`'s/
     // `callExpr`'s own boxed-array read -- a plain `index` read would silently
     // mistranslate (Core's `Expr.index` does not accept a `Val.iref` receiver).
@@ -3724,9 +5782,37 @@ import scala.annotation.tailrec
       val arrName = rawLocalOrParamName(a).map(localName).get
       Some(ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
         "a" -> ujson.Obj("k" -> "name", "v" -> arrName), "i" -> expr(b))))
+    // `009-reduce-remaining-holes-4`: `s.arr[i] = v`/`p->arr[i] = v` used AS A
+    // VALUE -- consistent with `assignTo`'s/`callExpr`'s own struct-array-field
+    // read (this same push); without this, a successful WRITE through this
+    // mechanism still fell through to `op:assignment`'s generic hole purely
+    // because this function couldn't construct the read-back.
+    case ia if asIndex(ia).isDefined &&
+               (boxedStructArrayIndexOperand(ia).isDefined || pointerStructArrayIndexOperand(ia).isDefined) =>
+      val (structName, f, idxNode) =
+        boxedStructArrayIndexOperand(ia).orElse(pointerStructArrayIndexOperand(ia)).get
+      Some(ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
+        "a" -> ujson.Obj("k" -> "field", "a" -> ujson.Obj("k" -> "name", "v" -> structName), "f" -> f),
+        "i" -> expr(idxNode))))
     case ia if asIndex(ia).isDefined =>
       val (a, b) = asIndex(ia).get
       Some(ujson.Obj("k" -> "index", "a" -> expr(a), "b" -> expr(b)))
+    // `009-reduce-remaining-holes-4` US4: `*p = v` used AS A VALUE (`if ((*p =
+    // compute()) != 0)`) -- `assignAsValue`'s own `proceed()` already lets
+    // `assignTo` write through `p` via `expr()`'s established `ptrIrefNames`/
+    // `ptrAliases`/`closedOutParams` machinery just fine (this is not a new
+    // write path), but reading the value straight back had no case here at
+    // all, so a write that succeeded still fell through to `op:assignment`'s
+    // generic hole purely because THIS function couldn't construct the read.
+    // Mirrors `expr()`'s own matching `<operator>.indirection` read case
+    // exactly -- same precedence (`ptrIrefNames` first, since `p` there reads
+    // straight through its own binding; `ptrAliases`/`closedOutParams` after,
+    // via `boxField`), reused rather than duplicated.
+    case c: Call if c.methodFullName == "<operator>.indirection" && kidsOf(c).size == 1 =>
+      val nm = rawLocalOrParamName(kidsOf(c)(0)).map(localName)
+      if (nm.exists(ptrIrefNames.contains))
+        Some(ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "name", "v" -> nm.get)))
+      else nm.flatMap(ptrAliases.get).orElse(nm.filter(closedOutParams.contains)).map(boxField)
     case _ => None
   }
 
@@ -3758,12 +5844,37 @@ import scala.annotation.tailrec
       }
     }
     lhs match {
+      // `009-reduce-remaining-holes-4`: `z += n`/`z++` used AS A VALUE, `z` a
+      // tracked byte cursor (`strCursorParams`) -- refused rather than guessed.
+      // `assignTo`'s own matching case correctly performs the SIDE EFFECT
+      // (`z$off := z$off ± n`), but there is no single Core value that honestly
+      // represents "the pointer after advancing" under this representation (`z`
+      // itself never changes, and this file does not reify a pointer value at
+      // all here, only the separate offset) -- `targetReadExpr`'s plain-Identifier
+      // case would otherwise silently hand back `z`'s ORIGINAL, unmoved string
+      // content as if it were the answer. Checked before the generic `Identifier`
+      // case below, which would otherwise reach exactly that silent-wrong path.
+      case i: Identifier if strCursorParams.contains(localName(i.name)) =>
+        (Nil, hole(genericLabel))
       case _: Identifier               => proceed()
       case fa if asField(fa).isDefined =>
         if (pureNode(asField(fa).get._1)) proceed() else (Nil, hole("assign:aug-impure-receiver"))
       case ia if asIndex(ia).isDefined =>
         val (a, b) = asIndex(ia).get
         if (pureNode(a) && pureNode(b)) proceed() else (Nil, hole("assign:aug-impure-target"))
+      // `009-reduce-remaining-holes-4`: `*p = v` used AS A VALUE. `targetReadExpr`
+      // already has its own matching case for exactly this shape (added earlier
+      // this same feature, its own doc comment says so explicitly) and
+      // `assignTo` (called by `proceed()` below) already writes through `p` via
+      // the established `ptrIrefNames`/`ptrAliases`/`closedOutParams` machinery
+      // -- but this dispatch itself never had a case admitting the shape in the
+      // first place, so every one fell through to the generic hole below
+      // WITHOUT EVER TRYING either already-built path, leaving both dead code
+      // for this one shape. Gated on purity of `p` itself (a bare name/parameter
+      // read, so always pure in practice), matching the SAME impure-receiver
+      // discipline the `asField`/`asIndex` cases just above already apply.
+      case c: Call if c.methodFullName == "<operator>.indirection" && kidsOf(c).size == 1 =>
+        if (pureNode(kidsOf(c).head)) proceed() else (Nil, hole("assign:aug-impure-target"))
       case _ => (Nil, hole(genericLabel))
     }
   }
@@ -3792,6 +5903,14 @@ import scala.annotation.tailrec
       }
     }
     tgt match {
+      // `009-reduce-remaining-holes-4`: `z++`/`z--` used AS A VALUE, `z` a tracked
+      // byte cursor -- same refusal, and the same reason, as `assignAsValue`'s own
+      // matching case just above: there is no single Core value honestly
+      // representing "the pointer after advancing" here, and `targetReadExpr`'s
+      // plain-Identifier case would otherwise silently hand back `z`'s ORIGINAL
+      // string content for either the pre- or post-bump "value".
+      case i: Identifier if strCursorParams.contains(localName(i.name)) =>
+        (Nil, hole(genericLabel))
       case _: Identifier               => proceed()
       case fa if asField(fa).isDefined =>
         if (pureNode(asField(fa).get._1)) proceed() else (Nil, hole("op:" + opName + ":impure-receiver"))
@@ -3807,7 +5926,7 @@ import scala.annotation.tailrec
     * that must run first plus the resulting value expression, in source evaluation
     * order. Every node shape that cannot itself contain such a construct -- the
     * overwhelming majority -- is the unchanged base case, `(Nil, expr(n))`. */
-  def exprV(n: AstNode): (List[ujson.Obj], ujson.Obj) = n match {
+  def exprV(n: AstNode): (List[ujson.Obj], ujson.Obj) = unwrapMacro(n) match {
     case c: Call if c.methodFullName == "<operator>.assignment" =>
       kidsOf(c) match {
         case lhs :: rhs :: Nil => assignAsValue(lhs, rhs, None, "op:assignment")
@@ -3825,6 +5944,21 @@ import scala.annotation.tailrec
           val opName = c.methodFullName.stripPrefix("<operator>.")
           incrAsValue(tgt, incrOps(c.methodFullName), opName, postfix = opName.startsWith("post"))
         case _ => (Nil, hole("op:" + c.methodFullName.stripPrefix("<operator>.") + ":arity"))
+      }
+    // `009-reduce-remaining-holes-4`: `p->pModule->xOpen(args)` reached in a
+    // PRELUDE-AWARE position -- try `expr`'s own existing resolution first
+    // (the functional-cast/`fnPtrVars`/`fieldFnTargets`/bare-variable paths,
+    // all already sound and BYTE-IDENTICAL for anything they already handle),
+    // and only on ITS OWN `op:pointerCall` hole fall back to
+    // `pointerCallFieldDynamic`'s temp-and-dispatch translation -- which
+    // NEEDS a prelude slot `expr` alone cannot provide, which is why this
+    // case lives here rather than being folded into `expr` itself.
+    case c: Call if c.methodFullName == "<operator>.pointerCall" =>
+      val baseline = expr(c)
+      if (!baseline.value.get("k").exists(_.str == "hole")) (Nil, baseline)
+      else {
+        val realArgs = kidsOf(c).filter(aidx(_) >= 1)
+        pointerCallFieldDynamic(c, realArgs).getOrElse((Nil, baseline))
       }
     // Compound-expression pass-through (research.md §3, point 2): thread and
     // concatenate sub-preludes left-to-right, matching source evaluation order.
@@ -3850,6 +5984,18 @@ import scala.annotation.tailrec
     // Story 5 rewrite there would silently never fire for an index reached via
     // `exprV` -- an `if`/`while`/`do`/`for` condition, a `return`/assignment-RHS
     // position, or any compound expression -- which is most real call sites).
+    // `009-reduce-remaining-holes-4`: `p[i]`, `p` a `ptrIrefNames`-tracked plain
+    // pointer -- mirrors `callExpr`'s own matching case (this same push, see its
+    // doc comment for the full bug report and reasoning) for the identical
+    // `exprV`-never-routes-through-`callExpr` reason the `boxedArrays` case just
+    // below already documents for itself.
+    case c: Call if indexOps.contains(c.methodFullName) && kidsOf(c).size == 2 &&
+                    rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(ptrIrefNames.contains) =>
+      val List(a, b) = kidsOf(c)
+      val nm = rawLocalOrParamName(a).map(localName).get
+      val (pb, be) = exprV(b)
+      (pb, ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "binop", "op" -> "+",
+        "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> be)))
     case c: Call if indexOps.contains(c.methodFullName) && kidsOf(c).size == 2 &&
                     rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(boxedArrays.contains) =>
       val List(a, b) = kidsOf(c)
@@ -3857,6 +6003,17 @@ import scala.annotation.tailrec
       val (pb, be) = exprV(b)
       (pb, ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
         "a" -> ujson.Obj("k" -> "name", "v" -> arrName), "i" -> be)))
+    // `009-reduce-remaining-holes-4`: `s.arr[i]`/`p->arr[i]` -- `exprV`'s own
+    // independent copy of `callExpr`'s matching case, same push, for the
+    // identical `exprV`-never-routes-through-`callExpr` reason documented above.
+    case c: Call if indexOps.contains(c.methodFullName) && kidsOf(c).size == 2 &&
+                    (boxedStructArrayIndexOperand(c).isDefined || pointerStructArrayIndexOperand(c).isDefined) =>
+      val (structName, f, idxNode) =
+        boxedStructArrayIndexOperand(c).orElse(pointerStructArrayIndexOperand(c)).get
+      val (pb, be) = exprV(idxNode)
+      (pb, ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "irefIndex",
+        "a" -> ujson.Obj("k" -> "field", "a" -> ujson.Obj("k" -> "name", "v" -> structName), "f" -> f),
+        "i" -> be)))
     case c: Call if indexOps.contains(c.methodFullName) && kidsOf(c).size == 2 =>
       val List(a, b) = kidsOf(c)
       val (pa, ae) = exprV(a); val (pb, be) = exprV(b)
@@ -3891,6 +6048,55 @@ import scala.annotation.tailrec
         else (prelude, ujson.Obj("k" -> "call", "f" -> baseline("f"),
                                  "args" -> ujson.Arr.from(recur.map(_._2) ++ argsArr.drop(posArgs.length))))
       }
+    // `009-reduce-remaining-holes-4`: `c ? t : e` where `t`/`e` may themselves need
+    // a prelude -- SQLite's own extremely common "optional vtable method" idiom,
+    // `pVfs->xDelete ? pVfs->xDelete(pVfs,zPath,dirSync) : SQLITE_OK`, where the
+    // pointerCall inside the TRUE branch needs `pointerCallFieldDynamic`'s own
+    // temp-assignment prelude (the `exprV` case for `<operator>.pointerCall`,
+    // above) -- but `callExpr`'s existing `cond` handling builds both branches via
+    // plain `expr()`, which has nowhere to put one, so the pointerCall's own
+    // baseline-hole fallback was all `expr()` could ever produce here, and
+    // `pointerCallFieldDynamic` was silently never even tried. Confirmed live:
+    // every one of `sqlite3OsSync`/`sqlite3OsDelete`/`sqlite3OsGetLastError`/...'s
+    // own remaining `op:pointerCall` sites is this exact shape.
+    //
+    // The condition's own prelude is always safe to hoist unconditionally (it
+    // always evaluates, in both branches). A branch's prelude is NOT: only the
+    // branch actually taken at runtime may run its side effects, so this cannot
+    // just concatenate both preludes before the value the way a plain `binop`'s
+    // two operands could -- it has to become a real `ifte` STATEMENT, assigning
+    // into one fresh temp so the overall expression still yields a value.
+    case c: Call if c.methodFullName == "<operator>.conditional" && kidsOf(c).size == 3 =>
+      val List(condN, trueN, falseN) = kidsOf(c)
+      val (condPrelude, condE) = exprV(condN)
+      val (tPrelude, tE) = exprV(trueN)
+      val (ePrelude, eE) = exprV(falseN)
+      if (tPrelude.isEmpty && ePrelude.isEmpty)
+        (condPrelude, ujson.Obj("k" -> "cond", "c" -> condE, "t" -> tE, "e" -> eE))
+      else {
+        val tmp = freshExprVTemp()
+        val ifStmt = ujson.Obj("k" -> "ifte", "c" -> condE,
+          "t" -> seqOf(tPrelude :+ ujson.Obj("k" -> "assign", "x" -> tmp, "e" -> tE)),
+          "e" -> seqOf(ePrelude :+ ujson.Obj("k" -> "assign", "x" -> tmp, "e" -> eE)))
+        (condPrelude :+ ifStmt, ujson.Obj("k" -> "name", "v" -> tmp))
+      }
+    // `009-reduce-remaining-holes-4`: `(void)e`, `e` IMPURE -- `callExpr`'s own
+    // cast-to-void handling keeps `e`'s effects by emitting `expr(e)` directly
+    // (the SAME "effects must survive, value is unreadable" reasoning as its own
+    // doc comment), which has nowhere to put a prelude -- so an impure `e` that is
+    // ITSELF a `pointerCall` needing `pointerCallFieldDynamic`'s temp-assignment
+    // prelude could never reach it, identical to the `cond` gap just above.
+    // Confirmed live: `robust_open`'s own `(void)osUnlink(z)` (`f & (O_EXCL|
+    // O_CREAT)`'s cleanup branch) and `sqlite3OsFileControlHint`'s guarded
+    // dispatch are both exactly this shape. Threads `exprV` on the operand
+    // instead ONLY for this one impure-void case; every other cast shape falls
+    // through to the unchanged `(Nil, expr(other))` fallback below, byte-identical
+    // to before.
+    case c: Call if c.methodFullName == "<operator>.cast" && kidsOf(c).size == 2 &&
+                    resolveIntType(staticTypeOf(kidsOf(c)(0))).isEmpty &&
+                    bareType(staticTypeOf(kidsOf(c)(0))) == "void" &&
+                    !pureExpr(kidsOf(c)(1)) =>
+      exprV(kidsOf(c)(1))
     case other => (Nil, expr(other))
   }
 
@@ -3909,8 +6115,7 @@ import scala.annotation.tailrec
           if isOp(tr._2, "<operator>.alloc") && kidsOf(tr._2).isEmpty
           cls <- ctorClassOf(ctor)
         } yield {
-          val k = if (moduleScope || declaredGlobals.contains(tr._1.name)) "setGlobal"
-                  else "assign"
+          val k = if (isGlobalWrite(tr._1.name)) "setGlobal" else "assign"
           ujson.Obj("k" -> k, "x" -> localName(tr._1.name),
                     "e" -> ujson.Obj("k" -> "alloc", "cls" -> cls,
                                      "args" -> exprs(kidsOf(ctor).filter(aidx(_) >= 1))))
@@ -4035,7 +6240,7 @@ import scala.annotation.tailrec
     seqOf(condPrelude ++ init ++ List(breakBlockStmt))
   }
 
-  def stmt(n: AstNode): ujson.Obj = n match {
+  def stmt(n: AstNode): ujson.Obj = unwrapMacro(n) match {
     case b: Block =>
       val kids = kidsOf(b)
       // An empty `kidsOf` is ambiguous by itself: it is the correct shape for a real
@@ -4051,6 +6256,24 @@ import scala.annotation.tailrec
       else forPattern(kids).getOrElse(seqOf(stmts(kids)))
     case l: Local => skip   // declarations carry no behaviour here
     case td: TypeDecl => skip   // a struct/union/typedef/class decl carries no behaviour either
+    // `009-reduce-remaining-holes-4`: `UNUSED_PARAMETER(x)`/`UNUSED_PARAMETER2(x,y)`,
+    // SQLite's own unused-parameter-warning suppressors (`sqliteInt.h`: `#define
+    // UNUSED_PARAMETER(x) (void)(x)`). No preprocessor runs here, so the macro
+    // invocation itself survives as a `Call` node -- but Joern ALSO attaches the
+    // macro's own expansion as a synthetic trailing `Block` child (confirmed live:
+    // `UNUSED_PARAMETER2(NotUsed, NotUsed2)`'s third child is a `Block` containing
+    // two `(void)(NotUsed)`/`(void)(NotUsed2)` cast calls), which is exactly the
+    // shape `blockExpr` exists to handle for `pysrc2cpg`'s OWN unrelated temp-
+    // binding lowering -- landing here by pure structural coincidence, not because
+    // this is that pattern, and holing under `expr:BLOCK-prelude` for a construct
+    // with no runtime semantics whatsoever. Same argument as `kernelMetaMacros`
+    // above: `(void)(x)` discards a pure read and produces no value anyone could
+    // observe, so `Stmt.skip` is the exact translation, not an approximation --
+    // matched by the macro's own clean `.name` (not `.methodFullName`, which
+    // carries a per-including-file prefix like `sqliteInt.h:UNUSED_PARAMETER:
+    // ANY(1)`), checked BEFORE any other Call case so the synthetic expansion
+    // Block is never even looked at.
+    case c: Call if c.name == "UNUSED_PARAMETER" || c.name == "UNUSED_PARAMETER2" => skip
     case r: Return =>
       kidsOf(r).headOption match {
         case Some(e) =>
@@ -4111,7 +6334,16 @@ import scala.annotation.tailrec
     // and why the trylock family is excluded (it returns a value).
     case c: Call if syncPrimitives.contains(c.methodFullName.split("\\.").last) =>
       syncElided += 1; skip
-    case c: Call => ujson.Obj("k" -> "exprS", "e" -> expr(c))
+    // `009-reduce-remaining-holes-4`: `exprV`, not plain `expr` -- a bare CALL
+    // statement (result discarded) is exactly where `p->pModule->xOpen(args);`,
+    // a `pointerCall` with no assignment around it at all, shows up, and
+    // `pointerCallFieldDynamic`'s own translation needs a prelude slot for its
+    // temp assignment that plain `expr` has nowhere to put. `exprV`'s own
+    // fallback for anything it does not handle specially is `(Nil, expr(n))`,
+    // so this is byte-identical to before for every OTHER call shape.
+    case c: Call =>
+      val (prelude, v) = exprV(c)
+      seqOf(prelude :+ ujson.Obj("k" -> "exprS", "e" -> v))
     case cs: ControlStructure =>
       val kids = kidsOf(cs)
       cs.controlStructureType match {
@@ -4168,10 +6400,16 @@ import scala.annotation.tailrec
         case "SWITCH" if kids.size >= 2 && !goFile => switchStmt(kids(0), kids(1))
         // `goto L` where `L` has been proved to be the single forward exit label of this
         // function, and this `goto` is not inside any loop or switch: see `methodBody`.
-        // Everything else keeps the `control:GOTO` hole.
         case "GOTO" if gotoAsBreak.isDefined &&
                        kids.map(_.code.trim) == List(gotoAsBreak.get) =>
           ujson.Obj("k" -> "brk")
+        // `goto L` where `L` is one of SEVERAL forward exit labels `methodBody` has
+        // proved safe (the multi-label generalization `gotoTailStmts` documents) --
+        // a fresh copy of `L`'s own tail, re-translated in place. Everything else
+        // (a backward jump, a jump into a loop, an unproven label) keeps the
+        // `control:GOTO` hole, exactly as before either mechanism existed.
+        case "GOTO" if kids.size == 1 && gotoTailStmts.contains(kids.head.code.trim) =>
+          seqOf(stmts(gotoTailStmts(kids.head.code.trim)))
         case "BREAK"    => ujson.Obj("k" -> "brk")
         case "CONTINUE" => ujson.Obj("k" -> "cont")
         case "ELSE" | "CATCH" | "FINALLY" => seqOf(kids.map(stmt))
@@ -4297,8 +6535,8 @@ import scala.annotation.tailrec
   // they are excluded rather than quietly padding the verifiable core. The file-level
   // `<module>`/`<global>` pseudo-methods are excluded from *this* list too, and re-added
   // below as initializers, so they never inflate the function count either.
-  val cLikeExts = List(".c", ".h", ".cpp", ".cc", ".hpp", ".java", ".js", ".ts", ".kt", ".go")
-  val cppExts   = List(".c", ".h", ".cpp", ".cc", ".hpp")
+  lazy val cLikeExts = List(".c", ".h", ".cpp", ".cc", ".hpp", ".java", ".js", ".ts", ".kt", ".go")
+  lazy val cppExts   = List(".c", ".h", ".cpp", ".cc", ".hpp")
 
   /** The name a method is exported under.
     *
@@ -4359,7 +6597,12 @@ import scala.annotation.tailrec
     *
     * Measured on `crypto/`: 234 functions contain a jump of this kind, 161 have a single
     * label, 105 of those are forward jumps to a tail label, and 82 also clear the loop
-    * condition. The other 152 keep `control:GOTO`, which is the honest answer for them. */
+    * condition. The other 152 kept `control:GOTO` until `009-reduce-remaining-holes-4`'s
+    * own multi-label generalization below -- see its doc comment for how a MULTIPLE-
+    * cascading-label function (SQLite's own dominant real shape: `goto cleanup;` to a
+    * shared error-handling tail, sometimes staged through more than one label) is
+    * handled too, without needing the "two nested wrappers" this comment used to name
+    * as the reason multiple labels stayed unsupported. */
   def methodBody(m: Method): ujson.Obj = {
     val body   = m.body
     val ks     = kidsOf(body)
@@ -4393,12 +6636,120 @@ import scala.annotation.tailrec
       ks.indexWhere(_ eq cur)
     }
     val targets = jumps.flatMap(g => kidsOf(g).map(_.code.trim)).distinct
-    val ok =
+    val singleLabelOk =
       jumps.nonEmpty && labels.size == 1 && idx >= 0 && (labels.head eq ks(idx)) &&
       targets == List(labels.head.name) &&
       jumps.forall(g => !insideLoop(g) && { val i = topIndex(g); i >= 0 && i < idx })
-    if (!ok) stmt(body)
-    else {
+
+    /** `009-reduce-remaining-holes-4`: the general case above's own named limit --
+      * "two labels need two nested wrappers and a choice about which" -- doesn't
+      * actually need wrappers at all. A bare `Stmt.brk` (what `Stmt.loop`/
+      * `Stmt.breakBlock` catch) is exactly as single-level as C's own `break`, so
+      * nesting more of either can never let one `break` cross more than its own
+      * innermost scope -- that is precisely why C itself has no multi-level break
+      * and reaches for `goto` instead. Trying to encode N labels as N nested
+      * loop-wrappers therefore cannot work, for the same reason the source needed
+      * `goto` rather than `break` in the first place; this file is not going to
+      * out-clever that.
+      *
+      * The actual fix is to stop trying to make `goto` INTO a break, and translate
+      * it as what it computationally IS instead: "run the rest of the function
+      * starting from here." For a FORWARD jump to a label that is a direct child of
+      * the function body, "the rest of the function starting from there" is simply
+      * the tail of one already-known statement list (`ks.drop(labelIndex + 1)`) --
+      * so a copy of it, re-translated in place at the `goto` site, is exactly as
+      * faithful a translation as the label itself falling through to it normally.
+      * This is a batch, one-time AST transform (`render_lean.py` runs once, ahead
+      * of any proof or execution), so duplicating that tail costs generated-Lean
+      * size, never correctness -- unlike inlining at RUNTIME, there is no risk of
+      * unbounded blowup from a cycle, because the SAME conditions the single-label
+      * case already requires (forward-only, top-level, never inside a loop) rule
+      * cycles out structurally: a jump can only ever reach a label AFTER its own
+      * position, so recursively re-translating a copied tail that itself contains
+      * a `goto` to a STILL-LATER label terminates by strict induction on label
+      * position, the same way the fixed-point loops elsewhere in this file
+      * terminate by their own bound.
+      *
+      * Confirmed live against this exact idiom: SQLite's `sqlite3Insert` has two
+      * labels, `insert_end` and `insert_cleanup`, `insert_cleanup` strictly after
+      * `insert_end` -- every `goto insert_cleanup` needs to skip `insert_end`'s own
+      * tail code, while falling through normally runs BOTH in sequence, exactly
+      * what a plain tail-copy from each label's own position reproduces without
+      * needing to know anything about how many labels came before it. */
+    // `009-reduce-remaining-holes-4`: a REAL soundness gap in the multi-label
+    // mechanism above, found by actually running its own generated Lean rather
+    // than by inspecting the export logic in isolation. `gotoTailStmts(label) =
+    // ks.drop(labelIndex + 1)` is spliced in PLACE OF the `goto` node itself --
+    // one statement, wherever it sits (often nested inside an `if`'s own
+    // then-branch). Once that spliced copy finishes running, if it does so by
+    // reaching its OWN end normally (`Ctl.normal`, not an early `.ret`/`.exn`),
+    // `execStmt`'s `.seq` case (Semantics.lean) does exactly what it always
+    // does after a NORMAL result: keeps going with whatever comes NEXT in the
+    // ENCLOSING sequence the `if` itself sits inside -- which is the ORIGINAL,
+    // never-removed code that the real `goto` was supposed to skip entirely.
+    // Confirmed live: a fixture (`GotoCheck.c`) with two labels and NO trailing
+    // `return` (a `void` function correctly falling off the end) produced
+    // generated Lean whose `if (e1 != 0) { <mid's tail, spliced> } else { skip
+    // }` is followed, UNCONDITIONALLY, by the ORIGINAL untouched tail -- so
+    // `record(100)` (which a real `goto mid` must skip) ran on EVERY call,
+    // `e1` true or false, and the mid/end tail code ran TWICE whenever `e1` was
+    // true. This was silently wrong, not a hole, on every CURRENTLY-COUNTED
+    // hole-free function using this mechanism whose trailing code does not
+    // itself force an exit -- exactly the failure Constitution Principle III
+    // forbids, and this file's own `singleLabelOk` doc comment is careful never
+    // to introduce (its `while(true){...; brk}` wrapper cannot have this
+    // problem: `Stmt.brk` is never `.normal`, so the loop's own unconditional
+    // trailing `brk` always fires before anything past the loop can run).
+    //
+    // Every jump's own target-tail is a SUFFIX of the SAME `ks`, so they all
+    // share one final element -- `ks.last` -- and it suffices to require THAT
+    // one statement to be an unconditional `return`: if it is, every spliced
+    // copy's own execution necessarily bottoms out in that same `.ret`
+    // (Ctl.ret, never `.normal`), so `.seq`'s "keep going" branch can never
+    // fire past it, at ANY nesting depth the splice happens to sit at.
+    // Deliberately narrow (a bare `Return` node, not e.g. an `if`/`else` where
+    // both branches return) -- broader recognition is a possible future
+    // extension, not a requirement for soundness, and this file's own
+    // precedent throughout is to accept a narrower, provably-safe subset over
+    // a broader, harder-to-verify one.
+    val tailAlwaysExits = ks.lastOption.exists(_.isInstanceOf[Return])
+    // `009-reduce-remaining-holes-4`, loop-nesting generalization: NO `!insideLoop(g)`
+    // check here, unlike `singleLabelOk` above -- and deliberately so, not an
+    // oversight. `insideLoop` was excluded historically because `singleLabelOk`'s
+    // OWN mechanism (`Stmt.brk` inside a synthetic `while(true){...}` wrapper) is
+    // UNSOUND for a nested goto: `Stmt.brk` only exits the INNERMOST loop it is
+    // lexically inside, so a `goto` nested K loops deep would only escape ONE of
+    // them, landing in the wrong place. `multiLabelOk`'s OWN mechanism is
+    // completely different -- it never uses `brk` at all, it SPLICES a copy of
+    // the target label's own tail in place of the `goto` node, wherever that node
+    // sits -- and `tailAlwaysExits` (just above) already guarantees that spliced
+    // copy's execution bottoms out in an unconditional `Stmt.ret`. Checked
+    // directly against `Semantics.lean`'s own `execStmt`: `.loop`'s `.brk` case is
+    // the ONLY Ctl variant it catches (`.ret`/`.exn`/`.hole`/`.outOfFuel` all fall
+    // through its `| (h₂, r) => (h₂, r)` catch-all, propagating unchanged), and
+    // `.breakBlock` (SWITCH's own lowering) is identical -- it catches ONLY
+    // `.brk`, explicitly not even `.cont`. So a `.ret` reached anywhere inside a
+    // spliced copy propagates cleanly through ANY number of enclosing
+    // `.loop`/`.forIn`/`.breakBlock` wrappers, all the way to the function's own
+    // top level, regardless of how many loops or switches the `goto` was nested
+    // inside. Measured live (diagnostic query, this push): 411 of 829 gotos on
+    // the bounded local corpus are inside a loop or switch -- the dominant
+    // reason a function fails BOTH mechanisms today -- so this one check removal
+    // is expected to be the single highest-leverage step available in the
+    // char*-unrelated hole families.
+    val multiLabelOk =
+      jumps.nonEmpty && labels.nonEmpty && tailAlwaysExits &&
+      labels.forall(l => ks.exists(_ eq l)) &&
+      targets.forall(t => labels.exists(_.name == t)) &&
+      jumps.forall { g =>
+        kidsOf(g).size == 1 && {
+          val targetName = kidsOf(g).head.code.trim
+          val gi = topIndex(g)
+          labels.find(_.name == targetName).exists(l => gi >= 0 && gi < ks.indexWhere(_ eq l))
+        }
+      }
+
+    if (singleLabelOk) {
       val saved = gotoAsBreak
       gotoAsBreak = Some(labels.head.name)
       val prefix = seqOf(stmts(ks.take(idx)))
@@ -4410,6 +6761,14 @@ import scala.annotation.tailrec
                                              "b" -> ujson.Obj("k" -> "brk"))),
         "b" -> suffix)
     }
+    else if (multiLabelOk) {
+      val saved = gotoTailStmts
+      gotoTailStmts = labels.map(l => l.name -> ks.drop(ks.indexWhere(_ eq l) + 1)).toMap
+      val result = stmt(body)
+      gotoTailStmts = saved
+      result
+    }
+    else stmt(body)
   }
 
   /** Translate one method with the right scope/dialect state installed. `isModule` marks
@@ -4429,6 +6788,8 @@ import scala.annotation.tailrec
     localTypes   = (m.local.l.map(l => l.name -> l.typeFullName) ++
                     m.parameter.l.map(pp => pp.name -> pp.typeFullName))
                    .filter(_._2 != "ANY").toMap
+    genuineLocalNames = m.local.l.filter(_.closureBindingId.isEmpty).map(_.name).toSet ++
+                        m.parameter.l.map(_.name).toSet
     currentFile  = m.filename
     declaredGlobals =
       m.body.ast.collect { case u: Unknown if u.code.trim.startsWith("global ") => u }
@@ -4505,7 +6866,9 @@ import scala.annotation.tailrec
         .toSet
       m.parameter.l
         .filter(p => derefOperands.contains(p.name) && !boxedLocals.contains(localName(p.name)))
-        .filter(p => closedOutParam(m, p.index))
+        .filter(p => closedOutParam(m, p.index) ||
+                     closedOutParamsTransitive.contains((m.fullName, p.index)) ||
+                     closedOutParamViaVtableTransitive.contains((mangledFullName(m.fullName), p.index)))
         .map(p => localName(p.name))
         .toSet
     }
@@ -4649,9 +7012,22 @@ import scala.annotation.tailrec
                 }
               case _ => false
             })
+            // `009-reduce-remaining-holes-4`: a BARE array-decay pass -- `nm` itself,
+            // no `&` at all (`sqlite3_snprintf(sizeof(zTab), zTab, ...)`) -- is
+            // semantically `&nm[0]`, and `closedIrefOutParam`/its transitive closure
+            // now accept exactly this shape too (see their own matching case) --
+            // reusing the SAME whole-program verification `elementOrFieldAddress`
+            // already relies on just below, not a new safety argument. Distinct from
+            // `elementOrFieldAddress` (which unwraps an explicit `&nm[i]`/`&nm.f`):
+            // `k` here is `nm` directly, un-wrapped, which is exactly what
+            // `rawLocalOrParamName` reads without needing to see through an
+            // `addressOf` at all.
+            val bareArrayDecay = rawLocalOrParamName(k).map(localName).contains(nm)
             val calleeIsInProgram = !c.methodFullName.startsWith("<operator>") && methodByName.contains(c.methodFullName)
-            (elementOrFieldAddress && calleeIsInProgram &&
-              methodByName.get(c.methodFullName).exists(callee => closedIrefOutParam(callee, aidx(k)))) ||
+            ((elementOrFieldAddress || bareArrayDecay) && calleeIsInProgram &&
+              methodByName.get(c.methodFullName).exists(callee =>
+                closedIrefOutParam(callee, aidx(k)) ||
+                closedIrefOutParamsTransitive.contains((callee.fullName, aidx(k))))) ||
             (wholeObjectAddress && calleeIsInProgram)
           }
         }
@@ -4681,8 +7057,8 @@ import scala.annotation.tailrec
       // size is never routed through the macro path, and a non-digit size that
       // `resolveMacroArraySize` cannot resolve (a `sizeof`, multi-term expression,
       // or macro not in this file's own table) falls through to `None` exactly as
-      // it did before this feature existed.
-      val arrayShapeAny = """^(.+)\[(.+)\]$""".r
+      // it did before this feature existed. (`arrayShapeAny` itself is now a
+      // top-level `lazy val` -- `009-reduce-remaining-holes-4` reuses it too.)
       val candidates = m.local.l.flatMap { l =>
         localTypes.get(l.name).flatMap { ty =>
           val bt = bareType(ty)
@@ -4694,16 +7070,70 @@ import scala.annotation.tailrec
             }
         }
       }.toMap
-      candidates.filter { case (nm, _) => nameSafelyBoxable(nm, wholeObjectAddressOk = false) }
+      // `009-reduce-remaining-holes-4`: `maxBoxableArraySize` -- a real, confirmed-
+      // live BUILD-BREAKING regression, not a hypothetical, and NOT limited to
+      // this push's own new struct-array-member mechanism (that val's own doc
+      // comment has the original bug report). This site had exactly the same gap
+      // from the moment `boxedArrays` was first built (006), just never TRIGGERED
+      // in practice until the CPP_DEFINES pipeline fix (this same push) unlocked
+      // previously-invisible TCL test-harness functions -- one of which
+      // (`test_db_config_lookaside`, a large local lookup table) hit the
+      // identical `maximum recursion depth` Lean elaboration failure the array-
+      // member cap was built for. Same fix, same cap, applied here for the first
+      // time now that a real corpus function has actually exercised it.
+      candidates.filter { case (_, n) => n <= maxBoxableArraySize }
+        .filter { case (nm, _) => nameSafelyBoxable(nm, wholeObjectAddressOk = false) }
     }
-    boxedStructs = if (moduleScope) Map.empty else {
-      val candidates = m.local.l.flatMap { l =>
-        localTypes.get(l.name).filter(isClassType).flatMap { ty =>
-          structTypeDeclOf(ty).map(td => localName(l.name) -> td.member.l.map(_.name))
+    // `009-reduce-remaining-holes-4`: struct TYPE DECLS collected once here (a
+    // plain local `val`, not a `var` -- nothing outside this block needs it),
+    // reused by BOTH `boxedStructs` below and `boxedStructArrayMembers` just
+    // after it, so a struct's member list is only ever read from the CPG once
+    // per candidate name.
+    val structCandidateDecls: Map[String, TypeDecl] =
+      if (moduleScope) Map.empty else (m.local.l ++ m.parameter.l).flatMap { l =>
+        val (name, isParam, ty) = l match {
+          case ll: Local             => (ll.name, false, localTypes.get(ll.name))
+          case pp: MethodParameterIn => (pp.name, true, localTypes.get(pp.name))
+          case _                     => ("", false, None)
         }
-      }.toMap
+        ty.filter(isClassType).flatMap(structTypeDeclOf).map { td =>
+          // `009-reduce-remaining-holes-4`: a PARAMETER (struct passed BY VALUE)
+          // with an array-typed member is excluded here, unlike a LOCAL -- a
+          // local's own prologue always starts EVERY member (array or scalar)
+          // from `unit`, exactly `boxedArrays`' own established convention for
+          // an uninitialized local array; a parameter, though, carries REAL
+          // incoming field values that must be preserved (`aggPrologues`' own
+          // `seedFrom` mechanism, this session's seventeenth push), and this
+          // first version does not attempt to copy an incoming array MEMBER's
+          // own elements one at a time -- only its SCALAR members. Boxing a
+          // parameter whose struct has an array member anyway would silently
+          // replace that member's real incoming contents with `unit` the
+          // moment the box is built, exactly the class of silent wrongness
+          // this file exists to refuse; simply not boxing that name at all (it
+          // keeps its existing hole) is the safe, honest alternative.
+          val hasArrayMember = isParam && td.member.l.exists(mm => arraySizeOf(mm.typeFullName, m.filename).isDefined)
+          (localName(name), hasArrayMember, td)
+        }
+      }.filterNot(_._2).map { case (nm, _, td) => nm -> td }.toMap
+    boxedStructs = if (moduleScope) Map.empty else {
+      val candidates = structCandidateDecls.map { case (nm, td) => nm -> td.member.l.map(_.name) }
       candidates.filter { case (nm, _) => nameSafelyBoxable(nm, wholeObjectAddressOk = true) }
     }
+    // `009-reduce-remaining-holes-4`: for each boxed struct NAME (locals only,
+    // per `structCandidateDecls`' own parameter exclusion above), its array-
+    // typed members and their resolved sizes -- consulted by `aggPrologues`
+    // (to nest a real, unit-filled sub-array box for that member instead of a
+    // bare `unit`) and by the new `&s.arr[i]`/`&p->arr[i]` address-of case in
+    // `callExpr` and `ptrIrefNames`, below. A member whose OWN size cannot be
+    // resolved (a `sizeof`, a VLA, a macro not in this file's table) is simply
+    // absent from this map, and `&s.thatMember[i]` keeps its existing hole --
+    // exactly `boxedArrays`' own precedent for a local array of unknown size.
+    boxedStructArrayMembers = if (moduleScope) Map.empty else
+      structCandidateDecls.filter { case (nm, _) => boxedStructs.contains(nm) }
+        .map { case (nm, td) =>
+          nm -> td.member.l.flatMap(mm => arraySizeOf(mm.typeFullName, m.filename).map(mm.name -> _)).toMap
+        }
+        .filter { case (_, arrMembers) => arrMembers.nonEmpty }
     // `006-reduce-remaining-holes`, Story 5: plain pointer locals PROVABLY, for
     // their whole lifetime, holding an interior pointer VALUE -- `p = &a[i]`,
     // `p = &s.f` (mirroring `ptrAliases`'s own whole-function single-assignment
@@ -4722,7 +7152,29 @@ import scala.annotation.tailrec
             kidsOf(rhs) match {
               case List(operand)
                   if boxedArrayIndexOperand(operand).isDefined ||
-                     boxedStructFieldOperand(operand).isDefined =>
+                     boxedStructFieldOperand(operand).isDefined ||
+                     // `009-reduce-remaining-holes-4`: `t = &p->f;`, `p` a PLAIN
+                     // pointer to a known struct type -- no boxing needed at all,
+                     // since `p`'s own value IS already its address (this file's
+                     // "a struct pointer is its own identity" convention;
+                     // `pointerStructFieldOperand`'s own doc comment has the full
+                     // reasoning). Reuses the IDENTICAL helper `callExpr`'s own
+                     // `<operator>.addressOf` case already trusts for the EXPRESSION
+                     // form of this exact shape (`structIref`, just above in this
+                     // file) -- no new eligibility logic, no new Core semantics,
+                     // just recognizing the SAME already-proven shape when its
+                     // result is stored into a name for later reuse instead of
+                     // used inline. `t`'s single assignment still requires
+                     // `assignCounts == 1`, matching every other bucket here.
+                     pointerStructFieldOperand(operand).isDefined ||
+                     // `009-reduce-remaining-holes-4`: `t = &s.arr[i];`/
+                     // `t = &p->arr[i];` -- the array-typed-member counterpart of
+                     // the two cases just above, same reasoning: reusing
+                     // `callExpr`'s own already-proven `structArrIref` helpers for
+                     // the "stored into a name" case instead of only the inline
+                     // expression case.
+                     boxedStructArrayIndexOperand(operand).isDefined ||
+                     pointerStructArrayIndexOperand(operand).isDefined =>
                 Some(localName(t.name))
               case _ => None
             }
@@ -4741,9 +7193,61 @@ import scala.annotation.tailrec
       // excluded when `p`'s OWN address is separately taken within this method
       // (`boxedLocals`), matching `closedOutParams`'s own disjointness precedent.
       m.parameter.l
-        .filter(p => closedIrefOutParam(m, p.index) && !boxedLocals.contains(localName(p.name)))
+        .filter(p => (closedIrefOutParam(m, p.index) ||
+                      closedIrefOutParamsTransitive.contains((m.fullName, p.index))) &&
+                     !boxedLocals.contains(localName(p.name)))
         .map(p => localName(p.name)).toSet
     }
+    // `009-reduce-remaining-holes-4`: `const char *` parameters eligible for
+    // byte-cursor tracking -- see `strCursorParams`'s own doc comment. Restricted to
+    // an actual `char*`/`char[]`-typed parameter (`isCString`) so this can never fire
+    // on an ordinary pointer already served by `ptrIrefNames`/`closedOutParams` above.
+    strCursorParams = (if (moduleScope) Nil else m.parameter.l)
+      .filter(p => isCString(p) && strCursorEligible(m, p.name))
+      .map(p => localName(p.name)).toSet
+    // `009-reduce-remaining-holes-4`: LOCAL variables, generalizing the mechanism
+    // above beyond parameters -- SQLite's own extremely common `char *zTail = zStr +
+    // 10;` / `char *p = q;` idiom (209 candidates measured across 173 methods on
+    // this session's own bounded local corpus). A local cannot get the unconditional
+    // function-entry prologue parameters get (it has no value until its own defining
+    // assignment runs), so instead its `$off` is seeded AT that one assignment
+    // (`assignTo`'s own new matching case, below) -- which is exactly why a local
+    // additionally needs its RHS shape checked here, via `cursorBaseAndOffset`, and
+    // not just the occurrence-accounting `strCursorEligible` already requires: unlike
+    // a parameter (already bound to a value the moment the method starts), a local's
+    // OWN single write is the one place that must independently produce BOTH halves
+    // of the pair (`p`'s string binding and `p$off`'s starting offset), so an RHS
+    // shape this cannot translate that way must disqualify the whole local, not just
+    // fall back to an ordinary (silently `$off`-less) assignment. Computed as a
+    // SECOND assignment to the same `var` (not merged into one filter above) so that
+    // `cursorBaseAndOffset`'s own "bare cursor identifier" / "cursor +/- int" cases
+    // can see this method's already-qualified PARAMETER cursors (`zTail = zStr + 10`,
+    // `zStr` a parameter) via the interim value of `strCursorParams` set just above --
+    // a local defined off ANOTHER newly-qualifying LOCAL cursor is out of scope (no
+    // fixed-point iteration here), which only means fewer locals qualify, never a
+    // wrong translation of one that does.
+    strCursorParams = strCursorParams ++ (if (moduleScope) Nil else m.local.l)
+      // `009-reduce-remaining-holes-4`: `isCStringType(l.typeFullName)`, NOT
+      // `isCString(l)` -- `nodeType`/`staticTypeOf` have no case for a raw `Local`
+      // DECLARATION node (only for a body-level Identifier/Call/... reference to
+      // one), so `isCString(l)` silently fell through to `direct = ""`, matching
+      // nothing, and disqualified every local candidate outright. Confirmed live:
+      // `zTail`'s own `typeFullName` reads `char*` correctly; `isCString(zTail)`
+      // (the Local node) read `false`. `l.typeFullName` is exactly what
+      // `localTypes` (this method's name-keyed type map, populated from
+      // `m.local.l` two lines below this whole block in `emit`) already holds for
+      // this same name, so this is not a new type-recovery path, just reading the
+      // one field a `Local` node already carries directly.
+      .filter(l => isCStringType(l.typeFullName) && strCursorEligible(m, l.name, allowDefiningAssign = true))
+      .filter { l =>
+        m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+          .find(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == l.name; case _ => false })
+          .exists(a => kidsOf(a) match {
+            case _ :: rhs :: Nil => cursorBaseAndOffset(rhs).isDefined
+            case _ => false
+          })
+      }
+      .map(l => localName(l.name)).toSet
     val body0 = methodBody(m)
     // `003-box-address-taken-locals`: allocate every boxed local's/parameter's cell
     // exactly once, unconditionally, before the translated body's first real
@@ -4766,22 +7270,61 @@ import scala.annotation.tailrec
     // `006-reduce-remaining-holes`, Story 5: the same unconditional-prologue
     // discipline as `boxedLocals` above, extended to arrays/structs -- every
     // field starts `unit` (Core's own "unassigned local" convention; `003`'s own
-    // precedent for a boxed LOCAL with no incoming value, and every array/struct
-    // this story boxes is a local, never a parameter, per the scope boundary).
-    def boxFieldsExpr(keys: List[String]): ujson.Obj =
+    // precedent for a boxed LOCAL with no incoming value) UNLESS `seedFrom` names
+    // a PARAMETER, in which case each field is seeded by READING it off the
+    // parameter's own CURRENT (still pre-rebind) incoming value instead --
+    // `009-reduce-remaining-holes-4`'s own extension of `boxedStructs` to
+    // parameters (see its doc comment) needs this: a struct passed BY VALUE
+    // already carries real field values from the caller, and seeding `unit`
+    // would silently discard them, the aggregate counterpart of the EXACT
+    // `boxRef(nm)`-vs-`unit` choice `prologues` (the SCALAR case, just above)
+    // already makes for a boxed scalar parameter. Safe for the identical reason
+    // that one is: `assign`'s own RHS is evaluated (reading `nm`'s OLD,
+    // still-unboxed binding via ordinary `Expr.field`) BEFORE the rebind to the
+    // new box takes effect, so there is no chicken-and-egg ordering problem.
+    // `009-reduce-remaining-holes-4`: `arrayMembers` -- a member NAME present here
+    // is itself array-typed (`boxedStructArrayMembers`, this struct's own entry)
+    // and gets a NESTED, unit-filled sub-array box (`boxedArrays`' own exact
+    // convention for a local array, recursively) instead of a bare `unit`/
+    // `seedFrom`-read value. Never combined with a non-empty `seedFrom` in
+    // practice -- `structCandidateDecls`' own population (`emit`) excludes any
+    // PARAMETER whose struct has an array member in the first place -- but kept
+    // as two independent, composable parameters rather than assuming that
+    // exclusion here too, so a future caller supplying both does not silently
+    // pick the wrong one.
+    def boxFieldsExpr(keys: List[String], seedFrom: Option[String] = None,
+                       arrayMembers: Map[String, Int] = Map.empty): ujson.Obj =
       ujson.Obj("k" -> "boxFields", "fields" -> ujson.Arr.from(
-        keys.map(k => (ujson.Arr(ujson.Str(k), ujson.Obj("k" -> "unit")): ujson.Value))))
+        keys.map { k =>
+          val v: ujson.Value = arrayMembers.get(k) match {
+            case Some(n) => boxFieldsExpr((0 until n).map(_.toString).toList)
+            case None =>
+              seedFrom.map(nm => ujson.Obj("k" -> "field", "a" -> ujson.Obj("k" -> "name", "v" -> nm), "f" -> k))
+                .getOrElse(ujson.Obj("k" -> "unit"))
+          }
+          ujson.Arr(ujson.Str(k), v)
+        }))
+    val boxedStructParamNames = m.parameter.l.map(_.name).map(localName).filter(boxedStructs.contains).toSet
     val aggPrologues: List[ujson.Obj] =
       boxedArrays.toList.sortBy(_._1).map { case (nm, n) =>
         ujson.Obj("k" -> "assign", "x" -> nm, "e" -> boxFieldsExpr((0 until n).map(_.toString).toList))
       } ++
       boxedStructs.toList.sortBy(_._1).map { case (nm, members) =>
-        ujson.Obj("k" -> "assign", "x" -> nm, "e" -> boxFieldsExpr(members))
+        val seedFrom = if (boxedStructParamNames.contains(nm)) Some(nm) else None
+        val arrayMembers = boxedStructArrayMembers.getOrElse(nm, Map.empty)
+        ujson.Obj("k" -> "assign", "x" -> nm, "e" -> boxFieldsExpr(members, seedFrom, arrayMembers))
       }
-    val allPrologues = prologues ++ aggPrologues
+    // `009-reduce-remaining-holes-4`: every byte-cursor parameter's own offset local
+    // starts at `0` -- `z` itself is the incoming parameter binding already, needing
+    // no re-init of its own, exactly like `ptrIrefNames`'s own parameters above.
+    val strCursorPrologues: List[ujson.Obj] = strCursorParams.toList.sorted.map { nm =>
+      ujson.Obj("k" -> "assign", "x" -> (nm + "$off"), "e" -> ujson.Obj("k" -> "int", "v" -> 0))
+    }
+    val allPrologues = prologues ++ aggPrologues ++ strCursorPrologues
     val body = if (allPrologues.isEmpty) body0 else seqOf(allPrologues :+ body0)
     moduleScope = false
     localTypes = Map.empty
+    genuineLocalNames = Set.empty
     valueReceivers = Set.empty
     ptrReceivers = Set.empty
     currentClass = None
@@ -4794,7 +7337,9 @@ import scala.annotation.tailrec
     fnPtrVars = Map.empty
     boxedArrays = Map.empty
     boxedStructs = Map.empty
+    boxedStructArrayMembers = Map.empty
     ptrIrefNames = Set.empty
+    strCursorParams = Set.empty
     // `self` is stripped ONLY for a method of a class, where `applyFunc` binds the
     // receiver itself. A MODULE-LEVEL function whose first parameter happens to be named
     // `self` is not a method and its `self` is an ordinary positional: cachetools defines
@@ -4857,11 +7402,48 @@ import scala.annotation.tailrec
   // at every real construction site — so it is neither user code nor reachable from user
   // code. Counting it inflated both the denominator and the hole-free numerator; excluding
   // it removes padding, not coverage, and the numbers below separate the two.
+  //
+  // `009-reduce-remaining-holes-4`: `<clinit>` joins the list for the same reason, on a C
+  // corpus this time rather than a C++ one -- confirmed live, this session, to be a
+  // per-TYPE-DECLARATION synthetic pseudo-method Joern's C frontend generates for a
+  // struct/union carrying an array-shaped member (`Bitvec.u.<clinit>:Bitvec.u()`,
+  // `CellArray.<clinit>:CellArray()`, ...), never called from anywhere and never itself
+  // calling anything -- there is no user code here, only the frontend's own bookkeeping,
+  // and the same "inflated both sides" argument applies (61 corpus-wide).
   val synthetic = List("<metaClassAdapter>", "<metaClassCallHandler>",
-                       "<global>", "<body>", "<fakeNew>")
+                       "<global>", "<body>", "<fakeNew>", "<clinit>")
+
+  /** `009-reduce-remaining-holes-4`: a pure PROTOTYPE declaration -- `SQLITE_API
+    * const char *sqlite3_column_database_name(sqlite3_stmt*,int);` in `sqlite3.h`,
+    * no `{...}` body anywhere in source -- confirmed live to be the dominant real
+    * shape (117 of 159 solo-`stmt:empty-ast-children`-blocked functions sampled
+    * this session) behind a label that looked like a translation gap but is
+    * actually a MEASUREMENT one: Joern still emits a `Method` node for the bare
+    * declaration (`isExternal=false`, since it is a local, not a library, symbol),
+    * with a synthetic zero-child `Block` whose leftover `.code` text (an attribute
+    * macro, the trailing declarator) is non-empty -- exactly `stmt:empty-ast-
+    * children`'s own trigger condition, reused verbatim here, but checked at the
+    * METHOD's own top-level body, not a nested block partway through real logic
+    * (that second, genuinely-different shape -- 13 of the 159 sampled -- is a real
+    * function with an actual dark-`#ifdef` block inside it, and stays exactly the
+    * hole it already is, unaffected by this filter). There is no real logic here
+    * to be hole-free OR holed about -- counting it inflated both the denominator
+    * and the hole-free numerator, mirroring this file's own adjacent precedent
+    * for `<metaClassCallHandler>` et al. immediately above: excluding it removes
+    * padding, not coverage. Deliberately NOT applied to a genuinely empty `{}`
+    * body (`stripBlockCode` empty there) -- that shape already translates
+    * correctly today (an empty statement sequence) and is real, if trivial, code,
+    * not measurement padding. */
+  def isBodylessDeclaration(m: Method): Boolean =
+    m.astChildren.l.collectFirst { case b: Block => b } match {
+      case Some(b) => b.astChildren.isEmpty && stripBlockCode(b.code).nonEmpty
+      case None    => false
+    }
+
   val methods = cpg.method.isExternal(false)
     .whereNot(_.nameExact("<module>"))
     .l.filterNot(m => synthetic.exists(m.fullName.contains))
+    .filterNot(isBodylessDeclaration)
     .take(maxMethods)
 
   // The file-level pseudo-method. It was previously excluded outright, which meant every

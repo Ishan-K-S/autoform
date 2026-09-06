@@ -964,6 +964,44 @@ def evalExpr (ctx : Ctx) : Nat → Heap → Env → Expr → Heap × EResult
           | _, _ => (h₂, .hole "index:unsupported")
         | (h₂, r) => (h₂, r)
       | (h₁, r) => (h₁, r)
+  -- `009-reduce-remaining-holes-4`: `Expr.strByte a b` -- read the byte at position
+  -- `b` of string `a`, as an `Int`. See `Syntax.lean`'s own doc comment for why this
+  -- is a separate constructor from `.index` rather than a new case on it. `a`'s own
+  -- length is a valid index (C's own implicit null terminator, `0`); anything past it
+  -- is undefined behaviour in C with no single correct answer, so it is a hole rather
+  -- than a guess. A negative index is guarded explicitly: `Int.toNat` silently clamps
+  -- a negative `Int` to `0`, which would otherwise alias `strByte s (-1)` to the FIRST
+  -- character rather than reporting the honest problem.
+  | n+1, h, ρ, .strByte a b =>
+      match evalExpr ctx n h ρ a with
+      | (h₁, .val (.str s)) =>
+        match evalExpr ctx n h₁ ρ b with
+        | (h₂, .val (.int i)) =>
+            let cs := s.toList
+            if i < 0 then (h₂, .hole "strByte:negative-index")
+            else if hh : i.toNat < cs.length then (h₂, .val (.int (Int.ofNat (cs[i.toNat]).toNat)))
+            else if i.toNat == cs.length then (h₂, .val (.int 0))
+            else (h₂, .hole "strByte:out-of-bounds")
+        | (h₂, .val _) => (h₂, .hole "strByte:non-integer-index")
+        | (h₂, r) => (h₂, r)
+      | (h₁, .val _) => (h₁, .hole "strByte:non-string-receiver")
+      | (h₁, r) => (h₁, r)
+  -- `009-reduce-remaining-holes-4`: `Expr.strFrom a b` -- the substring of string `a`
+  -- from position `b` onward. See `Syntax.lean`'s own doc comment: clamped like
+  -- `List.drop` for a start past the string's own length (the empty string, not a
+  -- hole), but a negative start is a hole -- the exporter never has a genuine reason
+  -- to produce one.
+  | n+1, h, ρ, .strFrom a b =>
+      match evalExpr ctx n h ρ a with
+      | (h₁, .val (.str s)) =>
+        match evalExpr ctx n h₁ ρ b with
+        | (h₂, .val (.int i)) =>
+            if i < 0 then (h₂, .hole "strFrom:negative-index")
+            else (h₂, .val (.str (String.ofList (s.toList.drop i.toNat))))
+        | (h₂, .val _) => (h₂, .hole "strFrom:non-integer-index")
+        | (h₂, r) => (h₂, r)
+      | (h₁, .val _) => (h₁, .hole "strFrom:non-string-receiver")
+      | (h₁, r) => (h₁, r)
   | n+1, h, ρ, .field a f =>
       match evalExpr ctx n h ρ a with
       | (h₁, .val (.ref r)) =>
