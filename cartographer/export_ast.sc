@@ -2282,8 +2282,11 @@ import scala.annotation.tailrec
     * one field name per `;`-terminated segment -- either a function-pointer
     * declarator's own `(*NAME)` group, or a plain trailing identifier before
     * an optional `[...]`. A struct containing a NESTED brace (an anonymous
-    * union/struct member), a multi-declarator line (`int a, b;`), or a
-    * bitfield is never matched -- none of those can be safely read by this
+    * union/struct member) has that block's own content stripped first
+    * (`stripNestedBraces`, just below) so the nested member still counts as
+    * exactly one correctly-positioned field, without this scheme trying (and
+    * failing) to read INSIDE it. A multi-declarator line (`int a, b;`) or a
+    * bitfield is still never matched -- neither can be safely read by this
     * scheme -- and any single segment this cannot cleanly read a name from
     * bails the WHOLE struct to `None`: a member order this cannot prove
     * correct must never silently mis-align a later field. */
@@ -2318,31 +2321,63 @@ import scala.annotation.tailrec
       }
     })
 
+  /** `010-reach-90pct-hole-free` US2/US4: collapses every balanced `{...}` block
+    * in `s` to nothing, leaving the surrounding declarator text intact -- e.g.
+    * `union MemValue { double r; i64 i; ...; } u;` becomes `union MemValue  u;`.
+    * Depth-tracked (mirrors `structBodyText`'s own boundary-finding scan just
+    * above), not a single-level regex, so a doubly-nested anonymous
+    * struct-in-union still collapses correctly rather than leaving a stray `}`
+    * that would corrupt every segment after it.
+    *
+    * Exists because `structFieldOrder`/`fieldTypeHasPointerFromText` below used
+    * to bail their ENTIRE struct to `None` the moment its body contained ANY
+    * `{` at all -- correct for a struct genuinely too irregular to segment
+    * safely (a nested brace's own `;`s would misalign the naive split), but far
+    * too conservative for SQLite's own extremely common "anonymous union
+    * member holds several typed alternatives" idiom (confirmed live:
+    * `sqlite3_value`/`Mem`'s own `union MemValue { ... } u;`), where the field
+    * this file actually needs -- `z`, `sqlite3_value`'s OWN top-level string
+    * pointer -- sits OUTSIDE the union entirely and was never really
+    * ambiguous. Stripping the nested block's CONTENT (not just skipping the
+    * bail) keeps the surrounding semicolon boundaries correctly aligned: `u`
+    * itself is still read as exactly one field, at its correct position,
+    * simply with its own interior members left unresolved (honestly still
+    * `None` if asked about, never guessed) -- a strict improvement, not a
+    * weaker check, since nothing previously resolvable becomes unresolvable. */
+  def stripNestedBraces(s: String): String = {
+    val sb = new StringBuilder
+    var depth = 0
+    for (ch <- s) {
+      if (ch == '{') depth += 1
+      else if (ch == '}') { if (depth > 0) depth -= 1 }
+      else if (depth == 0) sb.append(ch)
+    }
+    sb.toString
+  }
+
   lazy val structFieldOrderCache = scala.collection.mutable.Map.empty[String, Option[List[String]]]
   def structFieldOrder(td: TypeDecl): Option[List[String]] =
     structFieldOrderCache.getOrElseUpdate(td.fullName, {
       structBodyText(td) match {
         case None => None
-        case Some(body) =>
-          if (body.contains("{")) None
-          else {
-            val cleaned = body.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
-            val segments = cleaned.split(";").map(_.trim).filter(_.nonEmpty)
-            val fnPtrName = """\(\s*\*\s*([A-Za-z_]\w*)\s*\)""".r
-            val plainName = """^.*[\s\*]([A-Za-z_]\w*)(?:\s*\[[^\]]*\])?$""".r
-            val names = segments.map { seg =>
-              // A function-pointer field's own argument list is riddled with commas
-              // (`int (*xCreate)(sqlite3*, void*, int, ...)`) -- those are not the
-              // multi-declarator/bitfield shapes this must refuse, so the comma/colon
-              // bail applies only to the plain-field fallback, never before trying the
-              // function-pointer pattern first.
-              fnPtrName.findFirstMatchIn(seg).map(_.group(1)).orElse {
-                if (seg.contains(",") || seg.contains(":")) None
-                else seg match { case plainName(nm) => Some(nm); case _ => None }
-              }
+        case Some(rawBody) =>
+          val body = stripNestedBraces(rawBody)
+          val cleaned = body.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
+          val segments = cleaned.split(";").map(_.trim).filter(_.nonEmpty)
+          val fnPtrName = """\(\s*\*\s*([A-Za-z_]\w*)\s*\)""".r
+          val plainName = """^.*[\s\*]([A-Za-z_]\w*)(?:\s*\[[^\]]*\])?$""".r
+          val names = segments.map { seg =>
+            // A function-pointer field's own argument list is riddled with commas
+            // (`int (*xCreate)(sqlite3*, void*, int, ...)`) -- those are not the
+            // multi-declarator/bitfield shapes this must refuse, so the comma/colon
+            // bail applies only to the plain-field fallback, never before trying the
+            // function-pointer pattern first.
+            fnPtrName.findFirstMatchIn(seg).map(_.group(1)).orElse {
+              if (seg.contains(",") || seg.contains(":")) None
+              else seg match { case plainName(nm) => Some(nm); case _ => None }
             }
-            if (names.nonEmpty && names.forall(_.isDefined)) Some(names.map(_.get).toList) else None
           }
+          if (names.nonEmpty && names.forall(_.isDefined)) Some(names.map(_.get).toList) else None
       }
     })
 
@@ -2370,7 +2405,7 @@ import scala.annotation.tailrec
     * negative answer, so a struct this scheme cannot read never gets miscounted as
     * "confirmed not a pointer." */
   def fieldTypeHasPointerFromText(td: TypeDecl, field: String): Option[Boolean] =
-    structBodyText(td).filterNot(_.contains("{")).flatMap { body =>
+    structBodyText(td).map(stripNestedBraces).flatMap { body =>
       val cleaned = body.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
       val segments = cleaned.split(";").map(_.trim).filter(_.nonEmpty)
       val fnPtrName = """\(\s*\*\s*([A-Za-z_]\w*)\s*\)""".r
