@@ -1866,19 +1866,37 @@ import scala.annotation.tailrec
     * unrelated axis this feature's own per-array recursion depth was never
     * accounted against), so it is deliberately conservative rather than tuned
     * to the exact failure threshold. */
-  // `009-reduce-remaining-holes-4`: tried raising this to 256 (still nearly two
-  // orders of magnitude below the 8,192-element size that actually broke the
-  // build via `maxRecDepth`, this file's own doc comment above has that
-  // incident) -- but on the FULL corpus, combined with this same push's own
-  // CPP_DEFINES fix (which alone already grew the corpus by 334 previously-
-  // invisible functions), 256 pushed a DIFFERENT resource limit: the Lean
-  // build was SIGKILL'd (exit 137, an OOM kill) rather than hitting a
-  // recursion-depth error. Reverted to the original, already-verified-safe 64
-  // rather than spend further time tuning a value between the two under this
-  // session's own time budget -- a real, deliberate, conservative choice, not
-  // an oversight if `boxedStructArrayMembers`'s own reach looks narrower than
-  // its raw occurrence count would suggest.
-  val maxBoxableArraySize = 64
+  // `010-reach-90pct-hole-free` US1/US5: the root cause was never the SIZE of
+  // the array -- it was the REPRESENTATION. `boxFieldsExpr`'s own unit-filled
+  // numeric-range case (`(0 until n).map(_.toString).toList`, used by BOTH
+  // this array-member mechanism and `boxedArrays` below) rendered as a
+  // LITERAL Lean list of N pairs, which elaborates as N nested cons cells --
+  // exactly the mechanism `Autoform/Generated/IdentityCast.lean`'s own
+  // top-of-file comment already documents for a completely different list
+  // (`funcs := [...]`), and exactly what raising this cap to 256 traded one
+  // failure (`maxRecDepth`) for another (OOM) instead of fixing, per the
+  // history below. `boxRangeExpr` (this file, search "boxFieldsRange") emits
+  // a COMPUTED list (`List.range n |>.map ...`) instead of a literal one for
+  // this exact always-unit-filled shape -- a Lean term of CONSTANT size
+  // regardless of `n`. Confirmed live via a standalone experiment
+  // (`Autoform/Generated/ArrayRepExperiment.lean`): the literal form fails at
+  // n=8,192 with the identical `maximum recursion depth` error this cap was
+  // built to avoid; the computed form elaborates AND evaluates cleanly at
+  // the SAME n, with Lean's default `maxRecDepth`, no increase needed. The
+  // cap below is now a generous SANITY bound only (a corrupted/absurd macro
+  // resolving to something unreasonable), not a load-bearing architectural
+  // limit -- see `boxRangeExpr`'s own doc comment for the full argument.
+  //
+  // History kept for context: originally 64, tried raising to 256 (still two
+  // orders of magnitude below the 8,192-element size that broke the build
+  // via `maxRecDepth`) -- on the full corpus, combined with this same
+  // session's own `CPP_DEFINES` fix (which alone grew the corpus by 334
+  // previously-invisible functions), 256 pushed a DIFFERENT resource limit:
+  // the Lean build was SIGKILL'd (exit 137, an OOM kill) rather than hitting
+  // a recursion-depth error -- reverted to 64 at the time rather than tune a
+  // value between the two under that push's own time budget, since the cap
+  // itself was never the right fix.
+  val maxBoxableArraySize = 1000000
 
   /** the literal-integer-or-resolvable-macro size of a bare type string, for
     * `boxedStructs`' array-typed MEMBER candidates -- mirrors `boxedArrays`' own
@@ -7388,12 +7406,30 @@ import scala.annotation.tailrec
     // as two independent, composable parameters rather than assuming that
     // exclusion here too, so a future caller supplying both does not silently
     // pick the wrong one.
+    // `010-reach-90pct-hole-free` US1/US5: a plain, unit-filled numeric-range
+    // box (`boxedArrays`' own local-array shape, and `boxedStructArrayMembers`'
+    // nested array-member shape below -- both always call `boxFieldsExpr` with
+    // no `seedFrom` and keys `"0".."n-1"`, never any other pattern in
+    // practice) renders as a COMPUTED Lean list (`List.range n |>.map ...`)
+    // instead of `boxFieldsExpr`'s own literal-pair-list rendering below --
+    // a Lean term of CONSTANT size regardless of `n`, avoiding the
+    // elaboration-recursion-depth wall a literal list of N pairs hits at
+    // real buffer sizes. See `maxBoxableArraySize`'s own doc comment for the
+    // live experiment that confirmed this (`ArrayRepExperiment.lean`) and
+    // `render_lean.py`'s `"boxFieldsRange"` case for the emitted Lean syntax.
+    // Evaluates to EXACTLY the same `List (Expr × Expr)` value `boxFieldsExpr`
+    // would have built by unrolling -- `Expr.boxFields` itself, and every
+    // semantics/proof consuming it (`evalPairs`, `sizeP`, `holesP`), is
+    // completely unchanged; only how the ARGUMENT is spelled as Lean source
+    // text differs. */
+    def boxRangeExpr(n: Int): ujson.Obj = ujson.Obj("k" -> "boxFieldsRange", "n" -> n)
+
     def boxFieldsExpr(keys: List[String], seedFrom: Option[String] = None,
                        arrayMembers: Map[String, Int] = Map.empty): ujson.Obj =
       ujson.Obj("k" -> "boxFields", "fields" -> ujson.Arr.from(
         keys.map { k =>
           val v: ujson.Value = arrayMembers.get(k) match {
-            case Some(n) => boxFieldsExpr((0 until n).map(_.toString).toList)
+            case Some(n) => boxRangeExpr(n)
             case None =>
               seedFrom.map(nm => ujson.Obj("k" -> "field", "a" -> ujson.Obj("k" -> "name", "v" -> nm), "f" -> k))
                 .getOrElse(ujson.Obj("k" -> "unit"))
@@ -7403,7 +7439,7 @@ import scala.annotation.tailrec
     val boxedStructParamNames = m.parameter.l.map(_.name).map(localName).filter(boxedStructs.contains).toSet
     val aggPrologues: List[ujson.Obj] =
       boxedArrays.toList.sortBy(_._1).map { case (nm, n) =>
-        ujson.Obj("k" -> "assign", "x" -> nm, "e" -> boxFieldsExpr((0 until n).map(_.toString).toList))
+        ujson.Obj("k" -> "assign", "x" -> nm, "e" -> boxRangeExpr(n))
       } ++
       boxedStructs.toList.sortBy(_._1).map { case (nm, members) =>
         val seedFrom = if (boxedStructParamNames.contains(nm)) Some(nm) else None

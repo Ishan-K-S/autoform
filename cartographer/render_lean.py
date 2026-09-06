@@ -144,6 +144,24 @@ def expr_shape(n):
     if k == "boxFields":
         pairs = [[{"k": "str", "v": key}, val] for key, val in f('fields')]
         return ".boxFields", [("ps", pairs)]
+    # `010-reach-90pct-hole-free` US1/US5: a plain, unit-filled numeric-range
+    # box (`export_ast.sc`'s own `boxRangeExpr` -- see its doc comment for the
+    # full argument and the live experiment that motivated this) -- rendered
+    # as a COMPUTED Lean list (`List.range n |>.map ...`) instead of unrolling
+    # `n` literal pairs the way `"boxFields"` above does. Evaluates to exactly
+    # the same `List (Expr × Expr)` value a literal `[("0", .unit), ("1",
+    # .unit), ...]` of length `n` would, so `Expr.boxFields`'s own semantics
+    # (`evalPairs`) are completely unaffected -- only the SOURCE TEXT spelling
+    # the argument differs, and it differs at CONSTANT size regardless of `n`,
+    # avoiding the elaboration-recursion-depth wall a literal list of this
+    # shape hits at real buffer sizes (confirmed: `ArrayRepExperiment.lean`).
+    if k == "boxFieldsRange":
+        n = f('n')
+        if not isinstance(n, int) or n < 0:
+            raise ValueError(f"boxFieldsRange node has invalid n: {n!r}")
+        atom = (f"((List.range {n}).map (fun i => "
+                f"(Expr.lit (Lit.str s!\"{{i}}\"), Expr.lit Lit.unit)))")
+        return ".boxFields", [("atom", atom)]
     if k == "irefIndex": return ".irefIndex", [("e", f('a')), ("e", f('i'))]
     if k == "irefField": return ".irefField", [("e", f('a')), ("atom", lean_str(f('f')))]
     if k == "derefIref": return ".derefIref", [("e", f('p'))]
