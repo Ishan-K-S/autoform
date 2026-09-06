@@ -1113,6 +1113,21 @@ import scala.annotation.tailrec
     * `cstr:pointer-arith`/`op:postIncrement:pointer`/... holes, never a guess. */
   var strCursorParams = Set.empty[String]
 
+  /** `010-reach-90pct-hole-free` US4: for each name in `strCursorParams`, the plain
+    * identifier its value ultimately traces back to -- a parameter is its own base
+    * (it IS the original value, `$off` starts at 0); a local's base is whatever
+    * plain name `cursorBaseAndOffset` resolved its one defining assignment's RHS
+    * to (`p = zStr + 10;` -> base `"zStr"`, whether `zStr` is itself a parameter
+    * cursor or an ordinary untracked name -- both shapes produce a `{"k":"name",
+    * "v":X}` base object, and X is exactly what this map records). Two cursors
+    * sharing the same base name are provably measuring offsets into the SAME
+    * underlying string value, so their `$off`s are directly, soundly comparable --
+    * see the `<`/`<=`/`>`/`>=`/`==`/`!=` case in `expr` below, the only consumer.
+    * `None`/absent for a base that is not a plain name (a field access via
+    * `asField`) -- conservative, not a new gap: comparisons involving that shape
+    * simply fall through to the existing hole, exactly as before this feature. */
+  var strCursorBase = Map.empty[String, String]
+
   /** `(owning type, member name) -> member type`, for the whole program.
     *
     * `007-reduce-remaining-holes-2`: Joern's C frontend emits multiple `TypeDecl`
@@ -1369,6 +1384,21 @@ import scala.annotation.tailrec
       val nullChecks = m.body.ast.isCall.filter(c => c.methodFullName == "<operator>.equals" ||
                                                       c.methodFullName == "<operator>.notEquals").l
         .count(c => kidsOf(c).exists { case i: Identifier => i.name == paramName; case _ => false })
+      // `010-reach-90pct-hole-free` US4: `p < end` / `p <= end` / ... -- the four
+      // ORDERING comparisons had no bucket at all (only `==`/`!=`, named
+      // `nullChecks` above but in fact counting ANY operand occurrence of those
+      // two operators, not merely a literal-null check) -- meaning a cursor used
+      // in the single most common byte-cursor idiom, a bounded scan loop
+      // (`while (p < end) ...`), was DISQUALIFIED from `strCursorParams`
+      // entirely, since this occurrence fit no existing bucket. Counted the same
+      // way `nullChecks` counts its own two operators, so translation
+      // (`expr`'s new same-base-cursor-comparison case) and eligibility agree on
+      // exactly which occurrences are accounted for. */
+      val orderComparisons = m.body.ast.isCall.filter(c => c.methodFullName == "<operator>.lessThan" ||
+                                                            c.methodFullName == "<operator>.lessEqualsThan" ||
+                                                            c.methodFullName == "<operator>.greaterThan" ||
+                                                            c.methodFullName == "<operator>.greaterEqualsThan").l
+        .count(c => kidsOf(c).exists { case i: Identifier => i.name == paramName; case _ => false })
       val callArgs = m.body.ast.isCall.filter(c => !c.methodFullName.startsWith("<operator>") &&
                                                     c.methodFullName != "<unknownFullName>").l
         .map(c => kidsOf(c).count { k => aidx(k) >= 1 && (k match {
@@ -1400,8 +1430,34 @@ import scala.annotation.tailrec
             (c.methodFullName == "<operator>.addition" && rightIsParam && !isCString(a))
           case _ => false
         })
-      (reads + indexReads) > 0 &&
-      (reads + incrs + advances + nullChecks + callArgs + indexReads + defAssigns + arithOperands) == allRefs.size &&
+      // `010-reach-90pct-hole-free` US4: `zStart = zNum;` -- a cursor's CURRENT
+      // value copied (by plain assignment) into some OTHER, non-cursor variable.
+      // Not `defAssigns` (that bucket is `paramName` on the LEFT of its OWN
+      // single defining assignment); this is `paramName` on the RIGHT of a
+      // DIFFERENT variable's assignment -- a bare value read, translated
+      // identically to `callArgs`' own "z passed whole to another function" case
+      // (`expr`'s `Identifier` dispatch has exactly one rule for a tracked
+      // cursor's bare read, `strFrom`, reused for every context that reads one,
+      // not just a call argument) -- so eligibility must count it the same way
+      // callArgs does, or a function assigning its cursor to a plain local
+      // (SQLite's own `zStart = zNum;`, saving a start-of-token position) is
+      // wrongly disqualified entirely over an occurrence its own translation
+      // already handles soundly. */
+      val assignRhsReads = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+        .count(c => kidsOf(c) match {
+          case (lhs: Identifier) :: (rhs: Identifier) :: Nil => lhs.name != paramName && rhs.name == paramName
+          case _ => false
+        })
+      // `010-reach-90pct-hole-free` US4: `orderComparisons` joins the "at least one
+      // real occurrence" guard too -- a pure scan BOUND like `zEnd` above (`zEnd =
+      // zNum + length;`, then only ever compared against, never itself
+      // dereferenced or indexed) has `reads == indexReads == 0` by construction,
+      // and requiring one of those would wrongly disqualify exactly the variable
+      // this push's own fix exists to track. Tracking a name for comparison
+      // purposes alone is sound: its `(base, offset)` pair is well-defined
+      // whether or not the name is ever dereferenced.
+      (reads + indexReads + orderComparisons) > 0 &&
+      (reads + incrs + advances + nullChecks + orderComparisons + callArgs + indexReads + defAssigns + arithOperands + assignRhsReads) == allRefs.size &&
       (!allowDefiningAssign || defAssigns == 1)
     }
   }
@@ -4615,6 +4671,33 @@ import scala.annotation.tailrec
                                  "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")),
                                  "b" -> expr(kids(0))))
     }
+    // `010-reach-90pct-hole-free` US4: `p < end` / `p == q` / ... -- TWO tracked
+    // byte cursors, compared. Sound exactly when both provably measure offsets
+    // into the SAME underlying string (`strCursorBase`'s own doc comment has the
+    // full argument): the comparison then reduces to comparing their `$off`s
+    // directly, the same way pointer arithmetic above already reduces to `$off`
+    // arithmetic. Checked BEFORE the general `cStringUnsafe` fallback just below,
+    // which would otherwise hole this unconditionally. A cursor compared against
+    // anything OTHER than another same-base cursor (a literal, an unrelated
+    // buffer, `isNullCheck`'s own case) is untouched by this branch and falls
+    // through exactly as before.
+    else if (cLikeFile && kids.size == 2 && cStringUnsafe.contains(mfn) && !isNullCheck &&
+             rawLocalOrParamName(kids(0)).map(localName).exists(strCursorParams.contains) &&
+             rawLocalOrParamName(kids(1)).map(localName).exists(strCursorParams.contains) &&
+             {
+               val nmA = rawLocalOrParamName(kids(0)).map(localName).get
+               val nmB = rawLocalOrParamName(kids(1)).map(localName).get
+               (strCursorBase.get(nmA), strCursorBase.get(nmB)) match {
+                 case (Some(baseA), Some(baseB)) => baseA == baseB
+                 case _ => false
+               }
+             }) {
+      val nmA = rawLocalOrParamName(kids(0)).map(localName).get
+      val nmB = rawLocalOrParamName(kids(1)).map(localName).get
+      ujson.Obj("k" -> "binop", "op" -> binops(mfn),
+                "a" -> ujson.Obj("k" -> "name", "v" -> (nmA + "$off")),
+                "b" -> ujson.Obj("k" -> "name", "v" -> (nmB + "$off")))
+    }
     else if (cLikeFile && kids.size == 2 && kids.exists(isCString) &&
         cStringUnsafe.contains(mfn) && !isNullCheck)
       hole(cStringUnsafe(mfn))
@@ -7362,6 +7445,30 @@ import scala.annotation.tailrec
           })
       }
       .map(l => localName(l.name)).toSet
+    // `010-reach-90pct-hole-free` US4: `strCursorBase`, populated now that
+    // `strCursorParams` has its FULL final membership (params ++ locals) --
+    // a parameter is its own base; a local's base is `cursorBaseAndOffset`'s
+    // own resolved base object for its one defining assignment, when that
+    // object is a plain `{"k":"name","v":X}` (the only shape two cursors'
+    // `$off`s can be soundly compared through).
+    strCursorBase = (if (moduleScope) Nil else m.parameter.l)
+      .filter(p => strCursorParams.contains(localName(p.name)))
+      .map(p => localName(p.name) -> localName(p.name)).toMap ++
+      (if (moduleScope) Nil else m.local.l)
+        .filter(l => strCursorParams.contains(localName(l.name)))
+        .flatMap { l =>
+          m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+            .find(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == l.name; case _ => false })
+            .flatMap(a => kidsOf(a) match {
+              case _ :: rhs :: Nil => cursorBaseAndOffset(rhs)
+              case _ => None
+            })
+            .flatMap { case (base, _) =>
+              for { k <- base.value.get("k") if k.str == "name"
+                    v <- base.value.get("v") } yield v.str
+            }
+            .map(baseName => localName(l.name) -> baseName)
+        }.toMap
     val body0 = methodBody(m)
     // `003-box-address-taken-locals`: allocate every boxed local's/parameter's cell
     // exactly once, unconditionally, before the translated body's first real
@@ -7472,6 +7579,7 @@ import scala.annotation.tailrec
     boxedStructArrayMembers = Map.empty
     ptrIrefNames = Set.empty
     strCursorParams = Set.empty
+    strCursorBase = Map.empty
     // `self` is stripped ONLY for a method of a class, where `applyFunc` binds the
     // receiver itself. A MODULE-LEVEL function whose first parameter happens to be named
     // `self` is not a method and its `self` is an ordinary positional: cachetools defines
