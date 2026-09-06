@@ -3015,6 +3015,99 @@ import scala.annotation.tailrec
       }
     }
 
+  /** `010-reach-90pct-hole-free` US3 (T024): a general, RECURSIVE resolver for any
+    * expression that evaluates to a `Val.ref` naming a struct of a KNOWN type --
+    * generalizing `pointerStructFieldOperand`/`boxedStructFieldOperand`'s own
+    * single-hop "bare name" base requirement to an arbitrary CHAIN of pointer-typed
+    * field accesses (`p->q->r`, `s.pField->r`, `pBt->pPage1->aData`, ...), so
+    * `&EXPR->f`/`&EXPR->arr[i]` no longer needs EXPR itself to be a bare local or
+    * parameter. Live-diagnosed against the real corpus: 428 `&...` sites whose base
+    * is itself a compound field-access chain rather than a bare name (the four
+    * existing single-hop mechanisms above correctly leave every one of these a
+    * hole today, having no case for it at all).
+    *
+    * Two base cases, both already-proven "the value already IS its address"
+    * identities elsewhere in this file:
+    *   - a bare local/parameter whose OWN static type is a pointer to a known
+    *     struct (`fieldReceiverAggregateType`'s pointer branch, the exact check
+    *     `pointerStructFieldOperand` already makes for its own single-hop base).
+    *   - a bare local that is itself a BOXED value-typed struct (`boxedStructs`) --
+    *     its own environment binding is ALSO a `Val.ref`, for the identical reason
+    *     `boxedStructFieldOperand` already trusts it, gated on registry membership
+    *     specifically because (unlike a pointer parameter) a value-typed struct is
+    *     ONLY actually bound to a `Val.ref` when this file chose to box it.
+    *
+    * One recursive case: `x` is a field access (`base.f`/`base->f`) whose OWN base
+    * resolves recursively, AND `f`'s OWN declared type (`memberTypes`) is ALSO a
+    * pointer to a known struct -- the chain continues one hop further, re-verified
+    * against `memberTypes`/`structTypeDeclOf` exactly as a single-hop site already
+    * is. This is the SAME soundness bar applied repeatedly, not a weaker one: a
+    * hop through a VALUE-typed (non-pointer) nested member -- e.g. `pExpr->y.pTab`,
+    * where `y` is an anonymous union member -- deliberately does NOT match here,
+    * because that member's own read is not already a `Val.ref` the way a pointer
+    * field's is; closing that shape would need its own nested-object boxing
+    * (mirroring `boxedStructArrayMembers`' treatment of array-typed members) and is
+    * left a hole, not guessed at.
+    *
+    * Returns the JSON expr reading that ref, together with the resolved struct
+    * `TypeDecl`'s bare (duplicate-suffix-stripped) name, for a caller to look up
+    * further members against via `memberTypes`. */
+  def pointerBaseExpr(x: AstNode): Option[(ujson.Value, String)] = {
+    def baseCase: Option[(ujson.Value, String)] =
+      rawLocalOrParamName(x).map(localName).flatMap { nm =>
+        val ty = staticTypeOf(x)
+        val bt = bareType(ty)
+        val resolved =
+          if (bt.endsWith("*") && isClassType(bt.dropRight(1))) structTypeDeclOf(bt.dropRight(1))
+          else if (isClassType(ty) && boxedStructs.contains(nm)) structTypeDeclOf(bt)
+          else None
+        resolved.map(td =>
+          (ujson.Obj("k" -> "name", "v" -> nm): ujson.Value, stripDuplicateSuffix(bareType(td.fullName))))
+      }
+    def chainCase: Option[(ujson.Value, String)] =
+      asField(x).flatMap { case (base, f) =>
+        pointerBaseExpr(base).flatMap { case (baseJson, baseTy) =>
+          memberTypes.get((baseTy, f)).flatMap { mty =>
+            val mbt = bareType(mty)
+            if (mbt.endsWith("*") && isClassType(mbt.dropRight(1)))
+              structTypeDeclOf(mbt.dropRight(1)).map(td =>
+                (ujson.Obj("k" -> "field", "a" -> baseJson, "f" -> f): ujson.Value,
+                 stripDuplicateSuffix(bareType(td.fullName))))
+            else None
+          }
+        }
+      }
+    baseCase.orElse(chainCase)
+  }
+
+  /** `010-reach-90pct-hole-free` US3 (T024): the general form of
+    * `pointerStructFieldOperand`/`boxedStructFieldOperand` -- `&EXPR->f` where
+    * `EXPR` is any chain `pointerBaseExpr` can resolve, not only a bare name.
+    * Deliberately does not re-check `memberTypes` for `f` itself, matching those
+    * two functions' own existing leaf-level looseness (neither of them does
+    * either) -- `pointerBaseExpr` has already verified every HOP up to this point;
+    * this function's only job is composing the final field read on top. */
+  def chainedStructFieldOperand(n: AstNode): Option[(ujson.Value, String)] =
+    asField(n).flatMap { case (base, f) =>
+      pointerBaseExpr(base).map { case (baseJson, _) => (baseJson, f) }
+    }
+
+  /** `010-reach-90pct-hole-free` US3 (T024): the general form of
+    * `pointerStructArrayIndexOperand`/`boxedStructArrayIndexOperand` -- `&EXPR->arr[i]`
+    * where `EXPR` is any chain `pointerBaseExpr` can resolve. Keeps the SAME
+    * `arraySizeOf` requirement `pointerStructArrayIndexOperand` already has (an
+    * unresolvable size stays a hole here exactly as it does there). */
+  def chainedStructArrayIndexOperand(n: AstNode): Option[(ujson.Value, String, AstNode)] =
+    asIndex(n).flatMap { case (recv, idx) =>
+      asField(recv).flatMap { case (base, f) =>
+        pointerBaseExpr(base).flatMap { case (baseJson, baseTy) =>
+          memberTypes.get((baseTy, f))
+            .flatMap(mty => arraySizeOf(mty, currentFile))
+            .map(_ => (baseJson, f, idx))
+        }
+      }
+    }
+
   /** `003-box-address-taken-locals`, Increment B: every call site in the whole
     * analyzed program, and every function used as a VALUE (`MethodRef` -- evidence
     * its address was taken and it could be called indirectly), each computed once
@@ -5090,6 +5183,16 @@ import scala.annotation.tailrec
       // a scalar member, so neither can ever match this shape (a field access
       // wrapped in an index access) in the first place -- no ordering risk.
       val structArrIref = boxedStructArrayIndexOperand(kids(0)).orElse(pointerStructArrayIndexOperand(kids(0)))
+      // `010-reach-90pct-hole-free` US3 (T024): the general CHAIN forms of the two
+      // struct cases just above, tried only as a FALLBACK after them -- when the
+      // base is a bare name, `structArrIref`/`structIref` already succeed and these
+      // are never reached (zero risk to the two proven mechanisms); they only
+      // engage for a base `pointerBaseExpr` alone can resolve (`&p->q->r`,
+      // `&s.pField->arr[i]`, ...). Computed lazily (`lazy val`, not `val`) since
+      // most addressOf sites never need them at all -- `structArrIref`/`structIref`
+      // already cover the common bare-name case.
+      lazy val chainArrIref = chainedStructArrayIndexOperand(kids(0))
+      lazy val chainFieldIref = chainedStructFieldOperand(kids(0))
       if (arrIref.isDefined) {
         val (arrName, idxNode) = arrIref.get
         ujson.Obj("k" -> "irefIndex", "a" -> ujson.Obj("k" -> "name", "v" -> arrName),
@@ -5102,6 +5205,14 @@ import scala.annotation.tailrec
       } else if (structIref.isDefined) {
         val (structName, f) = structIref.get
         ujson.Obj("k" -> "irefField", "a" -> ujson.Obj("k" -> "name", "v" -> structName), "f" -> f)
+      } else if (chainArrIref.isDefined) {
+        val (baseJson, f, idxNode) = chainArrIref.get
+        ujson.Obj("k" -> "irefIndex",
+                  "a" -> ujson.Obj("k" -> "field", "a" -> baseJson, "f" -> f),
+                  "i" -> expr(idxNode))
+      } else if (chainFieldIref.isDefined) {
+        val (baseJson, f) = chainFieldIref.get
+        ujson.Obj("k" -> "irefField", "a" -> baseJson, "f" -> f)
       }
       else if (aggregate) expr(kids(0))
       else if (boxed.isDefined) boxRef(boxed.get)
