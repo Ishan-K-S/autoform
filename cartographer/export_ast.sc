@@ -5170,6 +5170,27 @@ import scala.annotation.tailrec
         case mr: MethodRef => true
         case _ => false
       }
+      // `010-reach-90pct-hole-free` US3/US4: `&z[i]`, `z` a tracked byte cursor
+      // (`strCursorParams`) -- C's own `&z[i]` IS `z + i`, a new pointer value,
+      // exactly the shape `expr`'s own `<operator>.addition` dispatch already
+      // produces via `Expr.strFrom` for the `z + i` spelling -- this is the SAME
+      // operation reached through `&`+index syntax instead. Live-diagnosed to be
+      // the DOMINANT real shape behind `op:addressOf:element:scalar`'s remaining
+      // occurrences (837 of 1,549 `&arr[i]`-shaped sites have a bare-identifier
+      // receiver, and sampling those found the overwhelming majority are exactly
+      // this -- `&zOut[nSql*2+1]`, `&z[iOff]`, `&zSql[iOff]`, all `char*`/`u8*` --
+      // not struct/array addressing at all). Checked FIRST, before the boxed-
+      // array/struct cases below (a char* cursor and a boxed array/struct are
+      // never the same name, so no ordering risk against those).
+      val cursorAddrOf: Option[ujson.Obj] =
+        asIndex(kids(0)).flatMap { case (recv, idx) =>
+          rawLocalOrParamName(recv).map(localName).filter(strCursorParams.contains).map { nm =>
+            ujson.Obj("k" -> "strFrom", "a" -> ujson.Obj("k" -> "name", "v" -> nm),
+                      "b" -> ujson.Obj("k" -> "binop", "op" -> "+",
+                                       "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")),
+                                       "b" -> expr(idx)))
+          }
+        }
       // `006-reduce-remaining-holes`, Story 5: `&a[i]`/`&s.f` once the receiver is
       // a recognized boxed array/struct -- checked FIRST, since `kids(0)` here is
       // an index/field access, not itself a `local`-shaped `addrShape`, so it
@@ -5193,7 +5214,9 @@ import scala.annotation.tailrec
       // already cover the common bare-name case.
       lazy val chainArrIref = chainedStructArrayIndexOperand(kids(0))
       lazy val chainFieldIref = chainedStructFieldOperand(kids(0))
-      if (arrIref.isDefined) {
+      if (cursorAddrOf.isDefined) {
+        cursorAddrOf.get
+      } else if (arrIref.isDefined) {
         val (arrName, idxNode) = arrIref.get
         ujson.Obj("k" -> "irefIndex", "a" -> ujson.Obj("k" -> "name", "v" -> arrName),
                   "i" -> expr(idxNode))
