@@ -5007,7 +5007,38 @@ import scala.annotation.tailrec
     // taxonomy `<operator>.cast` already uses just above (research.md §5), not the
     // single generic `op:sizeOf`.
     else if (mfn == "<operator>.sizeOf" && kids.size == 1) {
-      val ty = staticTypeOf(kids(0))
+      // `010-reach-90pct-hole-free` US2: two real, live-CPG-confirmed shapes where
+      // Joern's own type inference silently drops the operand's pointer-ness,
+      // affecting 240 of 1,376 sizeof sites corpus-wide (17%) -- neither is a
+      // fixture-only concern, both were found by sampling `op:sizeOf:object`'s
+      // actual real occurrences (`sqlite3BitvecSet`, `statInit`, `attachFunc`, ...).
+      //
+      //   1. `sizeof(*p)`: Joern gives the DEREFERENCE expression itself a
+      //      `typeFullName` of `"ANY"` even though `p`'s own pointer type is known
+      //      -- resolved here by reading `p`'s type directly and stripping one
+      //      level of pointer, rather than trusting the dereference node's own
+      //      (unresolved) type.
+      //   2. `sizeof(T *)` written with a bare type name (not a variable): the
+      //      type-ref node's `typeFullName` AND `.code` both lose the trailing
+      //      `*` -- it survives only in the ENCLOSING sizeof call's own `.code`
+      //      (`"sizeof (Bitvec *)"`), the exact same "type survives only in
+      //      surface syntax" quirk `castTargetIsPointer` already exists to catch
+      //      for casts. Checked via the call's own code, not the operand's,
+      //      since (unlike `castTargetIsPointer`'s cast target) the operand node
+      //      here never carries the star at all.
+      val operand = kids(0)
+      val derefPointeeTy: Option[String] =
+        if (isOp(operand, "<operator>.indirection")) kidsOf(operand) match {
+          case List(q) =>
+            val qty = bareType(staticTypeOf(q))
+            if (isPointerType(qty)) Some(qty.dropRight(1)) else None
+          case _ => None
+        } else None
+      val sizeofCallLooksLikePointer = c.code.trim.matches(""".*\*\s*\)$""")
+      val ty = derefPointeeTy.getOrElse {
+        val ty0 = staticTypeOf(operand)
+        if (sizeofCallLooksLikePointer && !isPointerType(ty0)) bareType(ty0) + "*" else ty0
+      }
       // `006-reduce-remaining-holes`, Story 4: a struct/union operand additionally
       // tries the aggregate layout resolver above; every other shape is unchanged
       // from `005`, and an aggregate whose layout does not resolve falls through
