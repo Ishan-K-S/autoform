@@ -1448,15 +1448,27 @@ import scala.annotation.tailrec
           case (lhs: Identifier) :: (rhs: Identifier) :: Nil => lhs.name != paramName && rhs.name == paramName
           case _ => false
         })
-      // `010-reach-90pct-hole-free` US4: `orderComparisons` joins the "at least one
-      // real occurrence" guard too -- a pure scan BOUND like `zEnd` above (`zEnd =
-      // zNum + length;`, then only ever compared against, never itself
-      // dereferenced or indexed) has `reads == indexReads == 0` by construction,
-      // and requiring one of those would wrongly disqualify exactly the variable
-      // this push's own fix exists to track. Tracking a name for comparison
-      // purposes alone is sound: its `(base, offset)` pair is well-defined
-      // whether or not the name is ever dereferenced.
-      (reads + indexReads + orderComparisons) > 0 &&
+      // `010-reach-90pct-hole-free` US4: `orderComparisons`/`incrs`/`advances`
+      // all join the "at least one real occurrence" guard too -- a pure scan
+      // BOUND like `zEnd` above (`zEnd = zNum + length;`, then only ever
+      // compared against, never itself dereferenced or indexed) has `reads ==
+      // indexReads == 0` by construction, and so does a "walk until equal"
+      // cursor (`while (p != end) p++;`, confirmed live: incremented and
+      // equality-compared, never dereferenced or index-read, never
+      // order-compared either) -- requiring `reads`/`indexReads` would wrongly
+      // disqualify both. `nullChecks` joins too, confirmed live to matter for
+      // the BOUND side of exactly this same idiom: `end` in `while (p != end)
+      // p++;` is compared ONLY via equality/inequality, never incremented,
+      // never order-compared, never dereferenced -- every OTHER bucket is
+      // zero, so without this the bound half of the single most common
+      // "walk until equal" idiom stays disqualified even once the walking
+      // half (`p`) qualifies. The real safety net against a false match was
+      // never this guard -- it is `strCursorBase`'s own same-base requirement
+      // at the actual comparison site (this file's `expr` dispatch): two
+      // unrelated char*s equality-compared, neither derived from the other,
+      // simply fail that check and fall through to the existing hole exactly
+      // as before, regardless of how permissively either one qualifies here. */
+      (reads + indexReads + orderComparisons + incrs + advances + nullChecks) > 0 &&
       (reads + incrs + advances + nullChecks + orderComparisons + callArgs + indexReads + defAssigns + arithOperands + assignRhsReads) == allRefs.size &&
       (!allowDefiningAssign || defAssigns == 1)
     }
@@ -5668,6 +5680,33 @@ import scala.annotation.tailrec
       Some((ujson.Obj("k" -> "name", "v" -> nm),
             ujson.Obj("k" -> "binop", "op" -> "+",
                       "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")), "b" -> expr(kidsOf(c)(0)))))
+    // `010-reach-90pct-hole-free` US4: `end = z + n;`, `z` a PLAIN (non-cursor)
+    // identifier -- confirmed live to matter (`scan_len`-style fixtures: `z`
+    // itself is never independently dereferenced/compared, only used to SEED
+    // `p`/`end`, so `z` never qualifies as its own tracked cursor, and the two
+    // arithmetic cases above -- which both require the identifier operand to
+    // ALREADY be `strCursorParams`-tracked -- never fire). The fresh base's
+    // own starting offset is simply the arithmetic amount itself (there is no
+    // prior `$off` to add to, unlike the two cases above): `0 + n` / `0 - n`.
+    // Symmetric with the bare-identifier case just below (same "not itself a
+    // tracked cursor" guard), just for the `ident +/- int` SHAPE rather than a
+    // bare identifier alone.
+    case c: Call if (c.methodFullName == "<operator>.addition" || c.methodFullName == "<operator>.subtraction") &&
+                     kidsOf(c).size == 2 &&
+                     rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(nm => !strCursorParams.contains(nm)) &&
+                     !isCString(kidsOf(c)(1)) =>
+      val nm = rawLocalOrParamName(kidsOf(c)(0)).map(localName).get
+      val op = if (c.methodFullName == "<operator>.addition") "+" else "-"
+      Some((ujson.Obj("k" -> "name", "v" -> nm),
+            ujson.Obj("k" -> "binop", "op" -> op,
+                      "a" -> ujson.Obj("k" -> "int", "v" -> 0), "b" -> expr(kidsOf(c)(1)))))
+    case c: Call if c.methodFullName == "<operator>.addition" && kidsOf(c).size == 2 &&
+                     rawLocalOrParamName(kidsOf(c)(1)).map(localName).exists(nm => !strCursorParams.contains(nm)) &&
+                     !isCString(kidsOf(c)(0)) =>
+      val nm = rawLocalOrParamName(kidsOf(c)(1)).map(localName).get
+      Some((ujson.Obj("k" -> "name", "v" -> nm),
+            ujson.Obj("k" -> "binop", "op" -> "+",
+                      "a" -> ujson.Obj("k" -> "int", "v" -> 0), "b" -> expr(kidsOf(c)(0)))))
     case _ if rawLocalOrParamName(n).exists(nm => !strCursorParams.contains(localName(nm))) =>
       Some((expr(n), ujson.Obj("k" -> "int", "v" -> 0)))
     case fa if asField(fa).isDefined =>
