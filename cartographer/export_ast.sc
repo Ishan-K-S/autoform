@@ -2405,6 +2405,33 @@ import scala.annotation.tailrec
     case _ => false
   }
 
+  /** `010-reach-90pct-hole-free`: unwraps any number of `<operator>.cast`
+    * layers around `n`, returning the innermost non-cast expression --
+    * `(volatile u32**)&aShare` and `&aShare` are the IDENTICAL runtime value,
+    * the cast merely spelling out the type C requires at THIS call site's
+    * parameter, so a call-site-argument classifier asking "is this an
+    * address-of expression" should see straight through it, exactly the same
+    * "a pointer-to-pointer cast is a transparent pass-through" reasoning
+    * `castOperandIsPointerShaped`/`isIrefExpr` already rely on elsewhere in
+    * this file for a different question. Confirmed live as a real, load-
+    * bearing gap: `walIndexPage`'s own `volatile u32 **ppPage` parameter
+    * failed EVERY whole-program closure proof (`closedOutParam`,
+    * `closedIrefOutParam`) outright because exactly one of its four call
+    * sites spells its argument `(volatile u32**)&aShare` -- a cast the
+    * existing `case addr: Call if addr.methodFullName ==
+    * "<operator>.addressOf"` match could never see past, poisoning the
+    * OTHERWISE-safe parameter (and, via `Fwd`/`wideClosedIrefParam`'s own
+    * forwarding, every caller that forwards it onward too) over a detail
+    * with no bearing on the argument's actual runtime shape. */
+  def unwrapCastLayers(n: AstNode): AstNode = n match {
+    case c: Call if c.methodFullName == "<operator>.cast" =>
+      kidsOf(c) match {
+        case List(_, operand) => unwrapCastLayers(operand)
+        case _ => n
+      }
+    case _ => n
+  }
+
   def castOperandIsPointerShaped(operand: AstNode): Boolean =
     isPointerType(staticTypeOf(operand)) || isOp(operand, "<operator>.addressOf") ||
     isKnownOpaquePointerTypedef(staticTypeOf(operand)) || isKnownPointerReturningCall(operand) ||
@@ -3812,7 +3839,7 @@ import scala.annotation.tailrec
     else {
       val callSites = allCalls.filter(_.methodFullName == fn.fullName)
       callSites.nonEmpty && callSites.forall { c =>
-        kidsOf(c).find(aidx(_) == paramIndex).exists {
+        kidsOf(c).find(aidx(_) == paramIndex).map(unwrapCastLayers).exists {
           case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
             kidsOf(addr) match {
               case List(n) if addrShape(n) == "local" =>
@@ -3918,7 +3945,7 @@ import scala.annotation.tailrec
     case object NullLit extends ArgShape
     case class Fwd(callerFn: String, callerIdx: Int) extends ArgShape
 
-    def classify(arg: AstNode): ArgShape = arg match {
+    def classify(rawArg: AstNode): ArgShape = unwrapCastLayers(rawArg) match {
       case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
         kidsOf(addr) match {
           case List(n) if addrShape(n) == "local" =>
@@ -4251,7 +4278,7 @@ import scala.annotation.tailrec
     * can reuse the IDENTICAL "is this argument expression, by itself, a proof
     * this parameter always receives a safe interior pointer" test without a
     * second, driftable copy. */
-  def irefCallArgStructurallyOk(c: Call, arg: AstNode): Boolean = arg match {
+  def irefCallArgStructurallyOk(c: Call, rawArg: AstNode): Boolean = unwrapCastLayers(rawArg) match {
     case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
       kidsOf(addr) match {
         case List(x) =>
@@ -4379,7 +4406,7 @@ import scala.annotation.tailrec
     case object Bad extends ArgShape
     case class Fwd(callerFn: String, callerIdx: Int) extends ArgShape
 
-    def classify(arg: AstNode): ArgShape = arg match {
+    def classify(rawArg: AstNode): ArgShape = unwrapCastLayers(rawArg) match {
       case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
         kidsOf(addr) match {
           case List(x) =>
@@ -4643,7 +4670,7 @@ import scala.annotation.tailrec
     case object NullLit extends ArgShape
     case class Fwd(callerFn: String, callerIdx: Int) extends ArgShape
 
-    def classify(arg: AstNode): ArgShape = arg match {
+    def classify(rawArg: AstNode): ArgShape = unwrapCastLayers(rawArg) match {
       case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
         kidsOf(addr) match {
           case List(n) if addrShape(n) == "local" =>
