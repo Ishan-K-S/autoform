@@ -8746,140 +8746,153 @@ import scala.annotation.tailrec
     }
     // `006-reduce-remaining-holes`, Story 5: plain pointer locals PROVABLY, for
     // their whole lifetime, holding an interior pointer VALUE -- `p = &a[i]`,
-    // `p = &s.f` (mirroring `ptrAliases`'s own whole-function single-assignment
-    // discipline), or `p = a` (array-to-pointer decay, C's own rule that an
-    // array used as a value is the address of its first element).
+    // `p = &s.f`, `p = a` (array-to-pointer decay), a bare copy of an already-
+    // tracked name, or pointer arithmetic on an already-tracked base.
+    //
+    // `010-reach-90pct-hole-free`: REPLACES the earlier "exactly ONE qualifying
+    // assignment total, of ONE specific shape, or the name doesn't count at
+    // all" discipline with "EVERY assignment anywhere in the method must
+    // independently qualify" -- confirmed live via direct corpus sampling that
+    // the old single-assignment rule was rejecting a real, common, and
+    // perfectly SAFE idiom outright: SQLite's own recurring `Type **pp`
+    // linked-list walk (`pp = &pParse->pRename; ...; pp = &(*pp)->pNext;`,
+    // sampled directly in `renameTokenFind`, `renameColumnTokenNext`,
+    // `clearAllSharedCacheTableLocks`, `unixShmUnmap`, `findReusableFd`,
+    // `sqlite3_backup_finish` -- six functions matching the identical shape).
+    // Reassigning the same name to a DIFFERENT interior pointer partway through
+    // a function is exactly as safe as assigning it once: `applyBinop`'s own
+    // same-object-checked `Val.iref` arithmetic and `derefIref`'s own
+    // address-only resolution (both predating this push, Story 5) never cared
+    // WHICH heap object `p` happens to hold at a given moment, only that it
+    // always holds SOME `Val.iref` -- the "exactly one assignment" restriction
+    // was never load-bearing for soundness, only an artifact of how this
+    // mechanism happened to be built incrementally, shape by shape.
+    //
+    // Also NEWLY recognizes pointer arithmetic on an already-tracked base
+    // (`t = pCell + 4;`, `t = pCell + pPage->childPtrSize;`, both sampled
+    // directly in `cellSizePtr`/`btreeParseCellPtrIndex`) as an interior-
+    // pointer-producing shape in its own right -- `basePtr + n` denotes an
+    // interior pointer into the SAME object `basePtr` does, exactly the
+    // reasoning `arithOperandIsPointerShaped` already relies on for a CAST
+    // operand elsewhere in this file, applied here to a NAME's own defining
+    // assignment instead. Subtraction only admits the base on the LEFT
+    // (`n - p` is not valid C pointer arithmetic), and the OTHER operand is
+    // confirmed NOT itself pointer-shaped -- so a genuine pointer DIFFERENCE
+    // (`pA - pB`, an INTEGER in C, not a new pointer) can never be mistaken
+    // for one.
+    //
+    // Any assignment that is NEITHER a self-sufficient shape NOR a dependency
+    // on another (soon-to-be-)tracked name disqualifies the WHOLE name,
+    // PERMANENTLY -- fail-closed, matching this file's own established
+    // convention (and the exact hardening `bareCopies`'s own single-assignment
+    // rule, now folded into this same fixed point, was originally built for):
+    // confirmed live, `osLocaltime`'s own `pX` is assigned `localtime(t)` in
+    // one branch, `pTm` in another, and a bare `0` (NULL) in a third -- mixing
+    // a null literal with real pointer derivations is a genuine soundness
+    // risk (a name this file trusts to always be `Val.iref` must never
+    // actually be able to hold C's `NULL` at runtime), so the DISQUALIFYING
+    // classification below rejects it outright the moment ANY one assignment
+    // doesn't match a recognized shape, not merely skipping that one
+    // occurrence.
     ptrIrefNames = {
-      val assigns = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
-      val assignCounts = assigns.flatMap { a =>
-        kidsOf(a) match { case (t: Identifier) :: _ :: Nil => Some(t.name); case _ => None }
-      }.groupBy(identity).view.mapValues(_.size).toMap
-      assigns.flatMap { a =>
-        kidsOf(a) match {
-          case (t: Identifier) :: (rhs: Call) :: Nil
-              if rhs.methodFullName == "<operator>.addressOf" &&
-                 assignCounts.getOrElse(t.name, 0) == 1 =>
-            kidsOf(rhs) match {
-              case List(operand)
-                  if boxedArrayIndexOperand(operand).isDefined ||
-                     boxedStructFieldOperand(operand).isDefined ||
-                     // `009-reduce-remaining-holes-4`: `t = &p->f;`, `p` a PLAIN
-                     // pointer to a known struct type -- no boxing needed at all,
-                     // since `p`'s own value IS already its address (this file's
-                     // "a struct pointer is its own identity" convention;
-                     // `pointerStructFieldOperand`'s own doc comment has the full
-                     // reasoning). Reuses the IDENTICAL helper `callExpr`'s own
-                     // `<operator>.addressOf` case already trusts for the EXPRESSION
-                     // form of this exact shape (`structIref`, just above in this
-                     // file) -- no new eligibility logic, no new Core semantics,
-                     // just recognizing the SAME already-proven shape when its
-                     // result is stored into a name for later reuse instead of
-                     // used inline. `t`'s single assignment still requires
-                     // `assignCounts == 1`, matching every other bucket here.
-                     pointerStructFieldOperand(operand).isDefined ||
-                     // `009-reduce-remaining-holes-4`: `t = &s.arr[i];`/
-                     // `t = &p->arr[i];` -- the array-typed-member counterpart of
-                     // the two cases just above, same reasoning: reusing
-                     // `callExpr`'s own already-proven `structArrIref` helpers for
-                     // the "stored into a name" case instead of only the inline
-                     // expression case.
-                     boxedStructArrayIndexOperand(operand).isDefined ||
-                     pointerStructArrayIndexOperand(operand).isDefined =>
-                Some(localName(t.name))
-              case _ => None
-            }
-          case (t: Identifier) :: (src: Identifier) :: Nil
-              if assignCounts.getOrElse(t.name, 0) == 1 &&
-                 boxedArrays.contains(localName(src.name)) =>
-            Some(localName(t.name))
-          case _ => None
-        }
-      }.toSet ++
+      // `None`: this assignment disqualifies its target NAME from `ptrIrefNames`
+      // entirely (a null/zero literal, an arbitrary external call, or any other
+      // shape this file has no interior-pointer representation for).
+      // `Some(None)`: self-sufficient -- needs no OTHER name's own eligibility.
+      // `Some(Some(srcName))`: sound PROVIDED `srcName` is (or becomes, in the
+      // SAME fixed point below) itself `ptrIrefNames`-tracked.
+      def classifyIrefAssignRhs(rhs: AstNode): Option[Option[String]] = rhs match {
+        case c: Call if c.methodFullName == "<operator>.addressOf" =>
+          kidsOf(c) match {
+            case List(operand)
+                if boxedArrayIndexOperand(operand).isDefined ||
+                   boxedStructFieldOperand(operand).isDefined ||
+                   pointerStructFieldOperand(operand).isDefined ||
+                   boxedStructArrayIndexOperand(operand).isDefined ||
+                   pointerStructArrayIndexOperand(operand).isDefined =>
+              Some(None)
+            case _ => None
+          }
+        case src: Identifier if boxedArrays.contains(localName(src.name)) =>
+          Some(None)
+        case c: Call if c.methodFullName == "<operator>.addition" =>
+          kidsOf(c) match {
+            case List(a, b) =>
+              val aName = rawLocalOrParamName(a).map(localName)
+              val bName = rawLocalOrParamName(b).map(localName)
+              if (aName.isDefined && !isPointerType(staticTypeOf(b))) Some(aName)
+              else if (bName.isDefined && !isPointerType(staticTypeOf(a))) Some(bName)
+              else None
+            case _ => None
+          }
+        case c: Call if c.methodFullName == "<operator>.subtraction" =>
+          kidsOf(c) match {
+            case List(a, b) =>
+              val aName = rawLocalOrParamName(a).map(localName)
+              if (aName.isDefined && !isPointerType(staticTypeOf(b))) Some(aName) else None
+            case _ => None
+          }
+        // A C chained assignment (`t = (inner = expr);`) -- `t` copies whatever
+        // name `inner`'s own assignment binds, exactly like a bare copy.
+        case inner: Call if inner.methodFullName == "<operator>.assignment" =>
+          kidsOf(inner) match {
+            case List(innerLhs: Identifier, _) => Some(Some(localName(innerLhs.name)))
+            case _ => None
+          }
+        case src: Identifier => Some(Some(localName(src.name)))
+        case _ => None
+      }
+
+      val assignsByName: Map[String, List[AstNode]] =
+        m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+          .flatMap(a => kidsOf(a) match {
+            case List(t: Identifier, rhs) => Some(localName(t.name) -> rhs)
+            case _ => None
+          })
+          .groupBy(_._1).view.mapValues(_.map(_._2)).toMap
+
+      val classified: Map[String, List[Option[Option[String]]]] =
+        assignsByName.view.mapValues(_.map(classifyIrefAssignRhs)).toMap
+
+      val disqualified: Set[String] =
+        classified.collect { case (nm, cs) if cs.exists(_.isEmpty) => nm }.toSet
+
       // `007-reduce-remaining-holes-2`: parameters of THIS method verified, across
       // the whole program (`closedIrefOutParam`), to always receive the address of
       // an element/field of a boxed array/struct -- the cross-function counterpart
-      // to the local-only shapes just above. `p` itself already holds the caller's
-      // `Val.iref` value directly, exactly like a local `ptrIrefNames` member;
-      // excluded when `p`'s OWN address is separately taken within this method
-      // (`boxedLocals`), matching `closedOutParams`'s own disjointness precedent.
-      m.parameter.l
-        .filter(p => (closedIrefOutParam(m, p.index) ||
-                      closedIrefOutParamsTransitive.contains((m.fullName, p.index))) &&
-                     !boxedLocals.contains(localName(p.name)))
-        .map(p => localName(p.name)).toSet ++
-      // `010-reach-90pct-hole-free`: `t = knownAllocator(...);` -- a fresh,
-      // runtime-sized buffer (`ptrIrefAllocNames`'s own doc comment has the full
-      // reasoning; `assignTo`'s bare-identifier dispatch is what actually special-
-      // cases the DEFINING assignment itself, this only needs `t` to be a member
-      // so its LATER `*t`/`t[i]`/`t++`/`*t = v` sites resolve).
-      ptrIrefAllocNames.keySet
-    }
-    // `010-reach-90pct-hole-free`: `z = zOut;`, `zOut` ALREADY a member of
-    // `ptrIrefNames` (a bare copy of an interior-pointer VALUE, not a fresh
-    // derivation -- `z` ends up pointing at the exact same heap object, same
-    // position, as `zOut` at the moment of the copy). Bounded fixed point
-    // (matching this file's own "bounded rather than recursive" precedent
-    // elsewhere, `closedOutParamsTransitive`/`strCursorParams`'s own local
-    // computation) because `zOut` may ITSELF only become a member during THIS
-    // same round (`ptrIrefAllocNames`-seeded, or another bare copy one hop
-    // earlier) -- confirmed live necessary in `sqlite3VdbeMemTranslate`: `z =
-    // zOut;` where `zOut = sqlite3DbMallocRaw(pMem->db, len);` are two SEPARATE
-    // statements, `zOut` only joining `ptrIrefNames` via `ptrIrefAllocNames`
-    // computed in the SAME pass just above -- a single, non-iterated pass over
-    // `m.local.l` in NAME order could miss this if `z`'s own assignment happened
-    // to be visited before establishing `zOut`'s membership; the round bound
-    // removes any dependence on iteration order. `z`'s own defining assignment
-    // needs NO special translation at all (unlike `ptrIrefAllocNames`'s own
-    // names) -- a bare read of `zOut` already evaluates to its current
-    // `Val.iref` value, and the ordinary `case i: Identifier => ...` assignment
-    // fallback copies whatever value an expression evaluates to, verbatim. */
-    if (!moduleScope) {
-      // `010-reach-90pct-hole-free`: hardened after a real, live-caught regression
-      // (`unistrFunc`/`jsonReturnFromBlob`/`createTableStmt`/`sqlite3Pragma`, this
-      // push) -- the first version built `bareCopies` via a plain `.toMap` over
-      // EVERY `t = src` assignment in the method, which SILENTLY KEEPS ONLY THE
-      // LAST entry for a name assigned more than once (`x = someInt;` in one
-      // branch, `x = y;` in another -- ordinary Scala `Map` construction, no
-      // "exactly one" check at all), exactly the `.find`-not-`.count` mistake
-      // `strCursorParams`'s own local computation was hardened against earlier
-      // this session for the identical reason (`sqlite3PagerOpen`'s `zPathname`).
-      // If THAT surviving entry happened to be the bare-copy one and its source
-      // was in `ptrIrefNames`, `x` was wrongly admitted even though its OTHER,
-      // discarded assignment could bind it to an ordinary integer -- confirmed
-      // live as the cause of new `op:postIncrement:value`/`op:preIncrement:value`
-      // holes on names that were never pointers at all. Fixed by requiring
-      // EXACTLY one bare-identifier-to-bare-identifier assignment to `t.name`
-      // anywhere in the method, counted explicitly rather than assumed from
-      // `Map` construction.
-      // `010-reach-90pct-hole-free`: ALSO recognizes `t = (inner = expr);` -- a C
-      // chained assignment -- as `t` copying whatever name `inner`'s OWN
-      // assignment binds, not just a bare `t = src;`. Live-caught gap: `zOut`'s
-      // OWN translation (`assignTo`'s matching chained-allocation case) correctly
-      // seeds `z` and copies it into `zOut`, but without this, `zOut` itself
-      // never actually JOINS `ptrIrefNames`'s membership SET at all -- there is
-      // no separate `zOut = z` node anywhere in the CPG for the plain-bare-copy
-      // pattern above to match (Joern nests `z = ...` inside `zOut = (...)` as
-      // ONE statement, not two) -- so every LATER use of `zOut` (`charFunc`'s own
-      // `*zOut++ = ...`) kept falling through to the generic hole regardless.
-      val allBareIdentAssigns = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
-        .flatMap(a => kidsOf(a) match {
-          case List(t: Identifier, src: Identifier) => Some(localName(t.name) -> localName(src.name))
-          case List(t: Identifier, inner: Call) if inner.methodFullName == "<operator>.assignment" =>
-            kidsOf(inner) match {
-              case List(innerLhs: Identifier, _) => Some(localName(t.name) -> localName(innerLhs.name))
-              case _ => None
-            }
-          case _ => None
-        })
-      val bareCopyCounts = allBareIdentAssigns.groupBy(_._1).view.mapValues(_.size).toMap
-      val bareCopies: Map[String, String] =
-        allBareIdentAssigns.filter { case (nm, _) => bareCopyCounts.getOrElse(nm, 0) == 1 }.toMap
-      for (_ <- 1 to 4) {
-        val newlyQualified = bareCopies.collect {
-          case (nm, src) if !ptrIrefNames.contains(nm) && ptrIrefNames.contains(src) => nm
+      // to the local-only shapes above. Seeded into `tracked` from the START (not
+      // unioned in afterward) so a local's bare-copy-of-a-parameter or arithmetic-
+      // on-a-parameter can depend on it within the SAME fixed point below.
+      val paramTracked: Set[String] =
+        m.parameter.l
+          .filter(p => (closedIrefOutParam(m, p.index) ||
+                        closedIrefOutParamsTransitive.contains((m.fullName, p.index))) &&
+                       !boxedLocals.contains(localName(p.name)))
+          .map(p => localName(p.name)).toSet
+
+      var tracked: Set[String] = paramTracked ++ ptrIrefAllocNames.keySet ++
+        classified.collect {
+          case (nm, cs) if !disqualified(nm) && cs.forall(_.exists(_.isEmpty)) => nm
         }.toSet
-        ptrIrefNames = ptrIrefNames ++ newlyQualified
+
+      // Bounded fixed point (matches this file's own "bounded rather than
+      // recursive" convention elsewhere, `closedOutParamsTransitive`/
+      // `strCursorParams`'s own local computation) for the `DependsOn` chains --
+      // a bare copy's or arithmetic base's own source name may itself only
+      // become tracked during THIS same round. Skipped entirely for the
+      // synthetic `<global>` module-initializer pseudo-method (`moduleScope`),
+      // matching the ORIGINAL bare-copy mechanism's own scope restriction --
+      // untested territory for whole-program initializer analysis, left as-is.
+      if (!moduleScope) {
+        for (_ <- 1 to 4) {
+          val newlyQualified = classified.collect {
+            case (nm, cs) if !disqualified(nm) && !tracked(nm) &&
+                             cs.forall(c => c.exists(dep => dep.isEmpty || tracked(dep.get))) => nm
+          }.toSet
+          tracked = tracked ++ newlyQualified
+        }
       }
+      tracked
     }
     // `009-reduce-remaining-holes-4`: `const char *` parameters eligible for
     // byte-cursor tracking -- see `strCursorParams`'s own doc comment. Restricted to
