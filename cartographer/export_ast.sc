@@ -2287,6 +2287,23 @@ import scala.annotation.tailrec
   def isKnownOpaquePointerTypedef(ty: String): Boolean =
     opaquePointerTypedefs.contains(bareType(ty).replace("const", "").trim)
 
+  /** `010-reach-90pct-hole-free`: `objClientData`, Tcl's OWN `Tcl_CmdInfo.
+    * objClientData` field name -- confirmed live to matter across SIX
+    * near-identical sites (`getDbPointer`, `get_sqlite_pointer`,
+    * `test_enable_load`, `test_load_extension`, `test_register_dbstat_vtab`,
+    * `test_vfslog`, all `(struct SqliteDb*)cmdInfo.objClientData`) that
+    * `isKnownOpaquePointerTypedef` alone cannot reach: the OPERAND here is a
+    * FIELD ACCESS (`cmdInfo.objClientData`), not a bare name, and `Tcl_CmdInfo`
+    * is not a struct this corpus's own parse can see at all (`<tcl.h>` is
+    * outside its scope), so `staticTypeOf` on the field access itself resolves
+    * to nothing -- there is no TYPE to check against the typedef allowlist
+    * with. The FIELD NAME alone is the only signal available, and it is a
+    * specific enough one (Tcl's own public API struct, not a generic word) to
+    * trust the same way `opaquePointerTypedefs` trusts `ClientData` by name. */
+  val opaquePointerFieldNames = Set("objClientData")
+  def isKnownOpaquePointerField(n: AstNode): Boolean =
+    asField(n).exists { case (_, field) => opaquePointerFieldNames.contains(field) }
+
   /** `010-reach-90pct-hole-free`: a call to a function KNOWN to return a
     * pointer, even though it is external/unresolved (its own header is not in
     * this corpus's parsed scope, so Joern cannot report its return type at
@@ -2307,17 +2324,46 @@ import scala.annotation.tailrec
     * existing hole, the same safe default every other unlisted-name fallback
     * in this file already uses. */
   val knownPointerReturningExternalCalls = Set(
-    "Tcl_Alloc", "ckalloc", "malloc",
-    "Tcl_GetString", "Tcl_GetByteArrayFromObj", "Tcl_GetChannelName", "Tcl_GetStringFromObj"
+    "Tcl_Alloc", "ckalloc", "malloc", "Tcl_AttemptAlloc",
+    "Tcl_GetString", "Tcl_GetByteArrayFromObj", "Tcl_GetChannelName", "Tcl_GetStringFromObj",
+    "Tcl_GetHashValue", "Tcl_GetHashKey"
   )
   def isKnownPointerReturningCall(n: AstNode): Boolean = n match {
     case call: Call => knownPointerReturningExternalCalls.contains(call.methodFullName)
     case _ => false
   }
 
+  /** `010-reach-90pct-hole-free`: `basePtr + n` / `basePtr - n` -- pointer
+    * arithmetic is pointer-shaped BY C's OWN language rules regardless of
+    * whether Joern's own type inference agrees (confirmed live: it often does
+    * not, for the identical "no visibility into the real declaration" reason
+    * the OTHER cases here exist). Checked recursively (`castOperandIsPointerShaped`
+    * calling back into itself through this), so a chain (`(u8*)p + a + b`) or a
+    * cast-wrapped base (`((u8*)pSorter) + sz`) both resolve through the SAME
+    * one rule rather than needing a separate case per shape. Confirmed live as
+    * SQLite's own recurring "sub-allocate several objects from one malloc'd
+    * block, use pointer arithmetic to find each one's start" idiom:
+    * `sqlite3VdbeExec`'s own `(Mem*)((u8*)pCtx + nAlloc)`,
+    * `sqlite3VdbeSorterInit`'s own `(KeyInfo*)((u8*)pSorter + sz)`,
+    * `sqlite3WhereBegin`'s own `(WhereLoop*)(((char*)pWInfo)+nByteWInfo)`, and
+    * `sqlite3RowSetInit`'s own `(struct RowSetEntry*)(ROUND8(sizeof(*p)) +
+    * (char*)p)` (addition commutes; the pointer-shaped operand can be on
+    * either side). Only ONE side needs to be confirmed pointer-shaped -- C
+    * itself does not allow pointer+pointer, so if either operand already is
+    * one, the other is necessarily the integer offset. */
+  def arithOperandIsPointerShaped(n: AstNode): Boolean = n match {
+    case c: Call if c.methodFullName == "<operator>.addition" || c.methodFullName == "<operator>.subtraction" =>
+      kidsOf(c) match {
+        case List(a, b) => castOperandIsPointerShaped(a) || castOperandIsPointerShaped(b)
+        case _ => false
+      }
+    case _ => false
+  }
+
   def castOperandIsPointerShaped(operand: AstNode): Boolean =
     isPointerType(staticTypeOf(operand)) || isOp(operand, "<operator>.addressOf") ||
-    isKnownOpaquePointerTypedef(staticTypeOf(operand)) || isKnownPointerReturningCall(operand)
+    isKnownOpaquePointerTypedef(staticTypeOf(operand)) || isKnownPointerReturningCall(operand) ||
+    isKnownOpaquePointerField(operand) || arithOperandIsPointerShaped(operand)
 
   /** `char` is deliberately absent from `intTypeNames`: its signedness is
     * implementation-defined, so `static_cast<char>(300)` has no standard-mandated value.
