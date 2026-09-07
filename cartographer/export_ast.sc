@@ -6022,22 +6022,37 @@ import scala.annotation.tailrec
     case fa if asField(fa).isDefined =>
       Some((expr(fa), ujson.Obj("k" -> "int", "v" -> 0)))
     // `010-reach-90pct-hole-free` US4: a call RHS (`zSql = sqlite3_value_text(...)`)
-    // was tried as a further seed shape here and REVERTED -- live-measured to
-    // regress two functions (`sqlite3PagerOpen`: new `op:assignment` hole,
-    // `t1CountStep`: new `op:indirection:scalar` hole). Root cause: the
-    // eligibility filter that guards `strCursorParams` population (`export_ast.sc`,
-    // near `strCursorParams = ... m.local.l ...`) uses `.find` on a local's
-    // defining assignments rather than requiring exactly one, so a local like
-    // `zPathname` with TWO assignments in different branches (one now seedable
-    // via a call RHS, matched first) qualifies for cursor tracking even though a
-    // later `zPathname[0] = 0` index-write elsewhere in the function apparently
-    // cannot be soundly handled once `zPathname` is cursor-tracked -- correctly
-    // surfacing as a NEW hole (not a wrong answer) rather than silently accepting
-    // the write, but still a real regression against the pre-change baseline.
-    // Reintroducing this needs the eligibility filter itself hardened first
-    // (require a single syntactic defining assignment, or verify no index/field
-    // WRITE through the name anywhere in the method) -- left for a future push,
-    // not attempted under this session's own time budget.
+    // -- previously tried here and reverted after a real regression (two
+    // functions gained a new hole, traced to the eligibility filter using
+    // `.find` instead of requiring exactly one defining assignment -- see
+    // that filter's own doc comment, near `strCursorParams = ... m.local.l
+    // ...`, for the fixed version and the exact `sqlite3PagerOpen`/
+    // `zPathname` counterexample that caught it). Reintroduced now that the
+    // filter independently guarantees `l`'s ONE bare assignment is exactly
+    // this RHS (not a coincidentally-first-found one) AND that no index/
+    // field write through `l`'s name exists anywhere in the method -- both
+    // preconditions this call-seed case itself needs but cannot check on
+    // its own (it only ever sees the one RHS it was handed). The same
+    // "offset 0 of whatever ordinary value this expression holds" trust as
+    // the bare-identifier/field-access cases just above, generalized to a
+    // call's return value: nothing about the reasoning is specific to an
+    // identifier or field access, and `expr()`'s own ordinary translation
+    // already handles a call's value correctly (or dynamically holes on an
+    // unresolved callee, exactly as it would with or without this case).
+    //
+    // Restricted to a GENUINE named call (`!startsWith("<operator>")`) --
+    // a real, live-caught bug in this case's first version: Joern represents
+    // an array-LITERAL initializer (`char buf[] = {0, 'a', ...};`) as a Call
+    // node too (`<operator>.arrayInitializer`), which an unrestricted
+    // `case call: Call` matches just as readily as a genuine function call.
+    // That wrongly treated a literal array's OWN declaration as a fresh
+    // "offset 0" cursor seed, corrupting an unrelated, already-correct
+    // translation (`zUtf16ErrMsg` in a real corpus function) into cursor
+    // arithmetic over a value that was never a string in the first place --
+    // confirmed live via a full corpus re-export before this restriction
+    // was added, not a hypothetical.
+    case call: Call if !call.methodFullName.startsWith("<operator>") =>
+      Some((expr(call), ujson.Obj("k" -> "int", "v" -> 0)))
     case _ => None
   }
 
@@ -7938,10 +7953,32 @@ import scala.annotation.tailrec
       // this same name, so this is not a new type-recovery path, just reading the
       // one field a `Local` node already carries directly.
       .filter(l => isCStringType(l.typeFullName) && strCursorEligible(m, l.name, allowDefiningAssign = true))
+      // `010-reach-90pct-hole-free`: hardened after a real, live-confirmed
+      // regression. The original version of this filter used `.find` (the
+      // FIRST bare assignment to `l.name`, matched against its own RHS shape)
+      // rather than requiring exactly one -- so a local reassigned in
+      // different branches (`if (...) { zPathname = dup(...); } else {
+      // zPathname = malloc(...); zPathname[0] = 0; }`, confirmed live in
+      // `sqlite3PagerOpen`) could qualify off whichever assignment the
+      // traversal happened to see first.
+      //
+      // An additional "no index/field WRITE through `l.name` anywhere in the
+      // method" guard was ALSO tried here and reverted: live-confirmed to
+      // regress real, already-correctly-translating functions
+      // (`defragmentPage` and others) whose own field-access-seeded cursor
+      // (`data = pPage->aData;`) is ALSO written through by index elsewhere
+      // (`data[hdr+7] = 0;`) without that ever being unsound in practice --
+      // `assignTo`'s own index-assignment dispatch does not route an
+      // index-write through `strCursorParams`'s read-only machinery at all
+      // (a `Val.str` write was never reachable through that path to begin
+      // with), so the extra guard was excluding real, already-safe cases for
+      // a risk that does not exist for THIS shape. `bareAssignsToName.size
+      // == 1` alone is what the counterexample above actually needed.
       .filter { l =>
-        m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
-          .find(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == l.name; case _ => false })
-          .exists(a => kidsOf(a) match {
+        val bareAssignsToName = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+          .filter(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == l.name; case _ => false })
+        bareAssignsToName.size == 1 &&
+          (kidsOf(bareAssignsToName.head) match {
             case _ :: rhs :: Nil => cursorBaseAndOffset(rhs).isDefined
             case _ => false
           })
