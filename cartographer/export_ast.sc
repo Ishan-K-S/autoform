@@ -2788,7 +2788,18 @@ import scala.annotation.tailrec
       case seg if fnPtrName.findFirstMatchIn(seg).exists(_.group(1) == field) => true
       case seg if !seg.contains(",") && !seg.contains(":") &&
                   (seg match { case plainName(nm) => nm == field; case _ => false }) =>
-        seg.contains("*")
+        // `010-reach-90pct-hole-free`: an ARRAY-declared field (`u8 out[64];`) is
+        // pointer-shaped too -- C decays an array lvalue to a pointer to its first
+        // element in exactly the context this predicate exists for (a cast operand,
+        // `(void*)sqlite3Prng.out`) -- `isPointerType` itself already treats a `[...]`
+        // type string this way (confirmed: its own `.matches(".*\\[.*\\]")` arm), so
+        // this text-based fallback was inconsistent with it, checking only for `*`
+        // and silently missing every array field. `seg`'s own trailing `]` is
+        // sufficient evidence on its own: `plainName`'s match above already required
+        // the field name to be followed by nothing but an optional `[...]`, so a
+        // segment ending in `]` at this point can only be this field's own array
+        // dimension, never a later field or an unrelated bracket.
+        seg.contains("*") || seg.endsWith("]")
     }
   }
 
