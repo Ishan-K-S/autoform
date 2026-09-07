@@ -2938,10 +2938,21 @@ import scala.annotation.tailrec
     * `val` sitting between the two would otherwise block that. */
   val sizeofInProgress = scala.collection.mutable.Set.empty[String]
 
+  // `010-reach-90pct-hole-free`: no longer gated behind `isClassType(ty)` --
+  // that coarse pre-check has real false negatives of its own (`unix_syscall`
+  // reports zero members under EVERY name variant Joern gives it, so neither
+  // of `isClassType`'s own two proof routes -- a member-bearing `TypeDecl`, or
+  // `fieldOwnerTypes`'s field-access evidence -- ever fires for it, even
+  // though `aggregateSizeofBytes` can size it just fine via source text once
+  // actually asked to try). `aggregateSizeofBytes` has its OWN, stronger
+  // internal gate (`structTypeDeclOfAny` must find a real `TypeDecl`, and
+  // `structBodyText` must find a real `{...}` body to parse) -- safe to call
+  // unconditionally and let IT decide, rather than pre-filtering with a
+  // cruder check that can say no when the real answer is yes.
   def memberSizeofBytes(ty: String): Option[Int] = bareType(ty) match {
     case t if t.endsWith("[]")  => None
     case arrayShape(elem, n)    => memberSizeofBytes(elem).map(_ * n.toInt)
-    case _ => sizeofBytes(ty).orElse(if (isClassType(ty)) aggregateSizeofBytes(ty) else None)
+    case _ => sizeofBytes(ty).orElse(aggregateSizeofBytes(ty))
   }
 
   /** `006-reduce-remaining-holes`, Story 4 (FR-009/FR-010): the byte size of a
@@ -3271,23 +3282,50 @@ import scala.annotation.tailrec
     anonymousNestedAggregateMemberSizes(td, memberName, isUnion)
       .filter(_.nonEmpty).map(aggregateLayoutBytes(_, isUnion))
 
+  /** `010-reach-90pct-hole-free`: the byte size of `td`, via ITS OWN top-level
+    * source text (`structFieldSizesFromText`), using the SAME layout
+    * arithmetic (`aggregateLayoutBytes`) the structural, member-list-based
+    * path uses -- a SEPARATE, INDEPENDENT computation `aggregateSizeofBytes`
+    * (below) now falls back to whenever the structural path fails, not only
+    * when `td.member.l` started out empty. Factored out so both callers
+    * (the "no members at all" case and the NEW "some members resolved
+    * structurally, one did not" case) share one implementation rather than
+    * two copies of the same alignment/offset arithmetic. */
+  def aggregateSizeofBytesViaText(td: TypeDecl): Option[Int] =
+    structFieldSizesFromText(td).map(szs => aggregateLayoutBytes(szs, td.code.trim.startsWith("union")))
+
+  /** `010-reach-90pct-hole-free`: REWORKS how this whole function fails.
+    * Before this push, the structural (member-list) path was ALL-OR-NOTHING:
+    * one field whose OWN type `memberSizeofBytes` could not resolve --  a
+    * bitfield, a nested aggregate the anonymous-member parser could not read,
+    * a typedef chain this file has no entry for -- discarded the ENTIRE
+    * struct's layout computation, throwing away every OTHER field's already-
+    * successfully-resolved size along with it. Live-sampled directly against
+    * this exact failure (not guessed at): `SrcItem`/`Column`/`Index`/
+    * `WhereLoop` all measure `isClassType = true` (correctly recognized as
+    * real, known aggregates) yet still hole on `op:sizeOf:object` -- the
+    * TYPE classification was never the problem for these; `aggregateSizeofBytes`'s
+    * own internal all-or-nothing collapse was.
+    *
+    * The fix is not a smarter per-field resolver (a genuinely open-ended
+    * task with no natural stopping point); it is recognizing that this file
+    * ALREADY has a SECOND, fully independent way to size a struct --
+    * `structFieldSizesFromText`, which reads the SAME struct's real source
+    * text directly rather than walking Joern's own (sometimes incomplete)
+    * structural member list -- and using it as a FALLBACK for the structural
+    * path's failure, not only for the narrower case (`members.isEmpty`) this
+    * file already tried it for. The two methods fail for DIFFERENT reasons
+    * (structural: a field's typeFullName resolves to something
+    * `memberSizeofBytes` has no entry for; textual: the source text itself
+    * cannot be safely segmented), so a struct only remaining unresolved after
+    * BOTH have been tried is a substantially stronger claim than either
+    * alone. */
   def aggregateSizeofBytes(ty: String): Option[Int] =
     structTypeDeclOfAny(ty).flatMap { td =>
       if (hasPackingAttribute(td) || !sizeofInProgress.add(td.fullName)) None
       else try {
         val members = td.member.l
-        if (members.isEmpty)
-          structFieldSizesFromText(td).map { szs =>
-            val isUnion = td.code.trim.startsWith("union")
-            var offset = 0
-            var maxAlign = 1
-            szs.foreach { sz =>
-              if (sz > maxAlign) maxAlign = sz
-              if (!isUnion) { offset = ((offset + sz - 1) / sz) * sz; offset += sz }
-            }
-            val raw = if (isUnion) szs.max else offset
-            ((raw + maxAlign - 1) / maxAlign) * maxAlign
-          }
+        if (members.isEmpty) aggregateSizeofBytesViaText(td)
         else {
           val isUnion = td.code.trim.startsWith("union")
           var offset = 0
@@ -3328,7 +3366,7 @@ import scala.annotation.tailrec
               }
             }
           }
-          if (!ok) None
+          if (!ok) aggregateSizeofBytesViaText(td)
           else {
             val raw = if (isUnion) maxSize else offset
             Some(((raw + maxAlign - 1) / maxAlign) * maxAlign)
@@ -3359,11 +3397,43 @@ import scala.annotation.tailrec
     case other   => other.label.toLowerCase
   }
 
+  /** `010-reach-90pct-hole-free`: `isClassType`'s own two proof routes (a
+    * member-bearing `TypeDecl`, or `fieldOwnerTypes`'s field-access evidence)
+    * both require STRUCTURAL evidence Joern does not always provide even for
+    * a genuine, real struct -- confirmed live, `os_unix.c`'s own `struct
+    * unix_syscall` reports ZERO members under EVERY name variant Joern gives
+    * it AND is never field-accessed through a shape `fieldOwnerTypes`'s own
+    * scan recognizes, so `isClassType("unix_syscall")` answers `false` for a
+    * type this file's OWN `aggregateSizeofBytes`/`structTypeDeclOfAny` can
+    * already size and resolve just fine via source TEXT, once actually asked
+    * to try (this exact struct is `structFieldSizesFromText`'s own textbook
+    * case, from an EARLIER push -- the type-resolution SIDE of the story was
+    * simply never connected to `addrKind`'s own classification before now).
+    *
+    * Deliberately NOT a change to `isClassType` itself: that function is
+    * consulted throughout this file for the identity-vs-location-model
+    * distinction (`&it` needs certainty a `Val.ref` is already the object's
+    * own address), and `structTypeDeclOfAny`'s own LAST fallback -- ANY
+    * same-bare-name `TypeDecl` at all, regardless of content -- could in
+    * principle match a scalar typedef's own trivial `TypeDecl` entry, not
+    * only a genuine struct's. Requiring the found `TypeDecl`'s OWN source
+    * `.code` to TEXTUALLY start with `struct`/`union`/`class` is the SAME
+    * positive-evidence discipline `isClassType`'s own doc comment already
+    * establishes ("the test has to be positive") -- narrow enough to add
+    * here, where the only consequence of a wrong "object" classification is
+    * a MORE SPECIFIC hole label misfiring, not a location-model soundness
+    * question the way `&it`'s identity treatment is. */
+  def structTextConfirmedAggregate(ty: String): Boolean =
+    structTypeDeclOfAny(ty).exists { td =>
+      val raw = td.code.trim
+      raw.startsWith("struct") || raw.startsWith("union") || raw.startsWith("class")
+    }
+
   def addrKind(ty: String): String = {
     val b = bareType(ty)
     if (b.isEmpty || b == "ANY")   "unknown-type"
     else if (isPointerType(b))     "pointer"
-    else if (isClassType(ty))      "object"
+    else if (isClassType(ty) || structTextConfirmedAggregate(ty)) "object"
     // `009-reduce-remaining-holes-4` US4: `resolveIntType`'s own alias chain (already
     // extended, US2) is more thorough than this function's own fixed `scalarTypedefs`
     // set -- confirmed live: SQLite's own `i64`/`i16`/`i8`/`Pgno`/`LogEst`/... (a
@@ -6506,7 +6576,7 @@ import scala.annotation.tailrec
       // tries the aggregate layout resolver above; every other shape is unchanged
       // from `005`, and an aggregate whose layout does not resolve falls through
       // to the exact same `op:sizeOf:object` hole below it always has.
-      sizeofBytes(ty).orElse(if (isClassType(ty)) aggregateSizeofBytes(ty) else None) match {
+      sizeofBytes(ty).orElse(aggregateSizeofBytes(ty)) match {
         case Some(n) => intLit(n)
         case None =>
           if (modelDependentNames.contains(bareType(ty))) hole("op:sizeOf:model-dependent")
