@@ -2965,6 +2965,15 @@ import scala.annotation.tailrec
       !methodByName.contains(p.methodFullName)
     case _ => false
   }
+  // `010-reach-90pct-hole-free`: `addressOfFeedsExternalCall` is no longer
+  // consulted to gate `boxedLocals` -- see that population site's own updated
+  // comment. Kept, unused, only because its OWN doc comment above (the
+  // "does not risk a WRONG answer... Core's hole propagation aborts the
+  // entire dynamic execution... a stale boxed value can never be observed
+  // after it" argument) is exactly the reasoning that justifies the
+  // relaxation -- this file already had the correct insight, just applied it
+  // to a narrower question (whether to trace an alias) than the broader one
+  // (whether escaping disqualifies boxing) it also settles.
 
   // ---- `006-reduce-remaining-holes`, Story 5: interior pointers -------------
 
@@ -7469,21 +7478,34 @@ import scala.annotation.tailrec
       .groupBy(_._1).map { case (k, vs) => k -> vs.map(_._2).toSet }
     // `003-box-address-taken-locals`: every name whose address is taken anywhere in
     // this method, restricted to the boxable "local" shape (`boxableName` -- depends
-    // on `localTypes`/`declaredGlobals`/`moduleScope`/`cppFile`, all set above) AND
-    // -- per spec.md's edge cases and SC-001's own scoping -- never fed to an
-    // external call at ANY of its address-of sites (`addressOfFeedsExternalCall`): a
-    // name with even one such site is excluded ENTIRELY, so every one of its
-    // addressOf/indirection sites keeps today's hole rather than mixing boxed and
-    // unboxed behaviour for the same name.
+    // on `localTypes`/`declaredGlobals`/`moduleScope`/`cppFile`, all set above).
+    //
+    // `010-reach-90pct-hole-free`: a name feeding an EXTERNAL call at one of its
+    // address-of sites (`addressOfFeedsExternalCall`) is NO LONGER excluded --
+    // this used to disqualify `nm` from boxing ENTIRELY (spec.md's original
+    // SC-001 scoping), so every one of its OTHER, perfectly safe addressOf/
+    // indirection sites kept a hole too, purely because ONE unrelated site
+    // happened to reach an unresolved function. That was more conservative
+    // than sound: `addressOfFeedsExternalCall`'s OWN doc comment already
+    // states the reason it is safe not to be -- Core's hole propagation
+    // aborts the ENTIRE dynamic execution at the first hole reached (an
+    // external call ALWAYS produces one, confirmed against `Semantics.lean`'s
+    // own `.call`/`Stdlib.builtin` dispatch: an unresolved name falls through
+    // to `.hole s!"call:{f}"` unconditionally), so nothing about how a
+    // never-executed external function might have used `nm`'s address can
+    // ever be observed by anything that runs afterward. `nm`'s OWN box
+    // binding is completely unaffected by what a hole-producing call site
+    // does with a copy of its `Val.ref` -- there is no "mixing" risk to guard
+    // against, only a call site that was ALREADY going to hole on its own
+    // terms, with or without `nm` being boxed. Verified via two dedicated
+    // fixtures (see this commit) before this real corpus was re-exported.
     val addrCalls = m.body.ast.isCall.filter(_.methodFullName == "<operator>.addressOf").l
     val candidates: Map[String, List[Call]] =
       addrCalls.flatMap(c => kidsOf(c) match {
         case List(n) => boxableName(n).map(_ -> c)
         case _       => None
       }).groupBy(_._1).map { case (k, vs) => k -> vs.map(_._2) }
-    boxedLocals = candidates.collect {
-      case (nm, sites) if !sites.exists(addressOfFeedsExternalCall) => nm
-    }.toSet
+    boxedLocals = candidates.keySet
     // `p -> n`: every pointer-typed local provably aliasing exactly one boxed local
     // for its whole lifetime -- `p = &n` is the ONLY assignment to `p` anywhere in
     // this method (see `ptrAliases`'s own doc comment for why this must be stricter
@@ -7684,7 +7706,28 @@ import scala.annotation.tailrec
               methodByName.get(c.methodFullName).exists(callee =>
                 closedIrefOutParam(callee, aidx(k)) ||
                 closedIrefOutParamsTransitive.contains((callee.fullName, aidx(k))))) ||
-            (wholeObjectAddress && calleeIsInProgram)
+            (wholeObjectAddress && calleeIsInProgram) ||
+            // `010-reach-90pct-hole-free`: a GENUINELY EXTERNAL callee (not found
+            // in `methodByName`, this exporter's own whole-program index of
+            // functions it actually translates) is safe for ANY shape `k` takes
+            // -- element/field address, whole-object address, or a bare
+            // by-value/decay pass -- not just the two narrow shapes proven safe
+            // above for an IN-PROGRAM callee. The reason is unconditional and
+            // does not depend on the shape at all: confirmed against
+            // `Semantics.lean`'s own `.call` dispatch, an unresolved callee name
+            // (nothing this `Stdlib.builtin` models -- checked live, that table
+            // is Python-builtin-shaped: `len`/`str`/`list`/... , nothing
+            // C-pointer-mutating) ALWAYS produces `.hole s!"call:{f}"`
+            // unconditionally, before evaluating anything about what the
+            // callee would have done with its arguments -- so Core never
+            // "executes" the external function at all, and the existing
+            // "does not risk a WRONG answer... a stale boxed value can never
+            // be observed after it" argument (`addressOfFeedsExternalCall`'s
+            // own doc comment, already trusted for the scalar case) applies
+            // here without modification, for every shape uniformly. This is
+            // the ONE case where the shape of `k` genuinely does not matter,
+            // because the callee is never actually run either way.
+            !calleeIsInProgram
           }
         }
     def nameSafelyBoxable(nm: String, wholeObjectAddressOk: Boolean): Boolean =
