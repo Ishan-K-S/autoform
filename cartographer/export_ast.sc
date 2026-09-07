@@ -2790,6 +2790,22 @@ import scala.annotation.tailrec
       }
     })
 
+  /** `010-reach-90pct-hole-free`: the layout arithmetic `anonymousNestedAggregateSize`
+    * already applies to ONE resolved nested aggregate's own member-size list --
+    * factored out so `segmentSizes` below (a struct/union body) and this
+    * function's own recursive call into a nested block use the exact same
+    * offset/alignment rules, not two copies that could drift. */
+  def aggregateLayoutBytes(memberSizes: List[Int], isUnion: Boolean): Int = {
+    var offset   = 0
+    var maxAlign = 1
+    memberSizes.foreach { sz =>
+      if (sz > maxAlign) maxAlign = sz
+      if (!isUnion) { offset = ((offset + sz - 1) / sz) * sz; offset += sz }
+    }
+    val raw = if (isUnion) memberSizes.max else offset
+    ((raw + maxAlign - 1) / maxAlign) * maxAlign
+  }
+
   /** `009-reduce-remaining-holes-4`: the per-segment size-classification rules
     * `anonymousNestedAggregateMemberSizes` already established, factored out so
     * `structFieldSizesFromText` below can apply the SAME rules to a top-level
@@ -2799,28 +2815,103 @@ import scala.annotation.tailrec
     * function-pointer TYPEDEF field resolve correctly here, via
     * `functionPointerTypedefNames`, without this function needing to know
     * anything about function pointers itself), or anything this cannot cleanly
-    * read (a bitfield, a multi-declarator, a nested brace) bailing the WHOLE
-    * body to `None` rather than silently skipping just that one segment. */
+    * read (a bitfield, a multi-declarator) bailing the WHOLE body to `None`
+    * rather than silently skipping just that one segment.
+    *
+    * `010-reach-90pct-hole-free`: a nested `struct {...} name;`/`union {...}
+    * name;` segment -- previously ALSO an automatic bail (any embedded `{`
+    * failed every segment's own no-brace check) -- is now recognised and
+    * RECURSED into, using the exact same brace-depth-tracked scan
+    * `anonymousNestedAggregates` already uses to find a top-level struct's own
+    * anonymous members, rather than the naive `.split(";")` this function used
+    * before: a plain split cannot tell a nested block's OWN internal `;`s
+    * apart from the segment boundaries between DIFFERENT top-level members, so
+    * finding a nested aggregate at all requires walking the body once,
+    * tracking brace depth, exactly as the sibling function does.
+    *
+    * Live-confirmed the DOMINANT reason `sizeof(Table)`/`sizeof(Expr)` (and
+    * everywhere either is boxed/allocated by size, corpuswide -- both among
+    * SQLite's most heavily-used core structs) still holed as `op:sizeOf:object`
+    * despite `009`'s own anonymous-union work: `Table.u`'s own union holds a
+    * nested `struct { ... } ` arm per table kind (ordinary/view/virtual),
+    * and `Expr.y`'s union holds `Table *pTab; Window *pWin; int nReg; struct {
+    * int iAddr; int regReturn; } sub;` -- a trailing nested struct arm after
+    * three ordinary ones. Both unions' OTHER members were already individually
+    * resolvable; the one nested-struct segment was enough to bail the WHOLE
+    * union to `None` under the old any-brace-fails rule, taking the entire
+    * struct's own sizeof down with it. Recursion is naturally bounded by the
+    * SOURCE's own real nesting depth (never more than a couple of levels in
+    * practice) -- no artificial round cap needed, unlike this file's other
+    * bounded-fixed-point mechanisms, because each recursive call operates on a
+    * texually SMALLER, disjoint substring (the nested block's own inner body),
+    * not a graph that could cycle. */
   def segmentSizes(rawBody: String, filePath: String): Option[List[Int]] = {
     val body = rawBody.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
-    val segments = body.split(";").map(_.trim).filter(_.nonEmpty)
-    val declLine = """^(.*[\s\*])([A-Za-z_]\w*)$""".r
-    if (segments.isEmpty) None
-    else {
-      val sizes = segments.map { seg =>
-        seg match {
-          case nestedArrayDeclLine(tyPart, _, sizeExpr) if !tyPart.exists(",(){}:".contains(_)) =>
-            val n =
-              if (sizeExpr.trim.matches("""\d+""")) Some(sizeExpr.trim.toInt)
-              else resolveMacroArraySize(sizeExpr, filePath)
-            n.flatMap(nn => memberSizeofBytes(tyPart.trim).map(_ * nn))
-          case _ if seg.exists(",[(){}:".contains(_)) => None
-          case declLine(tyPart, _) => memberSizeofBytes(tyPart.trim)
-          case _ => None
+    val declLine   = """^(.*[\s\*])([A-Za-z_]\w*)$""".r
+    val nestedKw   = """\A(union|struct)\s*(?:[A-Za-z_]\w*\s*)?\{""".r
+    val nameAt     = """^\s*([A-Za-z_]\w*)\s*;""".r
+    var pos    = 0
+    var sizes  = List.empty[Int]
+    var ok     = true
+    var sawAny = false
+    while (ok && pos < body.length) {
+      while (pos < body.length && body.charAt(pos).isWhitespace) pos += 1
+      if (pos < body.length) {
+        nestedKw.findPrefixMatchOf(body.substring(pos)) match {
+          case Some(kwM) =>
+            val isUnion = kwM.group(1) == "union"
+            val absOpen = pos + kwM.end - 1
+            var depth = 0
+            var i = absOpen
+            var closeIdx = -1
+            while (i < body.length && closeIdx < 0) {
+              body.charAt(i) match {
+                case '{' => depth += 1
+                case '}' => depth -= 1; if (depth == 0) closeIdx = i
+                case _   =>
+              }
+              i += 1
+            }
+            if (closeIdx < 0) ok = false
+            else nameAt.findPrefixMatchOf(body.substring(closeIdx + 1)) match {
+              case Some(nm) =>
+                segmentSizes(body.substring(absOpen + 1, closeIdx), filePath) match {
+                  case Some(innerSizes) if innerSizes.nonEmpty =>
+                    sizes = sizes :+ aggregateLayoutBytes(innerSizes, isUnion)
+                    sawAny = true
+                    pos = closeIdx + 1 + nm.end
+                  case _ => ok = false
+                }
+              case None => ok = false
+            }
+          case None =>
+            val semiIdx = body.indexOf(';', pos)
+            if (semiIdx < 0) { ok = false }
+            else {
+              val seg = body.substring(pos, semiIdx).trim
+              pos = semiIdx + 1
+              if (seg.nonEmpty) {
+                sawAny = true
+                val segSize = seg match {
+                  case nestedArrayDeclLine(tyPart, _, sizeExpr) if !tyPart.exists(",(){}:".contains(_)) =>
+                    val n =
+                      if (sizeExpr.trim.matches("""\d+""")) Some(sizeExpr.trim.toInt)
+                      else resolveMacroArraySize(sizeExpr, filePath)
+                    n.flatMap(nn => memberSizeofBytes(tyPart.trim).map(_ * nn))
+                  case _ if seg.exists(",[(){}:".contains(_)) => None
+                  case declLine(tyPart, _) => memberSizeofBytes(tyPart.trim)
+                  case _ => None
+                }
+                segSize match {
+                  case Some(sz) => sizes = sizes :+ sz
+                  case None     => ok = false
+                }
+              }
+            }
         }
       }
-      if (sizes.forall(_.isDefined)) Some(sizes.map(_.get).toList) else None
     }
+    if (ok && sawAny) Some(sizes) else None
   }
 
   def anonymousNestedAggregateMemberSizes(td: TypeDecl, memberName: String,
@@ -2848,19 +2939,8 @@ import scala.annotation.tailrec
     * the SAME layout arithmetic `aggregateSizeofBytes` already uses for a
     * normal, Joern-visible aggregate -- reused directly, not duplicated. */
   def anonymousNestedAggregateSize(td: TypeDecl, memberName: String, isUnion: Boolean): Option[Int] =
-    anonymousNestedAggregateMemberSizes(td, memberName, isUnion).flatMap { szs =>
-      if (szs.isEmpty) None
-      else if (isUnion) Some(szs.max)
-      else {
-        var offset   = 0
-        var maxAlign = 1
-        szs.foreach { sz =>
-          if (sz > maxAlign) maxAlign = sz
-          offset = ((offset + sz - 1) / sz) * sz; offset += sz
-        }
-        Some(((offset + maxAlign - 1) / maxAlign) * maxAlign)
-      }
-    }
+    anonymousNestedAggregateMemberSizes(td, memberName, isUnion)
+      .filter(_.nonEmpty).map(aggregateLayoutBytes(_, isUnion))
 
   def aggregateSizeofBytes(ty: String): Option[Int] =
     structTypeDeclOfAny(ty).flatMap { td =>
