@@ -2768,37 +2768,32 @@ import scala.annotation.tailrec
     * own bail conditions) -- callers must treat that as "unproven," never as a
     * negative answer, so a struct this scheme cannot read never gets miscounted as
     * "confirmed not a pointer." */
-  def fieldTypeHasPointerFromText(td: TypeDecl, field: String): Option[Boolean] =
-    structBodyText(td).map(stripNestedBraces).flatMap { body =>
-      val cleaned = body.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
-      val segments = cleaned.split(";").map(_.trim).filter(_.nonEmpty)
-      val fnPtrName = """\(\s*\*\s*([A-Za-z_]\w*)\s*\)""".r
-      val plainName = """^.*[\s\*]([A-Za-z_]\w*)(?:\s*\[[^\]]*\])?$""".r
-      segments.collectFirst {
-        case seg if fnPtrName.findFirstMatchIn(seg).exists(_.group(1) == field) => true
-        case seg if !seg.contains(",") && !seg.contains(":") &&
-                    (seg match { case plainName(nm) => nm == field; case _ => false }) =>
-          seg.contains("*")
-      }
+  /** The field-scanning core of `fieldTypeHasPointerFromText`, factored out so
+    * `castFieldOperandPointerShaped`'s own two-hop case (just below) can run the
+    * IDENTICAL segment scan against a nested anonymous union/struct's own inner
+    * body text (`anonymousNestedAggregates`'s own `innerBodyText`) rather than a
+    * whole `TypeDecl`'s -- there is no `TypeDecl` for an anonymous member to
+    * pass in at all (confirmed live: Joern gives an anonymous union MEMBER's own
+    * `typeFullName` as the bare, non-identifying string `"union"`, and creates no
+    * separate `TypeDecl` anywhere carrying its real member list), so the text
+    * this scans has to come from the SOURCE, already-extracted-by-brace-matching
+    * inner body instead. */
+  def fieldTypeIsPointerInBodyText(rawBody: String, field: String): Option[Boolean] = {
+    val body = stripNestedBraces(rawBody)
+    val cleaned = body.replaceAll("/\\*(?s:.*?)\\*/", "").replaceAll("//[^\n]*", "")
+    val segments = cleaned.split(";").map(_.trim).filter(_.nonEmpty)
+    val fnPtrName = """\(\s*\*\s*([A-Za-z_]\w*)\s*\)""".r
+    val plainName = """^.*[\s\*]([A-Za-z_]\w*)(?:\s*\[[^\]]*\])?$""".r
+    segments.collectFirst {
+      case seg if fnPtrName.findFirstMatchIn(seg).exists(_.group(1) == field) => true
+      case seg if !seg.contains(",") && !seg.contains(":") &&
+                  (seg match { case plainName(nm) => nm == field; case _ => false }) =>
+        seg.contains("*")
     }
+  }
 
-  /** `castOperandIsPointerShaped`'s own check, extended to a field/index-access
-    * operand whose FIELD's type Joern could not resolve but the real struct
-    * source text (`fieldTypeHasPointerFromText`, just above) confirms is a
-    * pointer -- see that function's own doc comment for why this case exists and
-    * is sound. Kept as a SEPARATE function rather than folded into
-    * `castOperandIsPointerShaped` itself: that def sits well before
-    * `fieldReceiverAggregateType`/`structTypeDeclOfAny`/
-    * `fieldTypeHasPointerFromText` in this file's own top-level body, and this
-    * script's forward-reference rule (`isNullLiteral`'s own doc comment has the
-    * full explanation) would reject the call from there. */
-  def castFieldOperandPointerShaped(operand: AstNode): Boolean =
-    asField(operand).exists { case (recv, field) =>
-      fieldReceiverAggregateType(staticTypeOf(recv))
-        .flatMap(structTypeDeclOfAny)
-        .flatMap(fieldTypeHasPointerFromText(_, field))
-        .getOrElse(false)
-    }
+  def fieldTypeHasPointerFromText(td: TypeDecl, field: String): Option[Boolean] =
+    structBodyText(td).flatMap(fieldTypeIsPointerInBodyText(_, field))
 
   /** A bitfield member (research.md §4): `typeFullName` alone stays the plain base
     * type (`int x : 3` has `typeFullName=int`), so the width survives only in the
@@ -3010,6 +3005,59 @@ import scala.annotation.tailrec
           result
       }
     })
+
+  /** `castOperandIsPointerShaped`'s own check, extended to a field/index-access
+    * operand whose FIELD's type Joern could not resolve but the real struct
+    * source text (`fieldTypeHasPointerFromText`, just above) confirms is a
+    * pointer -- see that function's own doc comment for why this case exists and
+    * is sound. Kept as a SEPARATE function rather than folded into
+    * `castOperandIsPointerShaped` itself: that def sits well before
+    * `fieldReceiverAggregateType`/`structTypeDeclOfAny`/
+    * `fieldTypeHasPointerFromText` in this file's own top-level body, and this
+    * script's forward-reference rule (`isNullLiteral`'s own doc comment has the
+    * full explanation) would reject the call from there.
+    *
+    * `010-reach-90pct-hole-free`: positioned HERE, after `anonymousNestedAggregates`
+    * rather than at its original spot right after `fieldTypeHasPointerFromText`,
+    * for the identical forward-reference reason -- the two-hop case just below
+    * calls `anonymousNestedAggregates`, defined immediately above, and this
+    * script's own forward-reference rule rejects a call crossing an
+    * intervening `val` (confirmed by trying the original position first: it
+    * failed with exactly the `arrayShape`-style error this file's other
+    * comments already document). */
+  def castFieldOperandPointerShaped(operand: AstNode): Boolean =
+    asField(operand).exists { case (recv, field) =>
+      fieldReceiverAggregateType(staticTypeOf(recv))
+        .flatMap(structTypeDeclOfAny)
+        .flatMap(fieldTypeHasPointerFromText(_, field))
+        .getOrElse(false) ||
+      // `010-reach-90pct-hole-free`: the SECOND-hop of a chain through an
+      // anonymous union/struct member -- `pExpr->u.zToken`, where `u` is
+      // `union { char *zToken; int iValue; } u;` declared inline inside
+      // `Expr`'s own body with no tag name at all. `recv` here is itself a
+      // field access (`pExpr->u`), and `staticTypeOf(recv)` resolves (via
+      // `memberTypes`) to the bare, non-identifying string Joern gives EVERY
+      // anonymous union member's own `typeFullName`: literally `"union"`
+      // (confirmed live), which is not merely unresolved but actively
+      // MISLEADING -- `fieldReceiverAggregateType`/`structTypeDeclOfAny`
+      // above already can't do anything useful with it, since no `TypeDecl`
+      // anywhere carries "union"'s own member list (there IS no such type;
+      // "union" is not a name, it's Joern's placeholder for "anonymous").
+      // The real member list already has a home: `anonymousNestedAggregates`
+      // (built for the SIZING side of this exact idiom, `009`) reads it
+      // straight from `Expr`'s own source text by brace-matching, keyed by
+      // the OUTER field name (`u`) off the ENCLOSING struct's `TypeDecl`
+      // (`Expr`, found the ordinary way via `recv`'s OWN receiver, one hop
+      // further up) -- so this asks for `recv`'s receiver's aggregate type,
+      // not `recv`'s own (unusable) one.
+      asField(recv).exists { case (recv2, outerField) =>
+        fieldReceiverAggregateType(staticTypeOf(recv2))
+          .flatMap(structTypeDeclOfAny)
+          .flatMap(td => anonymousNestedAggregates(td).get(outerField))
+          .flatMap { case (_, innerBody) => fieldTypeIsPointerInBodyText(innerBody, field) }
+          .getOrElse(false)
+      }
+    }
 
   /** `010-reach-90pct-hole-free`: the layout arithmetic `anonymousNestedAggregateSize`
     * already applies to ONE resolved nested aggregate's own member-size list --
