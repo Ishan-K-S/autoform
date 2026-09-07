@@ -5555,6 +5555,77 @@ import scala.annotation.tailrec
     else if (kids.size > 1) classifyInitElements(kids)
     else hole("op:arrayDecl:size")
 
+  /** `010-reach-90pct-hole-free`: is `n` an EXPRESSION (not merely a bare
+    * NAME) provably yielding a `Val.iref` -- the general form of the
+    * "PROVABLY holding an interior pointer VALUE" question `ptrIrefNames`
+    * itself only ever answered for a bare identifier/parameter. Every
+    * consumption site that used to check `rawLocalOrParamName(n).map(localName)
+    * .exists(ptrIrefNames.contains)` and then hand-build a `{k:"name",v:nm}`
+    * JSON object now instead checks `isIrefExpr(n)` and, if true, simply calls
+    * `expr(n)` -- sound because `derefIref`/`setDerefIref` (`Syntax.lean`)
+    * both take an arbitrary `Expr`, not specifically a name, and `expr()`'s
+    * own existing dispatch for EVERY shape this recognizes (a bare identifier,
+    * an address-of-array/struct/field, ordinary `+`/`-` arithmetic, a ternary,
+    * a pointer-to-pointer cast) already translates each one correctly on its
+    * own terms -- there was never a Core-semantics reason this had to be a
+    * bare name specifically, only that no consumption site had previously
+    * asked the more general question.
+    *
+    * Recognizes, recursively:
+    *   - a bare name already in `ptrIrefNames` (the original, narrower case);
+    *   - `&expr` in one of the shapes `ptrIrefNames`'s OWN classifier already
+    *     trusts (array/struct/field address-of);
+    *   - `base + n` / `base - n` / `n + base`, `base` itself `isIrefExpr` and
+    *     the OTHER operand confirmed NOT pointer-shaped (so a genuine pointer
+    *     DIFFERENCE, an INTEGER in C, is never mistaken for a new pointer --
+    *     the identical safeguard `classifyIrefAssignRhs` already relies on,
+    *     applied here to an INLINE expression instead of an assignment's RHS);
+    *   - `cond ? a : b`, BOTH branches `isIrefExpr` (Core already translates
+    *     a ternary as an ordinary value-producing `cond` node -- see `expr`'s
+    *     own `<operator>.conditional` case -- so nothing new is needed there,
+    *     only the WIDER recognition that both of ITS branches are safe);
+    *   - a pointer-to-pointer cast wrapping an `isIrefExpr` operand (the
+    *     identical "cast is a transparent pass-through" reasoning
+    *     `castOperandIsPointerShaped`'s own doc comment already argues for,
+    *     applied to THIS narrower question instead of the general one). */
+  def isIrefExpr(n: AstNode): Boolean = n match {
+    case i: Identifier        => ptrIrefNames.contains(localName(i.name))
+    case p: MethodParameterIn => ptrIrefNames.contains(localName(p.name))
+    case c: Call if c.methodFullName == "<operator>.addressOf" =>
+      kidsOf(c) match {
+        case List(operand) =>
+          boxedArrayIndexOperand(operand).isDefined ||
+          boxedStructFieldOperand(operand).isDefined ||
+          pointerStructFieldOperand(operand).isDefined ||
+          boxedStructArrayIndexOperand(operand).isDefined ||
+          pointerStructArrayIndexOperand(operand).isDefined
+        case _ => false
+      }
+    case c: Call if c.methodFullName == "<operator>.addition" =>
+      kidsOf(c) match {
+        case List(a, b) =>
+          (isIrefExpr(a) && !isPointerType(staticTypeOf(b))) ||
+          (isIrefExpr(b) && !isPointerType(staticTypeOf(a)))
+        case _ => false
+      }
+    case c: Call if c.methodFullName == "<operator>.subtraction" =>
+      kidsOf(c) match {
+        case List(a, b) => isIrefExpr(a) && !isPointerType(staticTypeOf(b))
+        case _ => false
+      }
+    case c: Call if c.methodFullName == "<operator>.conditional" =>
+      kidsOf(c) match {
+        case List(_, t, e) => isIrefExpr(t) && isIrefExpr(e)
+        case _ => false
+      }
+    case c: Call if c.methodFullName == "<operator>.cast" =>
+      kidsOf(c) match {
+        case List(_, operand) => isIrefExpr(operand)
+        case _ => false
+      }
+    case _ => false
+  }
+
   def callExpr(c: Call): ujson.Obj = {
     val kids = kidsOf(c)
     val mfn  = c.methodFullName
@@ -5620,12 +5691,16 @@ import scala.annotation.tailrec
     // walking a freshly `boxArray`-allocated buffer, `ptrIrefNames`-tracked, not
     // `strCursorParams`-tracked, since a WRITE-target name is excluded from the
     // read-only string-cursor mechanism entirely (`derefWriteTarget`)).
+    // `010-reach-90pct-hole-free`: generalized from "two bare tracked names" to
+    // `isIrefExpr` on each side -- `applyBinop`'s own same-object dynamic check
+    // cares only that BOTH runtime values are SOME `Val.iref`, never how each
+    // one's own expression happens to be spelled, so `(p+4) - zOut`/`p == (cond
+    // ? a : b)` are exactly as sound as the original bare-name-only case.
     else if (cLikeFile && kids.size == 2 &&
              Set("<operator>.subtraction", "<operator>.lessThan", "<operator>.lessEqualsThan",
                  "<operator>.greaterThan", "<operator>.greaterEqualsThan",
                  "<operator>.equals", "<operator>.notEquals").contains(mfn) &&
-             rawLocalOrParamName(kids(0)).map(localName).exists(ptrIrefNames.contains) &&
-             rawLocalOrParamName(kids(1)).map(localName).exists(ptrIrefNames.contains))
+             isIrefExpr(kids(0)) && isIrefExpr(kids(1)))
       ujson.Obj("k" -> "binop", "op" -> binops(mfn), "a" -> expr(kids(0)), "b" -> expr(kids(1)))
     // `010-reach-90pct-hole-free` US4: `p < end` / `p == q` / ... -- TWO tracked
     // byte cursors, compared. Sound exactly when both provably measure offsets
@@ -5701,11 +5776,13 @@ import scala.annotation.tailrec
     // reuses it verbatim rather than inventing anything new. Checked BEFORE the
     // boxed-array case just below (a `ptrIrefNames` name and a `boxedArrays` name
     // are never the same one).
-    else if (indexOps.contains(mfn) && kids.size == 2 &&
-             rawLocalOrParamName(kids(0)).map(localName).exists(ptrIrefNames.contains)) {
-      val nm = rawLocalOrParamName(kids(0)).map(localName).get
+    // `010-reach-90pct-hole-free`: generalized from a bare-name-only receiver
+    // to `isIrefExpr` -- `(p+4)[i]`/`(cond ? a : b)[i]` now recognized too, via
+    // `expr(kids(0))` rather than a hand-built name reference (`isIrefExpr`'s
+    // own doc comment has the full reasoning).
+    else if (indexOps.contains(mfn) && kids.size == 2 && isIrefExpr(kids(0))) {
       ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "binop", "op" -> "+",
-        "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> expr(kids(1))))
+        "a" -> expr(kids(0)), "b" -> expr(kids(1))))
     }
     // `006-reduce-remaining-holes`, Story 5: `a[i]`, `a` a recognized boxed array
     // -- reads through the box (`irefIndex`+`derefIref`) rather than the ordinary
@@ -6056,8 +6133,17 @@ import scala.annotation.tailrec
       // interior pointer VALUE for its whole lifetime (`ptrIrefNames`) -- `p`
       // itself is unboxed, so this reads straight through its own binding,
       // unlike the `ptrAliases`/`closedOutParams` box-field reads just below.
-      if (nm.exists(ptrIrefNames.contains))
-        ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "name", "v" -> nm.get))
+      //
+      // `010-reach-90pct-hole-free`: generalized from a bare-name-only check
+      // to `isIrefExpr` -- `*(p + n)`/`*(cond ? a : b)`/`*(SomeType*)p` (a
+      // defensive cast wrapping any of the above) are now recognized too, not
+      // just a bare tracked identifier. `expr(kids(0))` (not a hand-built
+      // `{k:"name",...}`) is what actually makes this general: `derefIref`
+      // (`Syntax.lean`) takes an arbitrary `Expr`, and `expr()`'s own dispatch
+      // already correctly translates every one of these shapes on its own
+      // terms (`isIrefExpr`'s own doc comment has the full argument).
+      if (isIrefExpr(kids(0)))
+        ujson.Obj("k" -> "derefIref", "p" -> expr(kids(0)))
       // `009-reduce-remaining-holes-4`: `*z`/`*(u8*)z`, `z` a tracked byte cursor
       // (`strCursorParams`) -- read the byte at `z`'s own current offset.
       // `rawNameThroughCast` (not the strict `nm` above) so a defensive cast
@@ -7037,10 +7123,22 @@ import scala.annotation.tailrec
       // interior pointer VALUE for its whole lifetime (`ptrIrefNames`) -- write
       // side of `callExpr`'s matching `<operator>.indirection` read case. `p`
       // itself is unboxed, so this writes straight through its own binding.
+      // `010-reach-90pct-hole-free`: generalized from a bare-name-only check to
+      // `isIrefExpr` -- see `callExpr`'s matching READ-side case (and
+      // `isIrefExpr`'s own doc comment) for the full reasoning; `pRef` built
+      // via `expr(kidsOf(c)(0))` rather than a hand-constructed name reference
+      // is what makes this general, since `setDerefIref` takes an arbitrary
+      // `Expr`. `pRef` is computed ONCE and reused for both the pointer AND
+      // the read-half of `combine`'s own augmented-assignment expansion, so an
+      // impure pointer expression (only possible via a ternary branch's own
+      // impurity, everything else `isIrefExpr` admits is pure) is never
+      // double-evaluated -- matching this file's own established discipline
+      // for exactly this hazard elsewhere (`assign:aug-impure-target`/
+      // `-receiver`).
       case c: Call if c.methodFullName == "<operator>.indirection" && kidsOf(c).size == 1 &&
-                       rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(ptrIrefNames.contains) =>
-        val nm = rawLocalOrParamName(kidsOf(c)(0)).map(localName).get
-        val pRef = ujson.Obj("k" -> "name", "v" -> nm)
+                       isIrefExpr(kidsOf(c)(0)) &&
+                       (aug.isEmpty || pureNode(kidsOf(c)(0))) =>
+        val pRef = expr(kidsOf(c)(0))
         ujson.Obj("k" -> "setDerefIref", "p" -> pRef,
                   "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> pRef)))
       case c: Call if c.methodFullName == "<operator>.indirection" && kidsOf(c).size == 1 &&
@@ -7084,16 +7182,25 @@ import scala.annotation.tailrec
       // impure `b` a second time -- so this matches this file's own established
       // `assign:aug-impure-target` discipline (the generic `asIndex` case's
       // sibling above) rather than silently double-evaluating it.
-      case ia if asIndex(ia).isDefined &&
-                 rawLocalOrParamName(asIndex(ia).get._1).map(localName).exists(ptrIrefNames.contains) =>
+      // `010-reach-90pct-hole-free`: generalized from a bare-name-only check
+      // to `isIrefExpr` (`isIrefExpr`'s own doc comment has the full
+      // reasoning) -- `a` built via `expr(a)` rather than a hand-constructed
+      // name reference, so `(p + n)[i] = v`/`(cond ? x : y)[i] = v` are now
+      // recognized too, not just a bare tracked identifier. `aug.isDefined &&
+      // !pureNode(a)` guards the SAME double-evaluation hazard `b`'s own
+      // check just below guards (this file's established `assign:aug-impure-
+      // .../-receiver` discipline) -- a bare name is always pure, so this is
+      // a no-op for the original case and only actually excludes a genuinely
+      // impure RECEIVER expression admitted by the new arithmetic/ternary
+      // shapes.
+      case ia if asIndex(ia).isDefined && isIrefExpr(asIndex(ia).get._1) &&
+                 (aug.isEmpty || pureNode(asIndex(ia).get._1)) =>
         val (a, b) = asIndex(ia).get
-        val nm = rawLocalOrParamName(a).map(localName).get
         if (aug.isDefined && !pureNode(b)) holeS("assign:aug-impure-target")
         else {
           val (pb, be) = exprV(b)
           indexPrelude = pb
-          val p = ujson.Obj("k" -> "binop", "op" -> "+",
-                            "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> be)
+          val p = ujson.Obj("k" -> "binop", "op" -> "+", "a" -> expr(a), "b" -> be)
           ujson.Obj("k" -> "setDerefIref", "p" -> p,
                     "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> p)))
         }
@@ -7249,12 +7356,10 @@ import scala.annotation.tailrec
     // `009-reduce-remaining-holes-4`: consistent with `assignTo`'s/`callExpr`'s
     // own `ptrIrefNames` read (this same push) -- a plain `index` read would
     // silently mistranslate identically to the `boxedArrays` case just below.
-    case ia if asIndex(ia).isDefined &&
-               rawLocalOrParamName(asIndex(ia).get._1).map(localName).exists(ptrIrefNames.contains) =>
+    case ia if asIndex(ia).isDefined && isIrefExpr(asIndex(ia).get._1) =>
       val (a, b) = asIndex(ia).get
-      val nm = rawLocalOrParamName(a).map(localName).get
       Some(ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "binop", "op" -> "+",
-        "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> expr(b))))
+        "a" -> expr(a), "b" -> expr(b))))
     // `006-reduce-remaining-holes`, Story 5: consistent with `assignTo`'s/
     // `callExpr`'s own boxed-array read -- a plain `index` read would silently
     // mistranslate (Core's `Expr.index` does not accept a `Val.iref` receiver).
@@ -7291,10 +7396,12 @@ import scala.annotation.tailrec
     // straight through its own binding; `ptrAliases`/`closedOutParams` after,
     // via `boxField`), reused rather than duplicated.
     case c: Call if c.methodFullName == "<operator>.indirection" && kidsOf(c).size == 1 =>
-      val nm = rawLocalOrParamName(kidsOf(c)(0)).map(localName)
-      if (nm.exists(ptrIrefNames.contains))
-        Some(ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "name", "v" -> nm.get)))
-      else nm.flatMap(ptrAliases.get).orElse(nm.filter(closedOutParams.contains)).map(boxField)
+      if (isIrefExpr(kidsOf(c)(0)))
+        Some(ujson.Obj("k" -> "derefIref", "p" -> expr(kidsOf(c)(0))))
+      else {
+        val nm = rawLocalOrParamName(kidsOf(c)(0)).map(localName)
+        nm.flatMap(ptrAliases.get).orElse(nm.filter(closedOutParams.contains)).map(boxField)
+      }
     case _ => None
   }
 
@@ -7472,12 +7579,11 @@ import scala.annotation.tailrec
     // `exprV`-never-routes-through-`callExpr` reason the `boxedArrays` case just
     // below already documents for itself.
     case c: Call if indexOps.contains(c.methodFullName) && kidsOf(c).size == 2 &&
-                    rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(ptrIrefNames.contains) =>
+                    isIrefExpr(kidsOf(c)(0)) =>
       val List(a, b) = kidsOf(c)
-      val nm = rawLocalOrParamName(a).map(localName).get
       val (pb, be) = exprV(b)
       (pb, ujson.Obj("k" -> "derefIref", "p" -> ujson.Obj("k" -> "binop", "op" -> "+",
-        "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> be)))
+        "a" -> expr(a), "b" -> be)))
     case c: Call if indexOps.contains(c.methodFullName) && kidsOf(c).size == 2 &&
                     rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(boxedArrays.contains) =>
       val List(a, b) = kidsOf(c)
