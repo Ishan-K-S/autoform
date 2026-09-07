@@ -2476,6 +2476,22 @@ import scala.annotation.tailrec
     val b = bareType(ty)
     if (isClassType(ty)) Some(b)
     else if (b.endsWith("*") && isClassType(b.dropRight(1))) Some(b.dropRight(1))
+    // `010-reach-90pct-hole-free`: a struct declared with an explicit TAG NAME
+    // but lexically NESTED inside another struct's own body (`struct FKey {
+    // ...; struct sColMap {...} aCol[1]; ...};`) is invisible to
+    // `isClassType`/`aggregateNames` entirely -- both are keyed off Joern's
+    // member/method-bearing `TypeDecl` set, and a nested tag's OWN bare-name
+    // entry is an always-EMPTY stub (`structTypeDeclOfAny`'s own doc comment
+    // has the full evidence: confirmed live, `sColMap` on its own reports
+    // zero members and 7 characters of code, while the real, two-member body
+    // lives under the QUALIFIED name `FKey.sColMap`). A qualified declaration
+    // existing for this exact name AT ALL is itself sufficient proof the name
+    // genuinely is a struct tag, regardless of whether ITS OWN member list
+    // happens to be populated -- `structTypeDeclOfAny`'s own matching case,
+    // consulted by every caller of THIS function, is what actually reads the
+    // real content back out via `fieldTypeHasPointerFromText`'s text-based
+    // fallback once this returns `Some`. */
+    else if (typeDeclsByName.keys.exists(_.endsWith("." + b))) Some(b)
     else None
   }
 
@@ -2546,8 +2562,44 @@ import scala.annotation.tailrec
     * reports ZERO members under every name variant Joern gives it, so
     * `structTypeDeclOf` itself would never hand back a `TypeDecl` for it at
     * all, text-fallback or not. */
-  def structTypeDeclOfAny(ty: String): Option[TypeDecl] =
-    structTypeDeclOf(ty).orElse(typeDeclsByName.get(bareType(ty)).flatMap(_.headOption))
+  /** `010-reach-90pct-hole-free`: a struct declared with an explicit TAG NAME
+    * but LEXICALLY NESTED inside another struct's own body (`struct FKey {
+    * ...; struct sColMap { int iFrom; char *zCol; } aCol[1]; ...};`) --
+    * Joern qualifies that inner declaration's OWN `fullName` with the
+    * ENCLOSING struct's name as a prefix (`FKey.sColMap`), but nothing about
+    * `aCol`'s own declared TYPE (what every caller here actually looks `ty`
+    * up BY) carries that prefix at all -- a bare-name lookup for `sColMap`
+    * alone only ever finds an UNRELATED, always-empty stub `TypeDecl` Joern
+    * also creates under that same bare name (confirmed live: `sColMap` on
+    * its own reports zero members and 7 characters of `code`, while
+    * `FKey.sColMap` reports the real two-member body), never the real
+    * declaration, regardless of how many times the bare-name lookup is
+    * retried. Searched for ONLY when the ordinary bare lookup found nothing
+    * with real members -- this can only ADD capability, never take away an
+    * existing correct resolution, since it is consulted strictly after
+    * `structTypeDeclOf`'s own member-bearing search already came up empty.
+    *
+    * Deliberately NOT `.find(_.member.nonEmpty)` on this qualified branch,
+    * unlike `structTypeDeclOf`'s own bare-name search above: confirmed live,
+    * `FKey.sColMap` ITSELF reports zero structural members despite having
+    * the real two-member body in its `.code` text (Joern's C frontend simply
+    * never populates `member` for a struct declared inline as a field's own
+    * type, only its bare, unrelated stub twin does NOT have the real code
+    * either -- so requiring non-emptiness here would reject the one and only
+    * `TypeDecl` that ever carries this shape's real content, defeating the
+    * whole point of searching for it). Safe to take unconditionally because
+    * the qualified-suffix match is already scoped tightly enough (exactly
+    * one enclosing-struct-qualified name can end in `"." + bt`) that no
+    * unrelated `TypeDecl` competes for it. `fieldTypeHasPointerFromText`'s
+    * own text-based `.code` reading is what actually recovers the real
+    * member types from here -- it never needed the structural member list. */
+  def structTypeDeclOfAny(ty: String): Option[TypeDecl] = {
+    val bt = bareType(ty)
+    structTypeDeclOf(ty)
+      .orElse(typeDeclsByName.keys.find(_.endsWith("." + bt))
+        .flatMap(typeDeclsByName.get).flatMap(_.headOption))
+      .orElse(typeDeclsByName.get(bt).flatMap(_.headOption))
+  }
 
   /** `009-reduce-remaining-holes-4`: the field NAMES of a top-level struct/union
     * declaration, IN ORDER -- needed to positionally match a C aggregate
