@@ -922,6 +922,37 @@ import scala.annotation.tailrec
     * `Map.empty` everywhere except inside a function whose gotos have been proved
     * (by `methodBody`) to be exactly this shape. */
   var gotoTailStmts: Map[String, List[AstNode]] = Map.empty
+  /** `010-reach-90pct-hole-free` US6: labels whose `gotoTailStmts` expansion is
+    * CURRENTLY on the Scala call stack -- a cycle guard for the `"GOTO"` dispatch
+    * just below, not for `resolvedTailStmts` itself (that function's own
+    * depth bound already prevents an unbounded CHAIN of DISTINCT labels).
+    *
+    * The gap this closes is different and real: `resolvedTailStmts` treats a
+    * conditional `goto` (one wrapped in an `if`, not a bare top-level statement)
+    * as "does not affect reachability" and correctly scans past it to find the
+    * real exit further down -- but that conditional `goto` is still PART OF the
+    * resolved tail it returns (an `if` node is opaque to the scan, its own
+    * contents untouched). If that `if`'s own body is `goto L` for the SAME
+    * label `L` this tail belongs to -- a genuine, common C idiom, "retry from
+    * this label" (confirmed live: SQLite's own `statNext`/`statNextRestart`) --
+    * then translating the resolved tail via `stmts()` reaches that inner `goto
+    * L` and re-enters this SAME `"GOTO"` dispatch case, which re-expands
+    * `gotoTailStmts(L)` -- the IDENTICAL list, containing the IDENTICAL inner
+    * `goto L` -- forever: unbounded Scala recursion (a real `StackOverflowError`,
+    * confirmed live crashing the exporter on the real corpus), because nothing
+    * about `resolvedTailStmts`'s OWN termination argument (which is about the
+    * SPLICE's own runtime control flow, not about how many times the EXPORTER
+    * re-visits the same static node) bounds this.
+    *
+    * `expandingGotoLabels` tracks exactly this: before expanding `L`, add it
+    * here; after, remove it. If `L` is already present when the dispatch is
+    * about to expand it again, the correct answer is the SAME one `stmt()`
+    * already gives an unrecognized `goto` -- an honest `control:GOTO` hole --
+    * not a guess, and not a crash. This never fires for the acyclic case (the
+    * ordinary "several labels funnel into one shared, non-self-referential
+    * cleanup" pattern this whole feature targets), since no label there is
+    * ever mid-expansion when reached again. */
+  var expandingGotoLabels: Set[String] = Set.empty
 
   /** C and C++ specifically, as opposed to the whole `cLike` *dialect* family (which
     * includes Java, Go, JS, TS and Kotlin). The constructor spelling `Cls::Cls`, the
@@ -6931,8 +6962,13 @@ import scala.annotation.tailrec
         // a fresh copy of `L`'s own tail, re-translated in place. Everything else
         // (a backward jump, a jump into a loop, an unproven label) keeps the
         // `control:GOTO` hole, exactly as before either mechanism existed.
-        case "GOTO" if kids.size == 1 && gotoTailStmts.contains(kids.head.code.trim) =>
-          seqOf(stmts(gotoTailStmts(kids.head.code.trim)))
+        case "GOTO" if kids.size == 1 && gotoTailStmts.contains(kids.head.code.trim) &&
+                       !expandingGotoLabels.contains(kids.head.code.trim) =>
+          val label = kids.head.code.trim
+          expandingGotoLabels += label
+          val result = seqOf(stmts(gotoTailStmts(label)))
+          expandingGotoLabels -= label
+          result
         case "BREAK"    => ujson.Obj("k" -> "brk")
         case "CONTINUE" => ujson.Obj("k" -> "cont")
         case "ELSE" | "CATCH" | "FINALLY" => seqOf(kids.map(stmt))
@@ -7161,6 +7197,82 @@ import scala.annotation.tailrec
       }
       ks.indexWhere(_ eq cur)
     }
+    /** `010-reach-90pct-hole-free` US6: generalizes `tailAlwaysExits` below from
+      * "is `ks.last` a bare `Return`" to "does a forward scan from this label's
+      * own position reach a bare `Return` (truncate there -- everything after is
+      * unreachable dead code w.r.t. THIS label, regardless of what it looks
+      * like) or a bare `goto` to ANOTHER label whose OWN resolution
+      * (recursively, memoized, depth-bounded against a cycle) also terminates."
+      *
+      * Live-diagnosed as the real shape blocking SQLite's own dominant
+      * multi-label idiom: `sqlite3VdbeExec`'s `abort_due_to_error`/
+      * `vdbe_return`/`too_big`/`no_mem`/`abort_due_to_interrupt` cluster.
+      * `too_big`/`no_mem`/`abort_due_to_interrupt`'s own tails each end in
+      * nothing but a BACKWARD `goto abort_due_to_error`; `abort_due_to_error`
+      * itself falls through NORMALLY into `vdbe_return`, whose own tail
+      * contains the actual `return rc;` partway through, with `too_big`/
+      * `no_mem`/`abort_due_to_interrupt`'s own (now genuinely unreachable, once
+      * that return fires) code trailing after it in `ks`. `tailAlwaysExits`'s
+      * "check only `ks.last`" cannot see this at all: the function's own
+      * absolute last statement is `abort_due_to_interrupt`'s trailing `goto
+      * abort_due_to_error`, never a `Return` -- but the CHAIN it starts does,
+      * unconditionally, terminate in one.
+      *
+      * Depth-bounded by `labels.size` -- a genuine bound, not a heuristic:
+      * there are only that many distinct labels to visit before a cycle is
+      * guaranteed, so a chain that has not resolved by then never will.
+      * Returns `None` in that case, the same conservative answer a genuine
+      * infinite `goto` cycle deserves, never a guess. Memoized because
+      * `multiLabelOk` below calls this once per declared label, and each call
+      * can itself recurse through several others.
+      *
+      * Deliberately narrow, matching `tailAlwaysExits`'s own established
+      * precedent ("a bare `Return` node, not e.g. an `if`/`else` where both
+      * branches return"): only a BARE, top-level `Return` or a BARE, top-level,
+      * single-target `goto` decide anything here. Any other top-level statement
+      * (an `if`, a call, an assignment, ...) cannot itself transfer control out
+      * of this flat list, so the scan simply continues past it.
+      *
+      * Returns the flattened, fully-resolved statement list to splice in place
+      * of a `goto` targeting this label, with every in-scope backward/forward
+      * `goto` already "inlined" by concatenation -- so the returned list itself
+      * contains no unresolved `goto` to a label this same resolution pass
+      * covers, and re-translating it via the ordinary `stmt()`/`gotoTailStmts`
+      * dispatch can never recurse back into this computation. */
+    val resolvedTailCache = scala.collection.mutable.Map.empty[String, Option[List[AstNode]]]
+    def resolvedTailStmts(labelName: String, depth: Int): Option[List[AstNode]] =
+      if (depth > labels.size) None
+      else resolvedTailCache.getOrElseUpdate(labelName + "@" + depth, {
+        val labelIdx = ks.indexWhere { case j: JumpTarget => j.name == labelName; case _ => false }
+        if (labelIdx < 0) None
+        else {
+          val start = labelIdx + 1
+          var i = start
+          var result: Option[List[AstNode]] = None
+          var done = false
+          while (!done && i < ks.size) {
+            ks(i) match {
+              case _: Return =>
+                result = Some(ks.slice(start, i + 1))
+                done = true
+              case g: ControlStructure if g.controlStructureType == "GOTO" =>
+                kidsOf(g) match {
+                  case List(t) =>
+                    val targetName = t.code.trim
+                    val targetIdx = ks.indexWhere { case j: JumpTarget => j.name == targetName; case _ => false }
+                    if (targetIdx >= 0)
+                      result = resolvedTailStmts(targetName, depth + 1).map(inner => ks.slice(start, i) ++ inner)
+                  case _ =>
+                }
+                done = true
+              case _ =>
+                i += 1
+            }
+          }
+          result
+        }
+      })
+
     val targets = jumps.flatMap(g => kidsOf(g).map(_.code.trim)).distinct
     val singleLabelOk =
       jumps.nonEmpty && labels.size == 1 && idx >= 0 && (labels.head eq ks(idx)) &&
@@ -7238,7 +7350,13 @@ import scala.annotation.tailrec
     // extension, not a requirement for soundness, and this file's own
     // precedent throughout is to accept a narrower, provably-safe subset over
     // a broader, harder-to-verify one.
-    val tailAlwaysExits = ks.lastOption.exists(_.isInstanceOf[Return])
+    // `010-reach-90pct-hole-free` US6: the check just above this comment used
+    // to be `val tailAlwaysExits = ks.lastOption.exists(_.isInstanceOf[Return])`
+    // -- a single, function-wide check that `ks.last` itself is a bare
+    // `Return`. `resolvedTailStmts` (above) generalizes this per-label: any
+    // `ks.last` that IS a bare `Return` is found by its forward scan too (the
+    // exact same check, just reached by walking forward instead of indexing
+    // straight to the end), so nothing that used to qualify stops qualifying.
     // `009-reduce-remaining-holes-4`, loop-nesting generalization: NO `!insideLoop(g)`
     // check here, unlike `singleLabelOk` above -- and deliberately so, not an
     // oversight. `insideLoop` was excluded historically because `singleLabelOk`'s
@@ -7263,16 +7381,27 @@ import scala.annotation.tailrec
     // reason a function fails BOTH mechanisms today -- so this one check removal
     // is expected to be the single highest-leverage step available in the
     // char*-unrelated hole families.
+    // `010-reach-90pct-hole-free` US6: the per-jump `gi < labelIndex`
+    // forward-only requirement this check used to carry is DROPPED here, not
+    // merely relaxed -- once EVERY declared label's own `resolvedTailStmts` is
+    // required to resolve (just below), a spliced copy is guaranteed to
+    // terminate in `.ret` (never fall through to `.normal`) regardless of
+    // whether the ORIGINAL `goto` site sits before or after its target's own
+    // position, for exactly the reason `tailAlwaysExits`'s own doc comment
+    // above already established for the forward-only case: `.seq`'s "keep
+    // going" branch can never fire past an unconditional `.ret`, at any
+    // nesting depth. The forward-only restriction was never load-bearing for
+    // soundness on its own -- it was a simple, sufficient proxy for "this
+    // splice provably terminates," back when the only proof available was "it
+    // reaches the shared final element." `resolvedTailStmts` is a strictly
+    // more general proof of the same fact.
     val multiLabelOk =
-      jumps.nonEmpty && labels.nonEmpty && tailAlwaysExits &&
+      jumps.nonEmpty && labels.nonEmpty &&
       labels.forall(l => ks.exists(_ eq l)) &&
       targets.forall(t => labels.exists(_.name == t)) &&
+      labels.forall(l => resolvedTailStmts(l.name, 0).isDefined) &&
       jumps.forall { g =>
-        kidsOf(g).size == 1 && {
-          val targetName = kidsOf(g).head.code.trim
-          val gi = topIndex(g)
-          labels.find(_.name == targetName).exists(l => gi >= 0 && gi < ks.indexWhere(_ eq l))
-        }
+        kidsOf(g).size == 1 && labels.exists(_.name == kidsOf(g).head.code.trim)
       }
 
     if (singleLabelOk) {
@@ -7289,7 +7418,7 @@ import scala.annotation.tailrec
     }
     else if (multiLabelOk) {
       val saved = gotoTailStmts
-      gotoTailStmts = labels.map(l => l.name -> ks.drop(ks.indexWhere(_ eq l) + 1)).toMap
+      gotoTailStmts = labels.map(l => l.name -> resolvedTailStmts(l.name, 0).get).toMap
       val result = stmt(body)
       gotoTailStmts = saved
       result
