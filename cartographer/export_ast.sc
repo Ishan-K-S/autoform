@@ -2270,8 +2270,54 @@ import scala.annotation.tailrec
     * has no representation for "a pointer to an arbitrary, non-heap-allocated address",
     * so this MUST NOT be folded into the identity translation (see the
     * `op:cast:pointer:int-to-pointer` branch in `callExpr`, below). */
+  /** `010-reach-90pct-hole-free`: opaque-pointer TYPEDEFS whose own name never
+    * ends in `*` -- `isPointerType`'s own regex, matched against Joern's
+    * UNRESOLVED typedef name rather than its (unavailable) underlying type,
+    * cannot recognize these on its own. TCL's own `ClientData` (`typedef void
+    * *ClientData;`, the standard "opaque callback data" idiom every TCL
+    * extension function in this corpus's own `test/`/`tool/` trees receives)
+    * is the one confirmed live to matter: `getDbPointer`'s own `(struct
+    * SqliteDb*)cmdInfo.objClientData`, `incrblobInput`'s own `(IncrblobChannel
+    * *)instanceData`, and many siblings. A small, explicit allowlist,
+    * deliberately -- NOT folded into `isPointerType` itself, which is used far
+    * more broadly across this file for purposes where guessing a typedef is
+    * secretly a pointer carries more risk than it does for this one, narrow,
+    * cast-operand-only question. */
+  val opaquePointerTypedefs = Set("ClientData")
+  def isKnownOpaquePointerTypedef(ty: String): Boolean =
+    opaquePointerTypedefs.contains(bareType(ty).replace("const", "").trim)
+
+  /** `010-reach-90pct-hole-free`: a call to a function KNOWN to return a
+    * pointer, even though it is external/unresolved (its own header is not in
+    * this corpus's parsed scope, so Joern cannot report its return type at
+    * all). Sound for the SAME reason `castOperandIsPointerShaped`'s own
+    * `<operator>.addressOf` case already is: Core NEVER actually executes an
+    * unresolved call (this session's own escape-analysis relaxation --
+    * "THE BIG ONE" -- already established this precisely), so the call's own
+    * translation is ALREADY nothing stronger than a dynamic hole regardless of
+    * what surrounds it; passing that same (already-as-weak-as-it-gets) value
+    * through an outer cast removes a REDUNDANT static hole without adding any
+    * risk the call's own translation did not already carry. A small, explicit
+    * table (matching `knownAllocators`' own precedent) -- TCL's own allocator
+    * (`Tcl_Alloc`, `ckalloc`) and string/byte-array accessors (all documented
+    * to return `char*`/`unsigned char*`), confirmed live across many real
+    * `test/`/`tool/` functions (`DbObjCmd`, `createIncrblobChannel`,
+    * `dbPrepareAndBind`, `hexio_get_int`, ...). Deliberately NOT "any
+    * unresolved call" -- a call this table does not list simply keeps its
+    * existing hole, the same safe default every other unlisted-name fallback
+    * in this file already uses. */
+  val knownPointerReturningExternalCalls = Set(
+    "Tcl_Alloc", "ckalloc", "malloc",
+    "Tcl_GetString", "Tcl_GetByteArrayFromObj", "Tcl_GetChannelName", "Tcl_GetStringFromObj"
+  )
+  def isKnownPointerReturningCall(n: AstNode): Boolean = n match {
+    case call: Call => knownPointerReturningExternalCalls.contains(call.methodFullName)
+    case _ => false
+  }
+
   def castOperandIsPointerShaped(operand: AstNode): Boolean =
-    isPointerType(staticTypeOf(operand)) || isOp(operand, "<operator>.addressOf")
+    isPointerType(staticTypeOf(operand)) || isOp(operand, "<operator>.addressOf") ||
+    isKnownOpaquePointerTypedef(staticTypeOf(operand)) || isKnownPointerReturningCall(operand)
 
   /** `char` is deliberately absent from `intTypeNames`: its signedness is
     * implementation-defined, so `static_cast<char>(300)` has no standard-mandated value.
