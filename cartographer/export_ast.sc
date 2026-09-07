@@ -1129,6 +1129,20 @@ import scala.annotation.tailrec
     * any kind for `p`. */
   var ptrIrefNames = Set.empty[String]
 
+  /** `010-reach-90pct-hole-free`: WHOLE-PROGRAM, method-fullName -> its own
+    * `ptrIrefNames` set from the MOST RECENT completed `emit` pass over it --
+    * unlike every other per-method `var` in this file, this one is
+    * deliberately NEVER reset between `emit` calls: it is the accumulated
+    * memory the driver's own repeated whole-program "priming" passes rely on
+    * to let `wideClosedIrefParam` (just above `closedIrefOutParam`) see
+    * ANOTHER function's already-established tracked names when deciding
+    * whether ITS OWN parameter may be trusted -- see that function's own doc
+    * comment for the full cross-function argument. Read-only from every
+    * consumer's perspective except `emit`'s own single write (one entry,
+    * for `m.fullName`, each time `emit(m, ...)` runs) right after `ptrIrefNames`
+    * itself is computed. */
+  var irefNamesByMethod = Map.empty[String, Set[String]]
+
   /** `010-reach-90pct-hole-free`: SQLite's own small, well-documented memory-
     * allocation API surface, mapped to the 0-based position (in `kidsOf`'s own
     * left-to-right order) of the argument carrying the BYTE COUNT of the buffer
@@ -4231,62 +4245,121 @@ import scala.annotation.tailrec
     }
   }
 
+  /** `010-reach-90pct-hole-free`: the per-CALL-SITE structural shape check
+    * `closedIrefOutParam` needs -- extracted verbatim (no behavior change) so
+    * `wideClosedIrefParam`'s own whole-program forwarding check, just below,
+    * can reuse the IDENTICAL "is this argument expression, by itself, a proof
+    * this parameter always receives a safe interior pointer" test without a
+    * second, driftable copy. */
+  def irefCallArgStructurallyOk(c: Call, arg: AstNode): Boolean = arg match {
+    case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+      kidsOf(addr) match {
+        case List(x) =>
+          asIndex(x).exists { case (r, _) =>
+            irefArrayEligible(r, c.method.filename) ||
+            // `009-reduce-remaining-holes-4`: `&s.arr[i]`/`&p->arr[i]` at
+            // the CALL SITE -- the array-typed-struct-MEMBER counterpart
+            // of the two shapes already here, checked purely structurally
+            // (this call site's own static types), matching this whole
+            // function's own "no per-caller precomputed state" discipline.
+            // Reuses `memberTypes`/`arraySizeOf` exactly as
+            // `pointerStructArrayIndexOperand` does for the SAME shape's
+            // single-function eligibility -- this is its cross-function
+            // counterpart. The ARGUMENT expression itself already
+            // translates correctly regardless of this check (`callExpr`'s
+            // own `<operator>.addressOf` dispatch, extended the same
+            // push): all this widens is whether `fn`'s OWN parameter may
+            // be TRUSTED, for its whole body, to be `Val.iref`.
+            asField(r).exists { case (base, f) =>
+              fieldReceiverAggregateType(staticTypeOf(base)).flatMap(structTypeDeclOf).exists { td =>
+                memberTypes.get((stripDuplicateSuffix(bareType(td.fullName)), f))
+                  .exists(mty => arraySizeOf(mty, c.method.filename).isDefined)
+              }
+            }
+          } ||
+          asField(x).exists { case (r, _) =>
+            fieldReceiverAggregateType(staticTypeOf(r)).exists(structTypeDeclOf(_).isDefined)
+          } ||
+          // `010-reach-90pct-hole-free` US3: `&n`, a plain scalar local
+          // or parameter -- see `scalarAddressOfEligible`'s own doc
+          // comment for the full soundness argument and why this is
+          // checked structurally here rather than reusing `boxableName`.
+          scalarAddressOfEligible(x)
+        case _ => false
+      }
+    // `009-reduce-remaining-holes-4`: a BARE array-decay pass -- `foo(arr)`, no
+    // `&` at all -- is semantically `&arr[0]`, exactly as safe as the explicit
+    // form just above, when `arr`'s own static type is array-shaped
+    // (`irefArrayEligible`, the SAME check). Restricted to a genuine LOCAL
+    // array by construction, not merely by convention: a C array PARAMETER
+    // always decays to a plain pointer type at its own declaration, so its
+    // static type never retains bracket syntax for `irefArrayEligible` to
+    // match in the first place -- a bare parameter reaching here always fails
+    // this check and correctly falls through to `case _ => false` below,
+    // unaffected. Confirmed live: `sqlite3ClearStatTables`'s own
+    // `sqlite3_snprintf(sizeof(zTab), zTab, ...)` -- `zTab` a genuine
+    // `char zTab[24]` local, passed bare to an in-program callee.
+    case bare @ (_: Identifier | _: MethodParameterIn) =>
+      irefArrayEligible(bare, c.method.filename)
+    case _ => false
+  }
+
   def closedIrefOutParam(fn: Method, paramIndex: Int): Boolean =
     if (takenAsValueFns.contains(fn.fullName)) false
     else {
       val callSites = allCalls.filter(_.methodFullName == fn.fullName)
       callSites.nonEmpty && callSites.forall { c =>
-        kidsOf(c).find(aidx(_) == paramIndex).exists {
-          case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
-            kidsOf(addr) match {
-              case List(x) =>
-                asIndex(x).exists { case (r, _) =>
-                  irefArrayEligible(r, c.method.filename) ||
-                  // `009-reduce-remaining-holes-4`: `&s.arr[i]`/`&p->arr[i]` at
-                  // the CALL SITE -- the array-typed-struct-MEMBER counterpart
-                  // of the two shapes already here, checked purely structurally
-                  // (this call site's own static types), matching this whole
-                  // function's own "no per-caller precomputed state" discipline.
-                  // Reuses `memberTypes`/`arraySizeOf` exactly as
-                  // `pointerStructArrayIndexOperand` does for the SAME shape's
-                  // single-function eligibility -- this is its cross-function
-                  // counterpart. The ARGUMENT expression itself already
-                  // translates correctly regardless of this check (`callExpr`'s
-                  // own `<operator>.addressOf` dispatch, extended the same
-                  // push): all this widens is whether `fn`'s OWN parameter may
-                  // be TRUSTED, for its whole body, to be `Val.iref`.
-                  asField(r).exists { case (base, f) =>
-                    fieldReceiverAggregateType(staticTypeOf(base)).flatMap(structTypeDeclOf).exists { td =>
-                      memberTypes.get((stripDuplicateSuffix(bareType(td.fullName)), f))
-                        .exists(mty => arraySizeOf(mty, c.method.filename).isDefined)
-                    }
-                  }
-                } ||
-                asField(x).exists { case (r, _) =>
-                  fieldReceiverAggregateType(staticTypeOf(r)).exists(structTypeDeclOf(_).isDefined)
-                } ||
-                // `010-reach-90pct-hole-free` US3: `&n`, a plain scalar local
-                // or parameter -- see `scalarAddressOfEligible`'s own doc
-                // comment for the full soundness argument and why this is
-                // checked structurally here rather than reusing `boxableName`.
-                scalarAddressOfEligible(x)
-              case _ => false
-            }
-          // `009-reduce-remaining-holes-4`: a BARE array-decay pass -- `foo(arr)`, no
-          // `&` at all -- is semantically `&arr[0]`, exactly as safe as the explicit
-          // form just above, when `arr`'s own static type is array-shaped
-          // (`irefArrayEligible`, the SAME check). Restricted to a genuine LOCAL
-          // array by construction, not merely by convention: a C array PARAMETER
-          // always decays to a plain pointer type at its own declaration, so its
-          // static type never retains bracket syntax for `irefArrayEligible` to
-          // match in the first place -- a bare parameter reaching here always fails
-          // this check and correctly falls through to `case _ => false` below,
-          // unaffected. Confirmed live: `sqlite3ClearStatTables`'s own
-          // `sqlite3_snprintf(sizeof(zTab), zTab, ...)` -- `zTab` a genuine
-          // `char zTab[24]` local, passed bare to an in-program callee.
-          case bare @ (_: Identifier | _: MethodParameterIn) =>
-            irefArrayEligible(bare, c.method.filename)
-          case _ => false
+        kidsOf(c).find(aidx(_) == paramIndex).exists(arg => irefCallArgStructurallyOk(c, arg))
+      }
+    }
+
+  /** `010-reach-90pct-hole-free`: the WHOLE-PROGRAM counterpart to
+    * `closedIrefOutParam` -- accepts a call-site argument that is EITHER the
+    * same structural shape `closedIrefOutParam` already trusts, OR a bare
+    * identifier/parameter that is itself a member of the CALLING method's own
+    * `ptrIrefNames` set (`irefNamesByMethod`, populated by PRIOR whole-program
+    * `emit` passes -- see the driver's own "priming rounds" at the bottom of
+    * this file for why more than one pass exists at all).
+    *
+    * Confirmed live as the single largest sub-cause (~45% of a 110-case live
+    * sample) `closedIrefOutParam` itself was missing: `btreeParseCellPtr`'s
+    * own `u8 *pCell` parameter is called from many sites passing a plain
+    * LOCAL VARIABLE (already `ptrIrefNames`-tracked in ITS OWN function, not
+    * a literal `&expr`) -- `closedIrefOutParam`'s call-site check has no case
+    * for "the argument is a NAME, not an address-of expression, but that name
+    * is already known safe" at all, so it always failed this shape
+    * regardless of how many call sites there were.
+    *
+    * Depends on `irefNamesByMethod`, which is populated as a SIDE EFFECT of
+    * running `emit` -- so this can only see what a PRIOR pass over the whole
+    * program already established, never the CURRENT pass's own in-progress
+    * results (this file's `var`s are per-method, reset before each `emit`
+    * call, so there is no "this pass so far" state to read mid-pass even in
+    * principle). This is why the driver runs multiple whole-program PASSES
+    * rather than expecting one pass to converge: `irefNamesByMethod` only
+    * grows monotonically across passes (a wider `paramTracked` seed can only
+    * ADD names to a method's own `ptrIrefNames`, never remove any -- the
+    * classifier's disqualification set depends solely on that method's OWN
+    * assignment shapes, never on the seed), so repeated passes converge
+    * toward -- and, within the bounded round count, effectively reach -- the
+    * same fixed point a single whole-program analysis would compute, without
+    * this file needing to restructure `emit`'s own per-method computation
+    * into two separate phases (a much larger, riskier change attempted and
+    * rejected in favor of this simpler repeated-pass scheme instead). */
+  def wideClosedIrefParam(fn: Method, paramIndex: Int): Boolean =
+    if (takenAsValueFns.contains(fn.fullName)) false
+    else {
+      val callSites = allCalls.filter(_.methodFullName == fn.fullName)
+      callSites.nonEmpty && callSites.forall { c =>
+        kidsOf(c).find(aidx(_) == paramIndex).exists { arg =>
+          irefCallArgStructurallyOk(c, arg) ||
+          (arg match {
+            case i: Identifier =>
+              irefNamesByMethod.getOrElse(i.method.fullName, Set.empty).contains(localName(i.name))
+            case p: MethodParameterIn =>
+              irefNamesByMethod.getOrElse(p.method.fullName, Set.empty).contains(localName(p.name))
+            case _ => false
+          })
         }
       }
     }
@@ -8863,10 +8936,18 @@ import scala.annotation.tailrec
       // to the local-only shapes above. Seeded into `tracked` from the START (not
       // unioned in afterward) so a local's bare-copy-of-a-parameter or arithmetic-
       // on-a-parameter can depend on it within the SAME fixed point below.
+      //
+      // `010-reach-90pct-hole-free`: ALSO trusts `wideClosedIrefParam` -- the
+      // whole-program, cross-pass counterpart that additionally accepts a
+      // call-site argument that is itself an ALREADY-tracked name in the
+      // CALLING method (not only a literal `&expr`) -- see that function's own
+      // doc comment for the full argument and why this needs multiple `emit`
+      // passes over the whole program to converge.
       val paramTracked: Set[String] =
         m.parameter.l
           .filter(p => (closedIrefOutParam(m, p.index) ||
-                        closedIrefOutParamsTransitive.contains((m.fullName, p.index))) &&
+                        closedIrefOutParamsTransitive.contains((m.fullName, p.index)) ||
+                        wideClosedIrefParam(m, p.index)) &&
                        !boxedLocals.contains(localName(p.name)))
           .map(p => localName(p.name)).toSet
 
@@ -8894,6 +8975,11 @@ import scala.annotation.tailrec
       }
       tracked
     }
+    // `010-reach-90pct-hole-free`: record THIS method's own just-computed
+    // `ptrIrefNames` into the whole-program map `wideClosedIrefParam` reads --
+    // see `irefNamesByMethod`'s own doc comment for why this is the one `var`
+    // in this file deliberately NOT reset between `emit` calls.
+    irefNamesByMethod = irefNamesByMethod.updated(m.fullName, ptrIrefNames)
     // `009-reduce-remaining-holes-4`: `const char *` parameters eligible for
     // byte-cursor tracking -- see `strCursorParams`'s own doc comment. Restricted to
     // an actual `char*`/`char[]`-typed parameter (`isCString`) so this can never fire
@@ -9313,6 +9399,45 @@ import scala.annotation.tailrec
     .filterNot(m => m.fullName.contains("<includes>"))
     .sortBy(_.fullName)
 
+  // `010-reach-90pct-hole-free`: `wideClosedIrefParam` needs to see ANOTHER
+  // method's own already-tracked names (`irefNamesByMethod`) to decide whether
+  // THIS method's parameter may be trusted -- a genuine whole-program, mutual
+  // dependency (method A's parameter eligibility can depend on method B's own
+  // local eligibility, which can depend on method C's parameter eligibility,
+  // ...), not something one pass over the methods in any fixed order can
+  // resolve on its own. Rather than restructuring `emit`'s own per-method
+  // computation into two separate phases (setup vs. translation) so a
+  // standalone whole-program analysis could run BEFORE any real translation
+  // -- a materially larger and riskier change, since `boxedArrays`/
+  // `boxedLocals`/`localTypes`/... are themselves a long CASCADE of per-method
+  // state each `emit` call builds up progressively -- this instead runs the
+  // ENTIRE `emit` pass over every method multiple times, throwing away the
+  // JSON output of every pass but the last. `irefNamesByMethod` is the one
+  // `var` in this file that is NEVER reset between calls (see its own doc
+  // comment), so each priming pass's `ptrIrefNames` results become visible to
+  // every OTHER method's `wideClosedIrefParam` check on the NEXT pass --
+  // `irefNamesByMethod` only ever GROWS across passes (a wider parameter seed
+  // can only ADD tracked names within a method, per `classifyIrefAssignRhs`'s
+  // own monotonicity -- its disqualification set depends solely on that
+  // method's OWN assignment shapes, never on the seed), so repeated passes
+  // converge toward the same fixed point a genuine whole-program analysis
+  // would compute directly. Bounded at 2 priming passes (3 total, including
+  // the real one) -- matches this file's own established "bounded rather than
+  // recursive/unbounded" convention (`closedOutParamsTransitive`'s own 8-round
+  // bound, `ptrIrefNames`'s own 4-round bound), sized for the call-chain
+  // depths actually observed in this idiom (live-sampled: overwhelmingly a
+  // single hop -- a leaf helper's own parameter, called by several higher-level
+  // functions passing their own already-simple local variable) rather than an
+  // unbounded fixed point this file has no established precedent for at
+  // whole-program scale. Every priming pass's own diagnostic side effects
+  // (`syncElided`/`useElided`'s own counters, `elseFlagSeq`'s own synthesized
+  // flag names) are harmless to repeat: the former are cosmetic console counts
+  // only, and the latter needs only PER-RUN uniqueness, which a monotonically
+  // increasing counter still guarantees regardless of its starting value.
+  for (_ <- 1 to 2) {
+    methods.foreach(emit(_, false))
+    moduleMethods.foreach(emit(_, true))
+  }
   val funcs = methods.map(emit(_, false))
   val inits = moduleMethods.map(emit(_, true))
   // The module objects are built **before** any module body runs, so an `import` at the
