@@ -1143,6 +1143,14 @@ import scala.annotation.tailrec
     * itself is computed. */
   var irefNamesByMethod = Map.empty[String, Set[String]]
 
+  /** `010-reach-90pct-hole-free`: holds `computeClosedIrefOutParamViaVtableTransitive`'s
+    * most recently computed result -- see that `def`'s own doc comment for why
+    * this is a `var` explicitly recomputed by the driver once per whole-
+    * program pass, not a `lazy val`. Starts empty; the first (priming) pass
+    * naturally finds nothing through it, exactly like `irefNamesByMethod`
+    * itself starting empty does. */
+  var closedIrefOutParamViaVtableTransitive: Set[(String, Int)] = Set.empty
+
   /** `010-reach-90pct-hole-free`: SQLite's own small, well-documented memory-
     * allocation API surface, mapped to the 0-based position (in `kidsOf`'s own
     * left-to-right order) of the argument carrying the BYTE COUNT of the buffer
@@ -4373,21 +4381,28 @@ import scala.annotation.tailrec
     * this file needing to restructure `emit`'s own per-method computation
     * into two separate phases (a much larger, riskier change attempted and
     * rejected in favor of this simpler repeated-pass scheme instead). */
+  /** `010-reach-90pct-hole-free`: the per-CALL-SITE check `wideClosedIrefParam`
+    * needs -- factored out so `closedIrefOutParamViaVtableTransitive` (the
+    * vtable-dispatch counterpart, just below `closedOutParamViaVtableTransitive`)
+    * can reuse the IDENTICAL "structurally safe, OR a name already tracked in
+    * the calling method" question for an indirect call site too, rather than a
+    * second, driftable copy. */
+  def irefArgWideOk(c: Call, arg: AstNode): Boolean =
+    irefCallArgStructurallyOk(c, arg) ||
+    (arg match {
+      case i: Identifier =>
+        irefNamesByMethod.getOrElse(i.method.fullName, Set.empty).contains(localName(i.name))
+      case p: MethodParameterIn =>
+        irefNamesByMethod.getOrElse(p.method.fullName, Set.empty).contains(localName(p.name))
+      case _ => false
+    })
+
   def wideClosedIrefParam(fn: Method, paramIndex: Int): Boolean =
     if (takenAsValueFns.contains(fn.fullName)) false
     else {
       val callSites = allCalls.filter(_.methodFullName == fn.fullName)
       callSites.nonEmpty && callSites.forall { c =>
-        kidsOf(c).find(aidx(_) == paramIndex).exists { arg =>
-          irefCallArgStructurallyOk(c, arg) ||
-          (arg match {
-            case i: Identifier =>
-              irefNamesByMethod.getOrElse(i.method.fullName, Set.empty).contains(localName(i.name))
-            case p: MethodParameterIn =>
-              irefNamesByMethod.getOrElse(p.method.fullName, Set.empty).contains(localName(p.name))
-            case _ => false
-          })
-        }
+        kidsOf(c).find(aidx(_) == paramIndex).exists(arg => irefArgWideOk(c, arg))
       }
     }
 
@@ -4608,6 +4623,41 @@ import scala.annotation.tailrec
               }
             }
           }
+        // `010-reach-90pct-hole-free`: a PLAIN (non-array-literal) function-
+        // pointer FIELD assignment -- `pPage->xCellSize = cellSizePtrTableLeaf;`,
+        // the ordinary-assignment-SYNTAX counterpart of the array-initializer
+        // case just above, sharing THIS map's own multi-value tolerance (unlike
+        // `fieldFnTargets`, which requires every assignment to agree on ONE
+        // function and would reject this outright). Confirmed live as a real,
+        // load-bearing gap, not a hypothetical one: `MemPage.xCellSize` is
+        // assigned FOUR different functions depending on the page's own leaf/
+        // intKey flags at init time (`cellSizePtrTableLeaf`/`cellSizePtrIdxLeaf`/
+        // `cellSizePtr`/`cellSizePtrNoPayload`) -- disqualifying it from
+        // `fieldFnTargets`'s single-target scan, but landing in NEITHER map
+        // before this case existed, since this assignment SYNTAX (plain, not a
+        // literal table) was only ever scanned by the single-target-only one.
+        // `cellSizePtr`/`cellSizePtrTableLeaf`/... were wrongly treated as
+        // "address genuinely taken, therefore unconditionally unclosable"
+        // (`takenAsValueFns`) rather than "assigned to a SMALL, KNOWN, closed
+        // set of call sites this program's own source fully determines" --
+        // the same distinction `pointerCallCalleeVar`'s own single-function
+        // resolution already draws for a LOCAL variable, generalized here to a
+        // struct FIELD with more than one possible value. No new eligibility
+        // logic: `targetFn` (just above) already recognizes a bare function
+        // name OR `&function` as a genuine function reference, and `asField`
+        // is the same receiver/field extraction `pointerCallCalleeField` (the
+        // matching CALL-SITE side of this mechanism) already relies on.
+        case List(lhs, rhs) if targetFn(rhs).isDefined =>
+          asField(lhs).foreach { case (recv, field) =>
+            val owner = stripDuplicateSuffix(
+              bareType(staticTypeOf(recv)).reverse.dropWhile(_ == '*').reverse)
+            if (owner.nonEmpty && owner != "ANY") {
+              targetFn(rhs).filter(methodByName.contains).foreach { rawFn =>
+                val nm = mangledFullName(rawFn)
+                out(nm) = out(nm) + ((owner, field))
+              }
+            }
+          }
         case _ =>
       }
     }
@@ -4736,6 +4786,108 @@ import scala.annotation.tailrec
           case Ok                               => true
           case Bad                              => false
           case NullLit                          => nullGuarded.getOrElse(key, false)
+          case Fwd(cfn, ci) if (cfn, ci) == key => true
+          case Fwd(cfn, ci)                     => closed.contains((cfn, ci)) || directlyClosed(cfn, ci)
+        }
+        if (ok) { closed += key; changed = true }
+      }
+    }
+    closed
+  }
+
+  /** `010-reach-90pct-hole-free`: `closedOutParamViaVtableTransitive`'s own
+    * vtable-dispatch reasoning (see its own doc comment for the full argument),
+    * applied to `closedIrefOutParam`'s INTERIOR-POINTER base case instead of
+    * `closedOutParam`'s whole-object one -- the vtable-side counterpart of
+    * `closedIrefOutParamsTransitive`'s own relationship to
+    * `closedOutParamsTransitive`, mirroring the SAME structure with two
+    * differences: call sites come from `vtableFieldsOf`'s dispatch fields
+    * (an INDIRECT call through a struct field, not a direct name), and the
+    * per-site shape check is `irefArgWideOk` (structurally safe OR a name
+    * already tracked in the calling method) instead of a plain structural-only
+    * test, so this ALSO benefits from `wideClosedIrefParam`'s own cross-
+    * function forwarding capability, not just the narrower one.
+    *
+    * Confirmed live as a real, load-bearing gap this closes: `cellSizePtr`'s
+    * own `u8 *pCell` parameter -- assigned to `MemPage.xCellSize` alongside
+    * `cellSizePtrTableLeaf`/`cellSizePtrIdxLeaf`/`cellSizePtrNoPayload` (four
+    * different functions depending on the page's own leaf/intKey flags),
+    * dispatched ONLY via `pPage->xCellSize(pPage, ...)` -- was previously
+    * excluded from EVERY closure proof outright by `takenAsValueFns`'s own
+    * blanket "address genuinely taken, therefore unconditionally unclosable"
+    * guard, even though its own call sites (`pPage->xCellSize(pPage,
+    * findCell(pPage, iCell))`, `pPage->xCellSize(pPage, &data[pc])`, ...) are
+    * fully visible, ordinary expressions in the SAME analyzed source -- no
+    * information genuinely outside the analyzed program, unlike a real
+    * external caller of a public API entry point. */
+  // `010-reach-90pct-hole-free`: a `def` (recomputed explicitly once per
+  // whole-program `emit` pass by the driver), NOT a `lazy val` -- unlike
+  // EVERY other whole-program closure fixed point in this file, this ONE
+  // depends on `irefArgWideOk`, and therefore on `irefNamesByMethod`, which
+  // only fills in AS the priming passes run. A `lazy val` here would compute
+  // ONCE, on first access (before ANY pass has populated
+  // `irefNamesByMethod` at all), and then never again -- CACHING that empty
+  // snapshot forever regardless of how much `irefNamesByMethod` fills in on
+  // later passes. Confirmed live as the actual reason this mechanism first
+  // measured ZERO effect despite `vtableFieldsOf` itself correctly resolving
+  // `cellSizePtr -> {(MemPage, xCellSize)}`: every `irefArgWideOk` check
+  // reported `false` because `irefNamesByMethod` was still the EMPTY map the
+  // lazy val had captured at its own first, premature evaluation.
+  def computeClosedIrefOutParamViaVtableTransitive(): Set[(String, Int)] = {
+    sealed trait ArgShape
+    case object Ok extends ArgShape
+    case object Bad extends ArgShape
+    case class Fwd(callerFn: String, callerIdx: Int) extends ArgShape
+
+    def classify(c: Call, rawArg: AstNode): ArgShape = unwrapCastLayers(rawArg) match {
+      case i: Identifier =>
+        i.method.parameter.l.find(_.name == i.name) match {
+          case Some(p) => Fwd(p.method.fullName, p.index)
+          case None    => if (irefArgWideOk(c, rawArg)) Ok else Bad
+        }
+      case p: MethodParameterIn => Fwd(p.method.fullName, p.index)
+      case _ => if (irefArgWideOk(c, rawArg)) Ok else Bad
+    }
+
+    val pcalls = allCalls.filter(_.methodFullName == "<operator>.pointerCall")
+    val callsByField: Map[(String, String), List[Call]] =
+      pcalls.flatMap(c => pointerCallCalleeField(c).map(_ -> c)).groupBy(_._1).view.mapValues(_.map(_._2)).toMap
+
+    // Every `fn` here is, by construction, a member of `vtableFieldsOf.keys` --
+    // i.e. its address WAS genuinely taken (that is how it got there at all).
+    // No `takenAsValueFns` filter is needed (or correct): that guard exists to
+    // stop trusting a DIRECT-name call site once a function might ALSO be
+    // reached indirectly, which is exactly the reachability THIS mechanism
+    // proves safe on its own terms instead, via the indirect sites themselves.
+    val candidates: List[(String, Int)] =
+      vtableFieldsOf.keys.toList
+        .flatMap { fn => methodByName.get(fn).toList.flatMap(m => m.parameter.l.map(p => (fn, p.index))) }
+
+    val shapesByPair: Map[(String, Int), List[ArgShape]] =
+      candidates.map { case (fn, idx) =>
+        val fields = vtableFieldsOf.getOrElse(fn, Set.empty)
+        val sites  = fields.toList.flatMap(f => callsByField.getOrElse(f, Nil))
+        (fn, idx) -> sites.flatMap(c => kidsOf(c).find(aidx(_) == idx).map(arg => classify(c, arg)))
+      }.toMap
+
+    def directlyClosed(fn: String, idx: Int): Boolean =
+      closedIrefOutParamsTransitive.contains((fn, idx)) ||
+      methodByName.get(fn).exists(m => closedIrefOutParam(m, idx) || wideClosedIrefParam(m, idx))
+
+    var closed  = Set.empty[(String, Int)]
+    var changed = true
+    var round   = 0
+    while (changed && round < 8) {
+      changed = false
+      round += 1
+      for ((key, shapes) <- shapesByPair if shapes.nonEmpty && !closed.contains(key)) {
+        val hasIndependentSite = shapes.exists {
+          case Fwd(cfn, ci) => (cfn, ci) != key
+          case _            => true
+        }
+        val ok = hasIndependentSite && shapes.forall {
+          case Ok                               => true
+          case Bad                              => false
           case Fwd(cfn, ci) if (cfn, ci) == key => true
           case Fwd(cfn, ci)                     => closed.contains((cfn, ci)) || directlyClosed(cfn, ci)
         }
@@ -9076,11 +9228,17 @@ import scala.annotation.tailrec
       // CALLING method (not only a literal `&expr`) -- see that function's own
       // doc comment for the full argument and why this needs multiple `emit`
       // passes over the whole program to converge.
+      // `010-reach-90pct-hole-free`: ALSO trusts `closedIrefOutParamViaVtableTransitive`
+      // -- the vtable-dispatch counterpart, for a parameter reached ONLY through
+      // an indirect call via a struct field (`pPage->xCellSize(pPage, ...)`),
+      // never a direct name `closedIrefOutParam`'s own call-site search could
+      // ever find. See that lazy val's own doc comment for the full argument.
       val paramTracked: Set[String] =
         m.parameter.l
           .filter(p => (closedIrefOutParam(m, p.index) ||
                         closedIrefOutParamsTransitive.contains((m.fullName, p.index)) ||
-                        wideClosedIrefParam(m, p.index)) &&
+                        wideClosedIrefParam(m, p.index) ||
+                        closedIrefOutParamViaVtableTransitive.contains((mangledFullName(m.fullName), p.index))) &&
                        !boxedLocals.contains(localName(p.name)))
           .map(p => localName(p.name)).toSet
 
@@ -9567,10 +9725,18 @@ import scala.annotation.tailrec
   // flag names) are harmless to repeat: the former are cosmetic console counts
   // only, and the latter needs only PER-RUN uniqueness, which a monotonically
   // increasing counter still guarantees regardless of its starting value.
+  // `010-reach-90pct-hole-free`: `closedIrefOutParamViaVtableTransitive`
+  // recomputed once at the START of each pass (its own doc comment has the
+  // full reasoning for why it cannot be a `lazy val`) -- using whatever
+  // `irefNamesByMethod` the PREVIOUS pass finished with, the same "one round
+  // behind, converges over repeated passes" discipline `wideClosedIrefParam`
+  // itself already accepts implicitly by reading `irefNamesByMethod` live.
   for (_ <- 1 to 2) {
+    closedIrefOutParamViaVtableTransitive = computeClosedIrefOutParamViaVtableTransitive()
     methods.foreach(emit(_, false))
     moduleMethods.foreach(emit(_, true))
   }
+  closedIrefOutParamViaVtableTransitive = computeClosedIrefOutParamViaVtableTransitive()
   val funcs = methods.map(emit(_, false))
   val inits = moduleMethods.map(emit(_, true))
   // The module objects are built **before** any module body runs, so an `import` at the
