@@ -3636,6 +3636,155 @@ import scala.annotation.tailrec
     closed
   }
 
+  /** `010-reach-90pct-hole-free`: `closedOutParamsTransitive`'s own whole-program,
+    * bounded-fixed-point discipline, applied to a DIFFERENT relationship -- not
+    * "does this parameter always receive `&local`", but "do these TWO char*
+    * parameters of the SAME function always receive arguments that are
+    * PROVABLY the same underlying buffer, at every call site, across the whole
+    * program". Motivated by `sqlite3DbSpanDup(db, zStart, zEnd)`'s own `zEnd -
+    * zStart`, and its siblings across the corpus -- SQLite's own extremely
+    * common "start/end of one token span, passed as a matched PARAMETER pair"
+    * idiom (as opposed to `strCursorBase`'s existing WITHIN-one-function
+    * derivation tracking, which has no way to relate two INDEPENDENT
+    * parameters at all -- each is trivially its own base, by the same
+    * reasoning a lone parameter always is, so two DIFFERENT parameter names
+    * can never compare equal under it, regardless of what the CALLER actually
+    * guarantees). Nothing inside `sqlite3DbSpanDup` itself can prove `zStart`
+    * and `zEnd` share a buffer -- that fact lives entirely at its CALL SITES,
+    * which is exactly the shape `closedOutParam`'s own family of checks exists
+    * to verify.
+    *
+    * A pair (`fn`, `i`, `j`) is CLOSED when every call site of `fn`, across the
+    * whole analyzed program, passes at positions `i`/`j` EITHER:
+    *   - a syntactically self-evident same-buffer shape (`sameBufferAtCallSite`:
+    *     the identical expression twice, or one argument spelled as the other
+    *     PLUS/MINUS some offset expression -- C's own `zEnd = zStart + n`
+    *     idiom, checked purely structurally, no interprocedural reasoning
+    *     needed for this case at all), or
+    *   - a FORWARDED pair -- both arguments are bare references to two
+    *     parameters of the CALLING function, and THAT pair is itself already
+    *     known closed (the same `Fwd` bootstrapping `closedOutParamsTransitive`
+    *     uses, generalized from one index to a pair of them).
+    *
+    * Candidates are every pair of char*-typed parameter positions of every
+    * function with at least one in-scope call site -- NOT filtered down to
+    * "the function's own body compares them" first, unlike a first-pass
+    * version of this idea would suggest: a PURE FORWARDER (`sqlite3AddDefaultValue`,
+    * `sqlite3ExprListSetSpan`, `triggerSpanDup`, ... -- confirmed live, all of
+    * `sqlite3DbSpanDup`'s own callers on the local corpus are pure forwarders,
+    * never comparing `zStart`/`zEnd` themselves at all) never appears as a
+    * body-usage candidate, but MUST still participate as a `Fwd` link in the
+    * chain, or the whole mechanism could never reach past one hop. A random
+    * UNRELATED pair of char* parameters (`sqlite3_snprintf`'s own `zBuf`/
+    * `zFormat`, say) simply never satisfies `Ok` or a closed `Fwd` at any real
+    * call site and stays permanently open -- costing nothing beyond the
+    * candidate enumeration itself.
+    *
+    * Consumed at `strCursorBase`'s own per-method computation (`emit`, below):
+    * for the CURRENT method only, any closed pair among ITS OWN parameters has
+    * both names unified onto one shared base, exactly as if one had been
+    * derived from the other within a single function body.
+    *
+    * Diagnosed, NOT yet measured on the real corpus at the time this was
+    * written -- the local bounded corpus (`src/` only) has exactly ONE
+    * candidate function matching this idiom at all (`sqlite3DbSpanDup`), and
+    * every one of its own callers, transitively, bottoms out in the
+    * Lemon-generated parser (`parse.c`), outside this corpus's own parsed
+    * scope -- so this mechanism cannot show ANY local movement regardless of
+    * whether it is correct, and needs a real Colab run (where `ext/`/`test/`/
+    * `tool/` trees may carry more, and different, instances of the idiom) to
+    * learn its true yield. Shipped anyway, on the strength of the reasoning
+    * above and zero local regressions, per this session's own explicit
+    * instruction to try it and measure for real rather than estimate further
+    * from an already-known-incomplete local sample. */
+  lazy val closedSpanPairs: Set[(String, Int, Int)] = {
+    sealed trait PairShape
+    case object Ok extends PairShape
+    case object Bad extends PairShape
+    case class Fwd(callerFn: String, callerI: Int, callerJ: Int) extends PairShape
+
+    def normCode(n: AstNode): String = n.code.replaceAll("\\s+", "")
+
+    // `zEnd = zStart + n` (or `n + zStart`, or the `-` spelling) -- one
+    // argument IS the other, textually, plus some offset expression. Checked
+    // BEFORE the `Fwd` case: a call site can satisfy both (a forwarded
+    // parameter that ALSO happens to be shifted, `foo(zStart, zStart+k)`
+    // where `zStart` is itself a parameter) and the syntactic case needs no
+    // recursion to trust, so it is strictly the cheaper, more direct proof.
+    def sameBufferAtCallSite(a: AstNode, b: AstNode): Boolean = {
+      def isShiftedFrom(base: AstNode, whole: AstNode): Boolean = whole match {
+        case c: Call if c.methodFullName == "<operator>.addition" || c.methodFullName == "<operator>.subtraction" =>
+          kidsOf(c) match {
+            case List(l, _) => normCode(l) == normCode(base)
+            case _ => false
+          }
+        case _ => false
+      }
+      normCode(a) == normCode(b) || isShiftedFrom(a, b) || isShiftedFrom(b, a)
+    }
+
+    // A bare reference to a parameter of `n`'s OWN enclosing method (the call
+    // site's caller) -- `(callerFullName, paramIndex)`, or `None` if `n` is not
+    // such a reference at all (an expression, a local, a literal, ...).
+    def paramRefOf(n: AstNode): Option[(String, Int)] = n match {
+      case i: Identifier =>
+        i.method.parameter.l.find(_.name == i.name).map(p => (p.method.fullName, p.index))
+      case p: MethodParameterIn => Some((p.method.fullName, p.index))
+      case _ => None
+    }
+
+    def classify(a: AstNode, b: AstNode): PairShape =
+      if (sameBufferAtCallSite(a, b)) Ok
+      else (paramRefOf(a), paramRefOf(b)) match {
+        case (Some((f1, i1)), Some((f2, i2))) if f1 == f2 =>
+          Fwd(f1, math.min(i1, i2), math.max(i1, i2))
+        case _ => Bad
+      }
+
+    val callsByCallee: Map[String, List[Call]] = allCalls.groupBy(_.methodFullName)
+    val candidates: List[(String, Int, Int)] =
+      methodByName.values.filterNot(m => takenAsValueFns.contains(m.fullName))
+        .filter(m => callsByCallee.contains(m.fullName))
+        .flatMap { m =>
+          val charParamIdx = m.parameter.l.filter(p => isCStringType(p.typeFullName)).map(_.index).sorted
+          for { i <- charParamIdx; j <- charParamIdx if i < j } yield (m.fullName, i, j)
+        }.toList
+
+    val shapesByTriple: Map[(String, Int, Int), List[PairShape]] =
+      candidates.map { case (fn, i, j) =>
+        val sites = callsByCallee.getOrElse(fn, Nil)
+        (fn, i, j) -> sites.map { c =>
+          val kids = kidsOf(c)
+          (kids.find(aidx(_) == i), kids.find(aidx(_) == j)) match {
+            case (Some(a1), Some(a2)) => classify(a1, a2)
+            case _ => Bad
+          }
+        }
+      }.toMap
+
+    var closed  = Set.empty[(String, Int, Int)]
+    var changed = true
+    var round   = 0
+    while (changed && round < 8) {
+      changed = false
+      round += 1
+      for ((key, shapes) <- shapesByTriple if shapes.nonEmpty && !closed.contains(key)) {
+        val hasIndependentSite = shapes.exists {
+          case Fwd(cfn, ci, cj) => (cfn, ci, cj) != key
+          case _                => true
+        }
+        val ok = hasIndependentSite && shapes.forall {
+          case Ok                                 => true
+          case Bad                                => false
+          case Fwd(cfn, ci, cj) if (cfn, ci, cj) == key => true
+          case Fwd(cfn, ci, cj)                   => closed.contains((cfn, ci, cj))
+        }
+        if (ok) { closed += key; changed = true }
+      }
+    }
+    closed
+  }
+
   /** `007-reduce-remaining-holes-2`: `closedOutParam`'s own discipline, generalized
     * from a whole-object scalar out-parameter to an INTERIOR-pointer one -- a
     * parameter receiving `&r[idx]`/`&r.f` (the address of one ELEMENT or FIELD of an
@@ -6086,6 +6235,27 @@ import scala.annotation.tailrec
   def cursorBaseAndOffset(n: AstNode): Option[(ujson.Obj, ujson.Obj)] = n match {
     case cst: Call if cst.methodFullName == "<operator>.cast" && kidsOf(cst).size == 2 =>
       cursorBaseAndOffset(kidsOf(cst)(1))
+    // `010-reach-90pct-hole-free`: `pResult = p = sqlite3_malloc64(...);` -- a C
+    // chained assignment, which Joern parses as `pResult = (p = sqlite3_malloc64(...))`,
+    // a NESTED `<operator>.assignment` Call as `pResult`'s own RHS -- previously
+    // matched NO case here at all (an assignment node is not a cast, not `&q[n]`,
+    // not `q +/- n`, not a bare name, not a field access, and its
+    // `<operator>.assignment` methodFullName fails the call-seed case's own
+    // `!startsWith("<operator>")` guard), so `pResult`'s own candidacy silently
+    // failed regardless of what the chain's ULTIMATE value actually was.
+    // `pResult`'s value is exactly whatever this nested assignment's OWN RHS value
+    // is -- recursing into it is the same "see through one layer" reasoning the
+    // cast case just above already uses, just for a different wrapper shape.
+    // Confirmed live: `sqlite3_create_filename`'s own `pResult = p =
+    // sqlite3_malloc64(nByte);`, `charFunc`'s `zOut = z = sqlite3_malloc64(...);`
+    // -- both real, common SQLite idioms, and in both, the OUTER name (`pResult`/
+    // `zOut`) is exactly as safe a cursor as any other call-seeded local; nothing
+    // about `isChainedAssignRhs` (`strCursorEligible`'s own guard, unchanged by
+    // this) is affected -- that guard's own INNER-name exclusion is a property of
+    // the INNER name's occurrences elsewhere in the function, orthogonal to
+    // whether the OUTER name can resolve a base at all. */
+    case asn: Call if asn.methodFullName == "<operator>.assignment" && kidsOf(asn).size == 2 =>
+      cursorBaseAndOffset(kidsOf(asn)(1))
     // `010-reach-90pct-hole-free`: `&q[n]`, `q` an ALREADY-tracked cursor --
     // identical in meaning to `q + n` (C's own `&q[n]` IS `q + n`), just
     // spelled with `&`+index instead of `+`, exactly the same equivalence
@@ -8168,6 +8338,34 @@ import scala.annotation.tailrec
     // own resolved base object for its one defining assignment, when that
     // object is a plain `{"k":"name","v":X}` (the only shape two cursors'
     // `$off`s can be soundly compared through).
+    // `010-reach-90pct-hole-free`: a local whose OWN `cursorBaseAndOffset` base is
+    // NOT a `{"k":"name",...}` shape -- a call-seeded cursor (`z =
+    // sqlite3_value_text(...);`, base = `expr(call)`, a `{"k":"call",...}` shape)
+    // or a field-seeded one (`data = pPage->aData;`, base = `expr(fieldAccess)`)
+    // -- used to get NO entry in `strCursorBaseRaw` at all: the `flatMap` below
+    // silently dropped it the moment the base's own shape wasn't literally a NAME
+    // reference to some OTHER tracked cursor. Live-confirmed root cause of
+    // `lengthFunc`'s own `z - z0` still holing DESPITE `z0`'s base correctly
+    // resolving to `"z"` (`z0 = z;`, the bare-already-tracked-cursor-RHS case) --
+    // `z` itself, the cursor `z0` was copied FROM, had no base entry to compare
+    // `z0`'s resolved `"z"` against, so the same-base check saw `Some("z") ==
+    // None` and correctly (given the missing entry) refused to trust it, exactly
+    // as if `z` and `z0` were unrelated. But `z` is EXACTLY as sound a base as any
+    // PARAMETER's own self-identity just above: a call-seeded/field-seeded local
+    // names a FRESH, independent buffer at the moment of its OWN defining
+    // assignment, so it is its own base by the same reasoning a parameter is.
+    // Confirmed this is the DOMINANT remaining `cstr:*` shape on the real corpus
+    // (live-sampled: `charFunc`, `sqlite3UtfSelfTest`, `sqlite3VdbeMemTranslate`,
+    // `sqlite3_create_filename`, and many more all follow the identical
+    // "call-seeded local + a second local/param copied from it" pattern) --
+    // NOT the span/pair-PARAMETER whole-program case originally suspected;
+    // diagnosis (real corpus call-site sampling of `sqlite3DbSpanDup` and
+    // similar) found those chains bottom out in the Lemon-generated parser,
+    // outside this corpus's own parsed scope, undermining that avenue instead.
+    // Restricted to falling back ONLY when a base WAS resolved but its shape
+    // wasn't a name (`.map` on an already-`Some` result) -- a local whose RHS
+    // never resolves to any cursor base at all (`cursorBaseAndOffset(rhs)` itself
+    // `None`) is unaffected, exactly as before.
     val strCursorBaseRaw = (if (moduleScope) Nil else m.parameter.l)
       .filter(p => strCursorParams.contains(localName(p.name)))
       .map(p => localName(p.name) -> localName(p.name)).toMap ++
@@ -8180,11 +8378,11 @@ import scala.annotation.tailrec
               case _ :: rhs :: Nil => cursorBaseAndOffset(rhs)
               case _ => None
             })
-            .flatMap { case (base, _) =>
-              for { k <- base.value.get("k") if k.str == "name"
-                    v <- base.value.get("v") } yield v.str
+            .map { case (base, _) =>
+              val nameShapeBase = for { k <- base.value.get("k") if k.str == "name"
+                                         v <- base.value.get("v") } yield v.str
+              localName(l.name) -> nameShapeBase.getOrElse(localName(l.name))
             }
-            .map(baseName => localName(l.name) -> baseName)
         }.toMap
     // `010-reach-90pct-hole-free`: `strCursorBaseRaw` is not transitively
     // resolved -- a local seeded from ANOTHER local cursor (`pEnd = &pIter[8];`,
@@ -8204,6 +8402,29 @@ import scala.annotation.tailrec
       var m2 = strCursorBaseRaw
       for (_ <- 1 to 4) m2 = m2.map { case (k, v) => k -> m2.getOrElse(v, v) }
       m2
+    }
+    // `010-reach-90pct-hole-free`: unify any of THIS method's OWN parameter pairs
+    // that `closedSpanPairs` (its own doc comment has the full reasoning) has
+    // whole-program-verified as always receiving the same underlying buffer --
+    // exactly as if one had been derived from the other within a single
+    // function's own body, the only difference being WHERE the proof lives
+    // (across every call site, not this function's own statements). The lower
+    // parameter index is the arbitrary but consistent canonical representative;
+    // any prior self-identity entry for either name (both already have one, from
+    // the parameter self-identity map just above) is overwritten, not merged --
+    // there is nothing to reconcile, a parameter's only prior entry was always
+    // itself.
+    if (!moduleScope) {
+      val paramNameByIdx = m.parameter.l.map(p => p.index -> localName(p.name)).toMap
+      for {
+        i <- paramNameByIdx.keys.toList.sorted
+        j <- paramNameByIdx.keys.toList.sorted
+        if i < j && closedSpanPairs.contains((m.fullName, i, j))
+        nameI <- paramNameByIdx.get(i)
+        nameJ <- paramNameByIdx.get(j)
+      } {
+        strCursorBase = strCursorBase + (nameI -> nameI) + (nameJ -> nameI)
+      }
     }
     val body0 = methodBody(m)
     // `003-box-address-taken-locals`: allocate every boxed local's/parameter's cell
