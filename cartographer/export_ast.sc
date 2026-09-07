@@ -2360,10 +2360,42 @@ import scala.annotation.tailrec
     case _ => false
   }
 
+  /** `010-reach-90pct-hole-free`: is `operand` ITSELF a pointer cast, read off
+    * its type-ref's own SOURCE TEXT rather than `staticTypeOf` -- confirmed
+    * live that a `<operator>.cast` CALL node's `typeFullName` (what
+    * `staticTypeOf` falls back to for a Call it has no other case for) drops
+    * the pointer depth entirely for a cast used as a SUB-expression:
+    * `(u8*)pCtx`'s own Call node reports `typeFullName = "u8"`, not `"u8*"`,
+    * and its TYPE-REF child's `typeFullName` has the IDENTICAL gap -- this is
+    * why `sqlite3VdbeExec`'s own `(Mem*)((u8*)pCtx + nAlloc)` still holed
+    * after the pointer-arithmetic fix that was specifically built for this
+    * shape (`arithOperandIsPointerShaped`, which asks `castOperandIsPointerShaped`
+    * on each side of the `+`, which in turn asks `staticTypeOf`). Mirrors
+    * `castTargetIsPointer`'s own established technique one level up: reads the
+    * type-ref's `.code` (source text, "u8*" exactly as spelled) instead of any
+    * `typeFullName`. Deliberately NOT a fix to `staticTypeOf` itself: tried
+    * first and reverted after a live corpus re-export showed a net
+    * REGRESSION (holeFree 2806 -> 2792) -- `cstr:pointer-arith`'s own,
+    * unrelated pointer-arithmetic-soundness check also consults
+    * `staticTypeOf` on `+`/`-` operands, and making casts resolve correctly
+    * there flipped many ordinary-looking additions into a hole they
+    * previously escaped by having an (incorrectly) non-pointer operand type.
+    * Scoping the fix to exactly this one predicate keeps the blast radius to
+    * the cast-operand question it was diagnosed for. */
+  def castOperandIsItselfPointerCast(operand: AstNode): Boolean = operand match {
+    case c: Call if c.methodFullName == "<operator>.cast" =>
+      kidsOf(c) match {
+        case List(tref, _) => castTargetIsPointer(tref, staticTypeOf(tref))
+        case _ => false
+      }
+    case _ => false
+  }
+
   def castOperandIsPointerShaped(operand: AstNode): Boolean =
     isPointerType(staticTypeOf(operand)) || isOp(operand, "<operator>.addressOf") ||
     isKnownOpaquePointerTypedef(staticTypeOf(operand)) || isKnownPointerReturningCall(operand) ||
-    isKnownOpaquePointerField(operand) || arithOperandIsPointerShaped(operand)
+    isKnownOpaquePointerField(operand) || castOperandIsItselfPointerCast(operand) ||
+    arithOperandIsPointerShaped(operand)
 
   /** `char` is deliberately absent from `intTypeNames`: its signedness is
     * implementation-defined, so `static_cast<char>(300)` has no standard-mandated value.
