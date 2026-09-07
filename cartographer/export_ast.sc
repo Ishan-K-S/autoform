@@ -1936,6 +1936,25 @@ import scala.annotation.tailrec
     * `u32`. There is deliberately no default: an unresolved name yields `None` and the
     * caller keeps a hole. */
   def resolveIntType(ty0: String): Option[String] = {
+    // `010-reach-90pct-hole-free`: an ENUM type (`(enum DB_enum)choice`,
+    // SQLite's own recurring "cast an int to an enum for a switch statement"
+    // idiom -- `tclsqlite.c`'s own `DB_enum`/`TTYPE_enum`, `test_malloc.c`'s
+    // own `MB_enum`, `test_osinst.c`'s own `VL_enum`) is unconditionally
+    // `int`-sized (`i32`) in C, absent an explicit underlying-type extension
+    // this project does not otherwise model -- unlike the genuinely
+    // data-model-dependent types this function is deliberately cautious
+    // about (`long`/`size_t`/...), an enum's width is a language guarantee,
+    // not a per-target fact, so hardcoding it here carries none of the
+    // "guessing silently" risk this function's own doc comment warns against.
+    // Checked on the RAW (const/volatile-stripped but NOT `bareType`'s own
+    // enum-KEYWORD-stripped) text, since the keyword itself -- not the tag
+    // name alone -- is the only reliable signal Joern's own type tables never
+    // separately flag. Neither `isClassType` (no `"enum"` case in its own
+    // keyword check) nor the `scalarTypedefs`/`nonClassScalars` fixed sets
+    // (a NAME table, not a general "is this an enum" structural test) could
+    // ever have caught this on their own.
+    if (ty0.replace("const ", "").replace("volatile ", "").trim.startsWith("enum")) Some("i32")
+    else {
     var t    = bareType(ty0)
     var seen = Set.empty[String]
     var res  = Option.empty[String]
@@ -1953,6 +1972,7 @@ import scala.annotation.tailrec
       }
     }
     res
+    }
   }
 
   /** `005-sizeof-constant-folding`: byte count of a SCALAR type under the resolved
@@ -2259,8 +2279,24 @@ import scala.annotation.tailrec
     * silently wrong arithmetic. Exactly the class of bug the ledger exists to make
     * impossible, so the surface syntax is consulted as well and a `*`, `&` or `[]` in the
     * written type sends the cast to the address hole where it belongs. */
+  /** `010-reach-90pct-hole-free`: ALSO recognizes a cast whose TARGET type is a
+    * known function-pointer TYPEDEF (`functionPointerTypedefNames`) as a
+    * pointer cast -- `(sqlite3_destructor_type)someExpr` has no `*` ANYWHERE
+    * in its own source spelling (the pointer-ness is hidden inside the
+    * typedef's own `typedef void (*sqlite3_destructor_type)(void*);`
+    * definition), so neither of this function's existing two checks
+    * (`isPointerType`'s own literal-`*` requirement, or `tref.code`'s own
+    * literal-`*`/`&`/`[]` text check) could ever recognize it -- the cast
+    * fell all the way through to the non-pointer (`resolveIntType`/
+    * `addrKind`) branch instead, which then correctly found no integer width
+    * for a genuinely POINTER-shaped target and holed on `op:cast:opaque-type`.
+    * Live-sampled as the single largest `op:cast:opaque-type` sub-pattern
+    * (10 of ~50 distinct local occurrences). `functionPointerTypedefNames`
+    * is already the file's own proven, whole-program-scanned set of GENUINE
+    * function-pointer typedef names (built for `memberSizeofBytes`'s
+    * identical gap, an earlier push) -- reused verbatim, not re-derived. */
   def castTargetIsPointer(tref: AstNode, ty: String): Boolean =
-    isPointerType(ty) || {
+    isPointerType(ty) || functionPointerTypedefNames.contains(bareType(ty)) || {
       val c = bareType(tref.code)
       c.endsWith("*") || c.endsWith("&") || c.matches(""".*\[.*\]""")
     }
