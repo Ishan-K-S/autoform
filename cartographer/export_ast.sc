@@ -1477,6 +1477,35 @@ import scala.annotation.tailrec
             (c.methodFullName == "<operator>.addition" && rightIsParam && !isCString(a))
           case _ => false
         })
+      // `010-reach-90pct-hole-free`: `z1 - z2`, the OTHER operand ALSO
+      // char*-shaped -- the complementary case to `arithOperands`'s own
+      // "z +/- n" bucket just above, which deliberately EXCLUDES this shape
+      // (`!isCString(b)`) because that bucket's own translation
+      // (`cursorBaseAndOffset`/`Expr.strFrom`) produces a NEW POINTER, wrong
+      // for a "how far apart are these two buffers" byte-offset computation.
+      // `z1 - z2` already has its OWN correct, already-shipped translation --
+      // `expr`'s same-base `cStringUnsafe` case a few hundred lines below
+      // (subtraction is one of that map's own operators), which reduces to
+      // `z1$off - z2$off`, an ordinary integer, exactly like the existing
+      // same-base ORDER comparison case already does for `<`/`<=`/`>`/`>=`.
+      // Confirmed live to matter: SQLite's own extremely common "how many
+      // bytes have I consumed" idiom (`btreeParseCellPtr`'s own `pIter -
+      // pCell`, `pCell`/`pIter` both `u8*` into the SAME page buffer) was
+      // disqualifying `pIter` from `strCursorParams` ENTIRELY over this one
+      // unaccounted occurrence, even though every OTHER occurrence
+      // (`*pIter`, `pIter[8]`, `++pIter`, `pIter < pEnd`) already had a
+      // bucket. `strCursorBase`'s own same-base check AT THE TRANSLATION
+      // SITE (unchanged) is the real guard against subtracting two UNRELATED
+      // cursors -- this bucket, like `orderComparisons` above, only needs to
+      // acknowledge the occurrence exists.
+      val cursorMinusCursor = m.body.ast.isCall.filter(_.methodFullName == "<operator>.subtraction").l
+        .count(c => kidsOf(c) match {
+          case List(a, b) =>
+            val leftIsParam = a match { case i: Identifier => i.name == paramName; case _ => false }
+            val rightIsParam = b match { case i: Identifier => i.name == paramName; case _ => false }
+            (leftIsParam && isCString(b)) || (rightIsParam && isCString(a))
+          case _ => false
+        })
       // `010-reach-90pct-hole-free` US4: `zStart = zNum;` -- a cursor's CURRENT
       // value copied (by plain assignment) into some OTHER, non-cursor variable.
       // Not `defAssigns` (that bucket is `paramName` on the LEFT of its OWN
@@ -1489,10 +1518,22 @@ import scala.annotation.tailrec
       // callArgs does, or a function assigning its cursor to a plain local
       // (SQLite's own `zStart = zNum;`, saving a start-of-token position) is
       // wrongly disqualified entirely over an occurrence its own translation
-      // already handles soundly. */
+      // already handles soundly.
+      //
+      // `010-reach-90pct-hole-free`: widened from requiring the LHS to ALSO
+      // be a bare identifier to accepting ANY LHS shape (`pInfo->pPayload =
+      // pIter;`, confirmed live in `btreeParseCellPtr`) -- `assignTo`'s own
+      // translation computes `rhsE = valueOf(rhs)` GENERICALLY, once, at the
+      // very top, before ever looking at the LHS's own shape (field, index,
+      // bare name, ...), so a tracked cursor's bare-identifier read already
+      // translates correctly as the RHS of ANY assignment target, not just
+      // another bare local -- the bare-identifier-LHS restriction here was
+      // narrower than what the translation itself already supports, for no
+      // safety reason specific to the LHS shape. */
       val assignRhsReads = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
         .count(c => kidsOf(c) match {
-          case (lhs: Identifier) :: (rhs: Identifier) :: Nil => lhs.name != paramName && rhs.name == paramName
+          case List(lhs, rhs: Identifier) =>
+            rhs.name == paramName && (lhs match { case i: Identifier => i.name != paramName; case _ => true })
           case _ => false
         })
       // `010-reach-90pct-hole-free` US4: `orderComparisons`/`incrs`/`advances`
@@ -1515,8 +1556,79 @@ import scala.annotation.tailrec
       // unrelated char*s equality-compared, neither derived from the other,
       // simply fail that check and fall through to the existing hole exactly
       // as before, regardless of how permissively either one qualifies here. */
-      (reads + indexReads + orderComparisons + incrs + advances + nullChecks) > 0 &&
-      (reads + incrs + advances + nullChecks + orderComparisons + callArgs + indexReads + defAssigns + arithOperands + assignRhsReads) == allRefs.size &&
+      // `010-reach-90pct-hole-free`: `cursorMinusCursor` joins the "at least
+      // one real occurrence" guard too -- a pointer PARAMETER used ONLY as
+      // the start marker a walking cursor is later subtracted from
+      // (`pCell` in `pIter - pCell`, `pIter` itself never derived from
+      // dereferencing/indexing/comparing `pCell` directly) is exactly as
+      // real a cursor role as any of the others already here; confirmed
+      // live as the reason `pCell` failed this guard even though its own
+      // occurrence-accounting was already exhaustive (`assignRhsReads` +
+      // `cursorMinusCursor` == `allRefs`, but neither bucket counted as
+      // "real" until now).
+      // `010-reach-90pct-hole-free`: `*(z++) = hexdigits[...]` (`hexFunc`, live on
+      // the real corpus) -- `Val.str` is an IMMUTABLE snapshot of the buffer's
+      // bytes at cursor-creation time (`strByte`/`strFrom`, `Semantics.lean`), so
+      // no cursor translation can soundly model a STORE through the dereferenced
+      // pointer, only reads. Every bucket above counts `z`'s occurrence in
+      // `z++` under `incrs` exactly the same whether that increment sits alone
+      // or, as here, inside `*(z++) = ...` -- occurrence-accounting has no notion
+      // of "this specific occurrence is a write target" at all, so a write-cursor
+      // was sailing through eligibility on the SAME bucket a genuine read-only
+      // walk uses, then failing later at actual codegen (a brand-new
+      // `op:assignment` hole where the plain, un-tracked pointer assignment used
+      // to just work) -- a net loss for the one function even though the corpus
+      // as a whole still gained. Disqualifies the name OUTRIGHT (not just the one
+      // occurrence) the moment it is EVER the base of a dereference that is
+      // itself an assignment's LHS, mirroring `identNameThroughCast`'s
+      // see-through-casts walk plus `incrOps`' pre/post inc/dec unwrap so
+      // `*(u8*)(z++) = ...` and `*(++z) = ...` are caught the same way. */
+      def derefWriteBase(n: AstNode): Option[String] = n match {
+        case i: Identifier => Some(i.name)
+        case c: Call if incrOps.contains(c.methodFullName) =>
+          kidsOf(c) match { case List(i: Identifier) => Some(i.name); case _ => None }
+        case c: Call if c.methodFullName == "<operator>.cast" && kidsOf(c).size == 2 =>
+          derefWriteBase(kidsOf(c)(1))
+        case _ => None
+      }
+      val derefWriteTarget = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+        .exists(a => kidsOf(a) match {
+          case List(lhs, _) =>
+            lhs match {
+              case ind: Call if ind.methodFullName == "<operator>.indirection" =>
+                kidsOf(ind) match {
+                  case List(inner) => derefWriteBase(inner).contains(paramName)
+                  case _ => false
+                }
+              case _ => false
+            }
+          case _ => false
+        })
+      // `010-reach-90pct-hole-free`: `z = zHex = contextMalloc(...);` -- the SAME
+      // `hexFunc` site, the OTHER half of it. `derefWriteTarget` above catches `z`
+      // (dereferenced-and-written directly), but `zHex` is never itself
+      // dereferenced -- it is only ALIASED to `z` through this C chained
+      // assignment, which Joern parses as `z = (zHex = contextMalloc(...))`, a
+      // nested `<operator>.assignment` Call as `z`'s own RHS, not two sibling
+      // statements. `zHex`'s own occurrence-accounting (a `contextMalloc` call
+      // makes it a plausible fresh "call-seeded" cursor, base=self, offset=0) has
+      // no way to see that `z`, the OUTER assignment's target, gets
+      // dereference-written later -- that fact lives entirely in `z`'s own
+      // bucket-counting, a different `paramName` this call never runs with.
+      // Rather than the much larger job of real alias tracking, disqualifies
+      // OUTRIGHT any name that is the LHS of an assignment nested as another
+      // assignment's RHS at all: a plain `x = y = expr;` chain always makes `x`
+      // and `y` the SAME pointer value, so `y` alone can never be soundly judged
+      // a read-only cursor without knowing what happens to `x` too. */
+      val isChainedAssignRhs = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+        .exists(outer => kidsOf(outer) match {
+          case List(_, rhs: Call) if rhs.methodFullName == "<operator>.assignment" =>
+            kidsOf(rhs) match { case List(innerLhs: Identifier, _) => innerLhs.name == paramName; case _ => false }
+          case _ => false
+        })
+      !derefWriteTarget && !isChainedAssignRhs &&
+      (reads + indexReads + orderComparisons + incrs + advances + nullChecks + cursorMinusCursor) > 0 &&
+      (reads + incrs + advances + nullChecks + orderComparisons + callArgs + indexReads + defAssigns + arithOperands + assignRhsReads + cursorMinusCursor) == allRefs.size &&
       (!allowDefiningAssign || defAssigns == 1)
     }
   }
@@ -5974,6 +6086,29 @@ import scala.annotation.tailrec
   def cursorBaseAndOffset(n: AstNode): Option[(ujson.Obj, ujson.Obj)] = n match {
     case cst: Call if cst.methodFullName == "<operator>.cast" && kidsOf(cst).size == 2 =>
       cursorBaseAndOffset(kidsOf(cst)(1))
+    // `010-reach-90pct-hole-free`: `&q[n]`, `q` an ALREADY-tracked cursor --
+    // identical in meaning to `q + n` (C's own `&q[n]` IS `q + n`), just
+    // spelled with `&`+index instead of `+`, exactly the same equivalence
+    // `cursorAddrOf` (the ADDRESS-OF EXPRESSION dispatch, `callExpr`'s own
+    // `<operator>.addressOf` case) already trusts for a cursor's OWN
+    // address-of sites -- this is that SAME equivalence, reached from the
+    // LOCAL cursor-SEEDING side instead (`pEnd = &pIter[8];`). Confirmed
+    // live to matter: SQLite's own `pEnd = &pIter[8];`/`pEnd = &pCell[n];`
+    // idiom (`btreeParseCellPtr` and siblings) left `pEnd` unseedable, so
+    // its later `pIter < pEnd` comparison could never use the same-base
+    // mechanism even once `pIter` itself became a tracked cursor.
+    case addr: Call if addr.methodFullName == "<operator>.addressOf" =>
+      kidsOf(addr) match {
+        case List(idx) =>
+          asIndex(idx).flatMap { case (recv, i) =>
+            rawLocalOrParamName(recv).map(localName).filter(strCursorParams.contains).map { nm =>
+              (ujson.Obj("k" -> "name", "v" -> nm),
+               ujson.Obj("k" -> "binop", "op" -> "+",
+                         "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")), "b" -> expr(i)))
+            }
+          }
+        case _ => None
+      }
     case c: Call if (c.methodFullName == "<operator>.addition" || c.methodFullName == "<operator>.subtraction") &&
                      kidsOf(c).size == 2 &&
                      rawLocalOrParamName(kidsOf(c)(0)).map(localName).exists(strCursorParams.contains) &&
@@ -6019,6 +6154,24 @@ import scala.annotation.tailrec
                       "a" -> ujson.Obj("k" -> "int", "v" -> 0), "b" -> expr(kidsOf(c)(0)))))
     case _ if rawLocalOrParamName(n).exists(nm => !strCursorParams.contains(localName(nm))) =>
       Some((expr(n), ujson.Obj("k" -> "int", "v" -> 0)))
+    // `010-reach-90pct-hole-free`: a BARE, ALREADY-tracked cursor as RHS
+    // (`pIter = pCell;`, `pCell` itself a tracked cursor) -- previously
+    // deliberately EXCLUDED here (this function's own doc comment above)
+    // because `strCursorEligible` had no bucket accounting for "q appears as
+    // the bare RHS of some OTHER identifier's assignment" for q ITSELF.
+    // `assignRhsReads` (`strCursorEligible`'s own eligibility computation)
+    // now accounts for exactly this occurrence, for ANY LHS shape -- closing
+    // the specific gap this exclusion existed to work around. `pIter` starts
+    // as a SNAPSHOT of `pCell`'s CURRENT value at `pCell`'s CURRENT offset --
+    // identical in shape to the `q +/- n` case above with `n = 0`, and
+    // populated into `strCursorBase` the same generic way (this function's
+    // own "name" return shape), so `pIter`/`pCell` compare as the same base.
+    // Confirmed live to matter: SQLite's own `pIter = pCell;` idiom
+    // (`btreeParseCellPtr` and its many siblings), where `pCell` is a
+    // pointer PARAMETER and `pIter` walks forward from it.
+    case _ if rawLocalOrParamName(n).exists(nm => strCursorParams.contains(localName(nm))) =>
+      val nm = rawLocalOrParamName(n).map(localName).get
+      Some((ujson.Obj("k" -> "name", "v" -> nm), ujson.Obj("k" -> "name", "v" -> (nm + "$off"))))
     case fa if asField(fa).isDefined =>
       Some((expr(fa), ujson.Obj("k" -> "int", "v" -> 0)))
     // `010-reach-90pct-hole-free` US4: a call RHS (`zSql = sqlite3_value_text(...)`)
@@ -7940,57 +8093,82 @@ import scala.annotation.tailrec
     // a local defined off ANOTHER newly-qualifying LOCAL cursor is out of scope (no
     // fixed-point iteration here), which only means fewer locals qualify, never a
     // wrong translation of one that does.
-    strCursorParams = strCursorParams ++ (if (moduleScope) Nil else m.local.l)
-      // `009-reduce-remaining-holes-4`: `isCStringType(l.typeFullName)`, NOT
-      // `isCString(l)` -- `nodeType`/`staticTypeOf` have no case for a raw `Local`
-      // DECLARATION node (only for a body-level Identifier/Call/... reference to
-      // one), so `isCString(l)` silently fell through to `direct = ""`, matching
-      // nothing, and disqualified every local candidate outright. Confirmed live:
-      // `zTail`'s own `typeFullName` reads `char*` correctly; `isCString(zTail)`
-      // (the Local node) read `false`. `l.typeFullName` is exactly what
-      // `localTypes` (this method's name-keyed type map, populated from
-      // `m.local.l` two lines below this whole block in `emit`) already holds for
-      // this same name, so this is not a new type-recovery path, just reading the
-      // one field a `Local` node already carries directly.
+    // `009-reduce-remaining-holes-4`: `isCStringType(l.typeFullName)`, NOT
+    // `isCString(l)` -- `nodeType`/`staticTypeOf` have no case for a raw `Local`
+    // DECLARATION node (only for a body-level Identifier/Call/... reference to
+    // one), so `isCString(l)` silently fell through to `direct = ""`, matching
+    // nothing, and disqualified every local candidate outright. Confirmed live:
+    // `zTail`'s own `typeFullName` reads `char*` correctly; `isCString(zTail)`
+    // (the Local node) read `false`. `l.typeFullName` is exactly what
+    // `localTypes` (this method's name-keyed type map, populated from
+    // `m.local.l` two lines below this whole block in `emit`) already holds for
+    // this same name, so this is not a new type-recovery path, just reading the
+    // one field a `Local` node already carries directly.
+    //
+    // `010-reach-90pct-hole-free`: hardened after a real, live-confirmed
+    // regression. The original version of the assignment-count filter used
+    // `.find` (the FIRST bare assignment to `l.name`, matched against its own
+    // RHS shape) rather than requiring exactly one -- so a local reassigned in
+    // different branches (`if (...) { zPathname = dup(...); } else {
+    // zPathname = malloc(...); zPathname[0] = 0; }`, confirmed live in
+    // `sqlite3PagerOpen`) could qualify off whichever assignment the
+    // traversal happened to see first.
+    //
+    // An additional "no index/field WRITE through `l.name` anywhere in the
+    // method" guard was ALSO tried here and reverted: live-confirmed to
+    // regress real, already-correctly-translating functions
+    // (`defragmentPage` and others) whose own field-access-seeded cursor
+    // (`data = pPage->aData;`) is ALSO written through by index elsewhere
+    // (`data[hdr+7] = 0;`) without that ever being unsound in practice --
+    // `assignTo`'s own index-assignment dispatch does not route an
+    // index-write through `strCursorParams`'s read-only machinery at all
+    // (a `Val.str` write was never reachable through that path to begin
+    // with), so the extra guard was excluding real, already-safe cases for
+    // a risk that does not exist for THIS shape. `bareAssignsToName.size
+    // == 1` alone is what the counterexample above actually needed.
+    //
+    // `010-reach-90pct-hole-free`: the SINGLE round this used to run (adding
+    // every newly-qualified local ONCE, using only the PARAMETER cursors
+    // already known) could not see a local seeded from ANOTHER local cursor
+    // (`pEnd = &pIter[8];`, `pIter` itself a local seeded from parameter
+    // `pCell`) -- `pIter` is never visible to `pEnd`'s own eligibility check
+    // within one round, because `strCursorParams` (the mutable var read
+    // inside `cursorBaseAndOffset`) is not updated until the WHOLE
+    // filter/map/toSet expression finishes, regardless of `m.local.l`'s own
+    // iteration order. Confirmed live in `btreeParseCellPtr`-style functions
+    // (SQLite's own extremely common two-tier "pIter walks from pCell,
+    // pEnd bounds pIter" idiom). Fixed with a small BOUNDED number of
+    // rounds (matching this file's own "bounded rather than recursive"
+    // precedent elsewhere, `closedOutParamsTransitive`), each adding
+    // whichever NOT-YET-qualified candidates now resolve given the PREVIOUS
+    // round's growed membership -- a genuine chain is never more than a
+    // couple of hops deep, and a candidate that still doesn't resolve after
+    // the round bound simply stays excluded, never guessed into membership.
+    val localCandidates = (if (moduleScope) Nil else m.local.l)
       .filter(l => isCStringType(l.typeFullName) && strCursorEligible(m, l.name, allowDefiningAssign = true))
-      // `010-reach-90pct-hole-free`: hardened after a real, live-confirmed
-      // regression. The original version of this filter used `.find` (the
-      // FIRST bare assignment to `l.name`, matched against its own RHS shape)
-      // rather than requiring exactly one -- so a local reassigned in
-      // different branches (`if (...) { zPathname = dup(...); } else {
-      // zPathname = malloc(...); zPathname[0] = 0; }`, confirmed live in
-      // `sqlite3PagerOpen`) could qualify off whichever assignment the
-      // traversal happened to see first.
-      //
-      // An additional "no index/field WRITE through `l.name` anywhere in the
-      // method" guard was ALSO tried here and reverted: live-confirmed to
-      // regress real, already-correctly-translating functions
-      // (`defragmentPage` and others) whose own field-access-seeded cursor
-      // (`data = pPage->aData;`) is ALSO written through by index elsewhere
-      // (`data[hdr+7] = 0;`) without that ever being unsound in practice --
-      // `assignTo`'s own index-assignment dispatch does not route an
-      // index-write through `strCursorParams`'s read-only machinery at all
-      // (a `Val.str` write was never reachable through that path to begin
-      // with), so the extra guard was excluding real, already-safe cases for
-      // a risk that does not exist for THIS shape. `bareAssignsToName.size
-      // == 1` alone is what the counterexample above actually needed.
       .filter { l =>
-        val bareAssignsToName = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
-          .filter(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == l.name; case _ => false })
-        bareAssignsToName.size == 1 &&
-          (kidsOf(bareAssignsToName.head) match {
-            case _ :: rhs :: Nil => cursorBaseAndOffset(rhs).isDefined
-            case _ => false
-          })
+        m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+          .count(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == l.name; case _ => false }) == 1
       }
-      .map(l => localName(l.name)).toSet
+    val candidateRhs: Map[String, AstNode] = localCandidates.flatMap { l =>
+      m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+        .find(c => kidsOf(c) match { case (i: Identifier) :: _ :: Nil => i.name == l.name; case _ => false })
+        .flatMap(a => kidsOf(a) match { case _ :: rhs :: Nil => Some(rhs); case _ => None })
+        .map(rhs => localName(l.name) -> rhs)
+    }.toMap
+    for (_ <- 1 to 4) {
+      val newlyQualified = candidateRhs.collect {
+        case (nm, rhs) if !strCursorParams.contains(nm) && cursorBaseAndOffset(rhs).isDefined => nm
+      }.toSet
+      strCursorParams = strCursorParams ++ newlyQualified
+    }
     // `010-reach-90pct-hole-free` US4: `strCursorBase`, populated now that
     // `strCursorParams` has its FULL final membership (params ++ locals) --
     // a parameter is its own base; a local's base is `cursorBaseAndOffset`'s
     // own resolved base object for its one defining assignment, when that
     // object is a plain `{"k":"name","v":X}` (the only shape two cursors'
     // `$off`s can be soundly compared through).
-    strCursorBase = (if (moduleScope) Nil else m.parameter.l)
+    val strCursorBaseRaw = (if (moduleScope) Nil else m.parameter.l)
       .filter(p => strCursorParams.contains(localName(p.name)))
       .map(p => localName(p.name) -> localName(p.name)).toMap ++
       (if (moduleScope) Nil else m.local.l)
@@ -8008,6 +8186,25 @@ import scala.annotation.tailrec
             }
             .map(baseName => localName(l.name) -> baseName)
         }.toMap
+    // `010-reach-90pct-hole-free`: `strCursorBaseRaw` is not transitively
+    // resolved -- a local seeded from ANOTHER local cursor (`pEnd = &pIter[8];`,
+    // `pIter` itself seeded from parameter `pCell`) maps to that local's own
+    // NAME ("pIter"), not to the ultimate root ("pCell") `pIter`'s own entry
+    // resolves to. Two same-base cursors both chained this way would then
+    // compare "pIter" against "pCell" and wrongly fail the same-base check at
+    // the comparison site, even though both genuinely trace back to the same
+    // object. Resolved here with a small BOUNDED number of rounds (matching
+    // this file's own "bounded rather than recursive" precedent elsewhere,
+    // `closedOutParamsTransitive`) rather than a true fixed point: a real
+    // forwarding chain here is never more than a couple of hops deep, and a
+    // cycle (which cannot arise from a real defining-assignment chain, since
+    // each hop is a DIFFERENT name's own single assignment) would simply stop
+    // resolving further after the round bound, never loop.
+    strCursorBase = {
+      var m2 = strCursorBaseRaw
+      for (_ <- 1 to 4) m2 = m2.map { case (k, v) => k -> m2.getOrElse(v, v) }
+      m2
+    }
     val body0 = methodBody(m)
     // `003-box-address-taken-locals`: allocate every boxed local's/parameter's cell
     // exactly once, unconditionally, before the translated body's first real
