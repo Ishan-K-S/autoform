@@ -429,6 +429,32 @@ inductive Expr where
   rather than a second, parallel list-evaluator needing its own proof. Any key that does
   not evaluate to a `Val.str` is a hole, never reached by anything the exporter emits. -/
   | boxFields : List (Expr × Expr) → Expr
+  /-- `010-reach-90pct-hole-free`: allocation of a fresh `Obj` whose FIELD COUNT is a
+  RUNTIME value, not a list of `(key, value)` pairs the exporter writes out one at a
+  time. `Expr.boxFields`' own list is a SYNTACTIC term embedded in the generated Lean
+  source -- its length is fixed at EXPORT time, which is exactly why a large
+  compile-time-sized array (SQLite's own I/O buffers run 512-8,192 elements) blows
+  the elaborator's recursion depth or exhausts memory (`research.md` §3, spec 010's
+  own Day-1 finding): the SOURCE FILE itself contains one nested list cell per
+  element.
+
+  `Expr.boxArray` sidesteps this by construction: it takes a single length
+  EXPRESSION, evaluates it ONCE at runtime to a `Val.int`, and the resulting `Obj`'s
+  fields (`"0" ↦ .unit, "1" ↦ .unit, ..., "n-1" ↦ .unit`, `List.range` under the
+  hood) are built by an ordinary, already-compiled Lean function operating on
+  whatever `Nat` the interpreter computes THEN -- no per-element syntax, so no
+  elaboration-time cost that scales with the array's size at all, compile-time-known
+  or not. This is what makes it usable for `malloc(len)`-shaped C allocations, whose
+  size the exporter can never know until the program runs: `zOut = malloc(n);` seeds
+  `zOut` as `Val.ref` to a fresh `n`-field `Obj`, `Val.iref` (`Sel.idx`, already
+  generic over the position) then walks and reads/writes it exactly like any other
+  boxed array -- `irefIndex`/`derefIref`/`setDerefIref`/pointer arithmetic on
+  `Val.iref` need no change at all, only a new way to OBTAIN a valid ref to something
+  shaped like one. Every field starts `.unit`, matching every other uninitialized
+  boxed local/array's own convention -- sound because the only real corpus idiom this
+  targets (`malloc` a buffer, walk it with a pointer, write every byte before ever
+  reading one back) never observes a field's `.unit` starting value at all. -/
+  | boxArray : Expr → Expr
   /-- `006-reduce-remaining-holes`, Story 5: `&a[i]` once `a` is a boxed array --
   evaluates the receiver to `Val.ref r`, evaluates the index, and produces
   `Val.iref r (.idx i)`. Takes a full sub-`Expr` for the index (not a literal), since
@@ -612,6 +638,7 @@ def holes : Expr → List String
   | .dstarred a   => holes a
   | .boxNew a     => holes a
   | .boxFields kvs => holesP kvs
+  | .boxArray n    => holes n
   | .irefIndex a i => holes a ++ holes i
   | .irefField a _ => holes a
   | .derefIref a   => holes a
@@ -649,6 +676,7 @@ def size : Expr → Nat
   | .dstarred a   => 1 + size a
   | .boxNew a     => 1 + size a
   | .boxFields kvs => 1 + sizeP kvs
+  | .boxArray n    => 1 + size n
   | .irefIndex a i => 1 + size a + size i
   | .irefField a _ => 1 + size a
   | .derefIref a   => 1 + size a

@@ -162,6 +162,15 @@ def expr_shape(n):
         atom = (f"((List.range {n}).map (fun i => "
                 f"(Expr.lit (Lit.str s!\"{{i}}\"), Expr.lit Lit.unit)))")
         return ".boxFields", [("atom", atom)]
+    # `010-reach-90pct-hole-free`: `boxFieldsRange` above needs `n` known at EXPORT
+    # time (it bakes the literal into the generated source text) -- no help for a
+    # `malloc(len)`-shaped C allocation, whose size the exporter can never know
+    # until the program runs. `Expr.boxArray` (`Syntax.lean`) takes a LENGTH
+    # EXPRESSION instead of a literal count, evaluated once at runtime; this is
+    # the ordinary `("e", ...)` single-sub-expression shape every other
+    # one-argument constructor here already uses (`boxNew`, `derefIref`, ...), not
+    # a new rendering pattern.
+    if k == "boxArray": return ".boxArray", [("e", f('n'))]
     if k == "irefIndex": return ".irefIndex", [("e", f('a')), ("e", f('i'))]
     if k == "irefField": return ".irefField", [("e", f('a')), ("atom", lean_str(f('f')))]
     if k == "derefIref": return ".derefIref", [("e", f('p'))]

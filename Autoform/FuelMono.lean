@@ -155,6 +155,17 @@ private theorem fuelStep : ∀ k, FuelStep k := by
                 cases r₁ <;> first
                   | (cases hy; exact absurd rfl hne)
                   | (rw [ihP _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
+        -- `010-reach-90pct-hole-free`: `Expr.boxArray` -- same shape as `boxNew`,
+        -- one recursive `evalExpr` call (for the length) with no further recursion;
+        -- `List.range`/`Heap.alloc` afterwards are fuel-free, exactly like
+        -- `Heap.alloc` after `boxNew`'s own single `evalExpr` call.
+        | boxArray a =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ <;> first
+              | (cases hy; exact absurd rfl hne)
+              | (rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
         -- `006-reduce-remaining-holes`, Story 5: `&a[i]` -- same shape as `index`,
         -- two sequential `evalExpr` calls with no further recursion afterwards.
         | irefIndex a i =>

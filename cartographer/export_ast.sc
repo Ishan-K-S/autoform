@@ -1129,6 +1129,51 @@ import scala.annotation.tailrec
     * any kind for `p`. */
   var ptrIrefNames = Set.empty[String]
 
+  /** `010-reach-90pct-hole-free`: SQLite's own small, well-documented memory-
+    * allocation API surface, mapped to the 0-based position (in `kidsOf`'s own
+    * left-to-right order) of the argument carrying the BYTE COUNT of the buffer
+    * being allocated. Deliberately a closed, explicit allowlist rather than
+    * "any unresolved call" -- there is no way to tell, from an ARBITRARY external
+    * call site alone, which argument (if any) is a length, and guessing wrong
+    * would silently allocate a buffer of the wrong size, exactly the "well-typed
+    * but wrong" failure mode this whole project exists to refuse. An allocator
+    * this table does not list simply keeps its existing hole -- the safe default,
+    * matching every other unlisted-name fallback in this file (`cStringUnsafe`,
+    * `modelDependentNames`, ...). Motivates `ptrIrefAllocNames`/`Expr.boxArray`
+    * just below: `zOut = sqlite3DbMallocRaw(pMem->db, len); ...; *zOut++ = byte;`
+    * (`sqlite3VdbeMemTranslate`, live on the real corpus) needs a buffer whose
+    * SIZE the exporter can never know until the program runs -- `boxArray`'s own
+    * doc comment (`Syntax.lean`) has the full reasoning for why that needs a new
+    * primitive rather than reusing `boxFieldsRange`'s existing (compile-time-N)
+    * mechanism. */
+  val knownAllocators = Map(
+    "sqlite3_malloc"        -> 0,
+    "sqlite3_malloc64"      -> 0,
+    "sqlite3DbMallocRaw"    -> 1,
+    "sqlite3DbMallocRawNN"  -> 1,
+    "sqlite3DbMallocZero"   -> 1,
+    "contextMalloc"         -> 1,
+    "malloc"                -> 0
+  )
+
+  /** `010-reach-90pct-hole-free`: per-method, a local whose ONE defining
+    * assignment is `t = knownAllocator(...)` -- name -> the length ARGUMENT node
+    * (not yet evaluated; translated via `expr()` at the actual assignment site,
+    * same as every other RHS in this file). Consumed at `assignTo`'s own
+    * bare-identifier dispatch (see its doc comment there) to translate `t`'s
+    * defining assignment as `Expr.irefIndex (Expr.boxArray lenExpr) 0` instead of
+    * the ordinary external-call translation (which would otherwise dynamically
+    * hole `t` outright, per Core's own "an unresolved call is never executed"
+    * semantics -- exactly the reasoning already relied on elsewhere this session
+    * for why an external call site itself is always safe to leave holing, just
+    * turned around: here `t`'s OWN name must NOT inherit that hole, since it is
+    * this project's own translation choosing the allocation shape, not a real
+    * external call whose behavior is unknown). Every such name also joins
+    * `ptrIrefNames` itself (below) so `*t`/`t[i]`/`t++`/`*t = v` all resolve via
+    * the SAME already-proven interior-pointer machinery arrays already use --
+    * this map exists ONLY to special-case the one DEFINING statement itself. */
+  var ptrIrefAllocNames = Map.empty[String, AstNode]
+
   /** `009-reduce-remaining-holes-4`: `const char *z` parameters walked as a BYTE
     * CURSOR -- `*z`, `z++`/`z--`/`z += n`/`z -= n`, and a bare `z == 0`/`z != 0` null
     * check, and NOTHING else anywhere in the method (no plain `=` reassignment, no
@@ -5249,6 +5294,31 @@ import scala.annotation.tailrec
                                  "a" -> ujson.Obj("k" -> "name", "v" -> (nm + "$off")),
                                  "b" -> expr(kids(0))))
     }
+    // `010-reach-90pct-hole-free`: `z - zOut` / `zIn < zTerm` / ... -- TWO
+    // `ptrIrefNames`-tracked names (`Val.iref`, not `Val.str`), compared or
+    // subtracted. Unlike the byte-cursor case just below, this needs NO static
+    // same-base proof at all: `applyBinop` (`Semantics.lean`, from Story 5,
+    // predating this push entirely) already has a same-OBJECT-checked runtime
+    // case for every one of `-`/`<`/`<=`/`>`/`>=`/`==`/`!=` on two `Val.iref`
+    // operands -- same ref succeeds (a plain integer/bool), cross-ref becomes a
+    // DYNAMIC hole (`iref:cross-object`), never a wrong answer. So it is sound
+    // to emit a PLAIN `Expr.binop` here unconditionally and let the semantics
+    // decide at run time, exactly the same "push the check to where the real
+    // objects are known" reasoning `==`/`!=` on two `Val.iref`s already relies
+    // on unconditionally two cases below. Checked BEFORE the general
+    // `cStringUnsafe` fallback, which would otherwise hole this outright the
+    // moment BOTH operands happen to be `char*`/`u8*`-typed (`sqlite3VdbeMemTranslate`'s
+    // own `z - zOut`, confirmed live -- `z`/`zOut` are `unsigned char*` locals
+    // walking a freshly `boxArray`-allocated buffer, `ptrIrefNames`-tracked, not
+    // `strCursorParams`-tracked, since a WRITE-target name is excluded from the
+    // read-only string-cursor mechanism entirely (`derefWriteTarget`)).
+    else if (cLikeFile && kids.size == 2 &&
+             Set("<operator>.subtraction", "<operator>.lessThan", "<operator>.lessEqualsThan",
+                 "<operator>.greaterThan", "<operator>.greaterEqualsThan",
+                 "<operator>.equals", "<operator>.notEquals").contains(mfn) &&
+             rawLocalOrParamName(kids(0)).map(localName).exists(ptrIrefNames.contains) &&
+             rawLocalOrParamName(kids(1)).map(localName).exists(ptrIrefNames.contains))
+      ujson.Obj("k" -> "binop", "op" -> binops(mfn), "a" -> expr(kids(0)), "b" -> expr(kids(1)))
     // `010-reach-90pct-hole-free` US4: `p < end` / `p == q` / ... -- TWO tracked
     // byte cursors, compared. Sound exactly when both provably measure offsets
     // into the SAME underlying string (`strCursorBase`'s own doc comment has the
@@ -6477,7 +6547,58 @@ import scala.annotation.tailrec
       case None     => rhsE
       case Some(op) => ujson.Obj("k" -> "binop", "op" -> op, "a" -> cur, "b" -> rhsE)
     }
+    // `010-reach-90pct-hole-free`: is `r` a nested `<operator>.assignment` Call
+    // (a C chained assignment's inner half) whose OWN LHS name is a
+    // `ptrIrefAllocNames` candidate -- see the matching `assignTo` case's own
+    // doc comment for the full reasoning. Returns that inner name.
+    def chainedAllocInnerName(r: AstNode): Option[String] = r match {
+      case inner: Call if inner.methodFullName == "<operator>.assignment" =>
+        kidsOf(inner) match {
+          case List(innerLhs: Identifier, _) => Some(localName(innerLhs.name)).filter(ptrIrefAllocNames.contains)
+          case _ => None
+        }
+      case _ => None
+    }
+    // `010-reach-90pct-hole-free`: `*(z++)`/`*(++z)` -- `z` a `ptrIrefNames` name
+    // wrapped in a pre/post increment, the operand shape `rawLocalOrParamName`
+    // alone cannot see through (it only recognizes a BARE identifier/parameter,
+    // exactly the same gap `derefWriteTarget`, `strCursorEligible`'s own
+    // increment-unwrapping, already had to solve for the READ-ONLY cursor
+    // mechanism -- needed here for the WRITE-CAPABLE one instead). Returns the
+    // target name, the arithmetic op (`incrOps`), and whether it is POST (use
+    // then advance) or PRE (advance then use).
+    def ptrIrefIncrWriteTarget(n: AstNode): Option[(String, String, Boolean)] = n match {
+      case inc: Call if incrOps.contains(inc.methodFullName) =>
+        kidsOf(inc) match {
+          case List(id) =>
+            rawLocalOrParamName(id).map(localName).filter(ptrIrefNames.contains).map { nm =>
+              (nm, incrOps(inc.methodFullName), inc.methodFullName.startsWith("<operator>.post"))
+            }
+          case _ => None
+        }
+      case _ => None
+    }
     val core = lhs match {
+      // `010-reach-90pct-hole-free`: `*(z++) = v;`/`*(++z) = v;` -- SQLite's own
+      // dominant buffer-write idiom (`sqlite3VdbeMemTranslate`'s own `*z++ =
+      // (u8)(c & 0xFF);`, confirmed live -- this push's real target, and the
+      // reason the plain bare-identifier `ptrIrefNames` case just below never
+      // fired for it at all). POST: write through `z`'s CURRENT binding first
+      // (an ordinary `setDerefIref` using `z`'s own name), THEN advance it --
+      // two sequential statements, no temp variable needed, since the first
+      // statement's use of `z` naturally happens before the second rebinds it.
+      // PRE is the mirror image: advance first, use the NEW value. `aug.isEmpty`
+      // -- `*(z++) += v` has no evidence of occurring in the real corpus and is
+      // not attempted; the generic catch-all below still holes it honestly if
+      // it ever does, exactly as before this case existed.
+      case c: Call if aug.isEmpty && c.methodFullName == "<operator>.indirection" && kidsOf(c).size == 1 &&
+                       ptrIrefIncrWriteTarget(kidsOf(c)(0)).isDefined =>
+        val (nm, op, isPost) = ptrIrefIncrWriteTarget(kidsOf(c)(0)).get
+        val pRef = ujson.Obj("k" -> "name", "v" -> nm)
+        val writeStmt = ujson.Obj("k" -> "setDerefIref", "p" -> pRef, "v" -> rhsE)
+        val advanceStmt = ujson.Obj("k" -> "assign", "x" -> nm,
+          "e" -> ujson.Obj("k" -> "binop", "op" -> op, "a" -> pRef, "b" -> ujson.Obj("k" -> "int", "v" -> 1)))
+        if (isPost) seqOf(List(writeStmt, advanceStmt)) else seqOf(List(advanceStmt, writeStmt))
       // `009-reduce-remaining-holes-4`: `z += n`/`z -= n`, `z` a tracked byte cursor
       // (`strCursorParams`) -- advances `z$off` by `n`, an ordinary integer local,
       // leaving `z`'s own binding untouched. Checked BEFORE the general `cstr:
@@ -6540,6 +6661,53 @@ import scala.annotation.tailrec
         val (base, off) = cursorBaseAndOffset(rhs).get
         seqOf(List(ujson.Obj("k" -> "assign", "x" -> nm, "e" -> base),
                    ujson.Obj("k" -> "assign", "x" -> (nm + "$off"), "e" -> off)))
+      // `010-reach-90pct-hole-free`: `zOut = z = knownAllocator(...);` -- a C
+      // chained assignment, which Joern parses as `zOut = (z = knownAllocator(...))`,
+      // a nested `<operator>.assignment` Call as `zOut`'s own RHS -- the SAME
+      // shape `cursorBaseAndOffset`'s own passthrough case exists for (the
+      // byte-cursor mechanism, a prior push), needed here for the WRITE-CAPABLE
+      // one instead. `z`'s OWN nested assignment is found independently by
+      // `ptrIrefAllocNames`'s whole-body scan (`m.body.ast.isCall` traverses
+      // nested calls, not just top-level statements), so `z` already has a
+      // resolved length expression by the time THIS case runs -- but Joern
+      // represents the WHOLE chain as one statement (`zOut`'s own; `z`'s
+      // assignment is embedded as its RHS, never a separate top-level statement
+      // in its own right), so nothing else ever calls `assignTo` for `z` alone.
+      // Emitting only `zOut`'s own assignment would leave `z` -- a real name,
+      // later read (`charFunc`'s own `zOut - z`) -- UNBOUND entirely in the
+      // translated program: C's chained assignment binds BOTH names to the
+      // identical value. Confirmed live: `charFunc`'s own `zOut = z =
+      // sqlite3_malloc64(...);`. `z` gets the fresh allocation; `zOut` becomes
+      // an ordinary bare copy of it -- two sequential statements, not two
+      // allocations.
+      case i: Identifier if aug.isEmpty && chainedAllocInnerName(rhs).isDefined =>
+        val innerNm = chainedAllocInnerName(rhs).get
+        val lenE = expr(ptrIrefAllocNames(innerNm))
+        seqOf(List(
+          ujson.Obj("k" -> "assign", "x" -> innerNm,
+                    "e" -> ujson.Obj("k" -> "irefIndex",
+                                     "a" -> ujson.Obj("k" -> "boxArray", "n" -> lenE),
+                                     "i" -> ujson.Obj("k" -> "int", "v" -> 0))),
+          ujson.Obj("k" -> "assign", "x" -> localName(i.name), "e" -> ujson.Obj("k" -> "name", "v" -> innerNm))
+        ))
+      // `010-reach-90pct-hole-free`: `t`'s own single defining assignment IS the
+      // `knownAllocator(...)` call `ptrIrefAllocNames` recognized -- translated as
+      // a fresh runtime-sized allocation immediately followed by an address-of-
+      // element-0, rather than the ordinary external-call translation (which
+      // would otherwise dynamically hole `t` outright the moment the program
+      // actually ran, since Core never executes an unresolved call -- see
+      // `ptrIrefAllocNames`'s own doc comment for why that reasoning does NOT
+      // excuse `t`'s own value here). `aug.isEmpty` for the same reason the
+      // cursor case just above requires it: a `+=`/`-=` on a freshly-allocated
+      // name is not a defining assignment at all and belongs to whatever
+      // ordinary case handles pointer `+=` elsewhere in this dispatch.
+      case i: Identifier if aug.isEmpty && ptrIrefAllocNames.contains(localName(i.name)) =>
+        val nm = localName(i.name)
+        val lenE = expr(ptrIrefAllocNames(nm))
+        ujson.Obj("k" -> "assign", "x" -> nm,
+                  "e" -> ujson.Obj("k" -> "irefIndex",
+                                   "a" -> ujson.Obj("k" -> "boxArray", "n" -> lenE),
+                                   "i" -> ujson.Obj("k" -> "int", "v" -> 0)))
       case i: Identifier =>
         // At module scope, for a name a `global` statement rebound, or (C-like
         // files) a name that's a recognized file-scope global and not a local/
@@ -6588,14 +6756,39 @@ import scala.annotation.tailrec
       // has no case for a `.iref` receiver either, so this was the identical
       // silent-wrong-at-runtime gap as the read side, just for a write. Checked
       // BEFORE the boxed-array case just below (never the same name).
+      //
+      // `010-reach-90pct-hole-free`: hardened after a real, live-caught
+      // regression (`unistrFunc`'s own `zOut[j++] = c;`, newly reached once
+      // `ptrIrefAllocNames` widened how many names populate `ptrIrefNames`) --
+      // the original version read the index via plain `expr(b)`, with no prelude
+      // threading at all, so an IMPURE index (`j++`) got embedded inline as a
+      // VALUE-producing sub-expression, a shape this file's own post/pre-
+      // increment translation only supports at STATEMENT position -- surfacing
+      // as a brand-new `op:postIncrement:value` hole exactly where `j++` sat,
+      // regressing a case that used to work (before `zOut` was `ptrIrefNames`-
+      // tracked at all, it fell through to the generic `asIndex` case below,
+      // which already threads `exprV`/`indexPrelude` correctly). For a PLAIN
+      // assignment, safe to thread the identical `exprV`/`indexPrelude`
+      // machinery that generic case already uses (`p` itself is a bare name,
+      // always pure; only `b` can be impure, and it is read exactly once either
+      // way). For an AUGMENTED one (`p[j++] += v`), `combine` reads `p` a SECOND
+      // time (once for the read side, once for the write) -- re-evaluating an
+      // impure `b` a second time -- so this matches this file's own established
+      // `assign:aug-impure-target` discipline (the generic `asIndex` case's
+      // sibling above) rather than silently double-evaluating it.
       case ia if asIndex(ia).isDefined &&
                  rawLocalOrParamName(asIndex(ia).get._1).map(localName).exists(ptrIrefNames.contains) =>
         val (a, b) = asIndex(ia).get
         val nm = rawLocalOrParamName(a).map(localName).get
-        val p = ujson.Obj("k" -> "binop", "op" -> "+",
-                          "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> expr(b))
-        ujson.Obj("k" -> "setDerefIref", "p" -> p,
-                  "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> p)))
+        if (aug.isDefined && !pureNode(b)) holeS("assign:aug-impure-target")
+        else {
+          val (pb, be) = exprV(b)
+          indexPrelude = pb
+          val p = ujson.Obj("k" -> "binop", "op" -> "+",
+                            "a" -> ujson.Obj("k" -> "name", "v" -> nm), "b" -> be)
+          ujson.Obj("k" -> "setDerefIref", "p" -> p,
+                    "v" -> combine(ujson.Obj("k" -> "derefIref", "p" -> p)))
+        }
       // `006-reduce-remaining-holes`, Story 5: `a[i] = v`, `a` a recognized boxed
       // array -- write side of `callExpr`'s matching `indexOps` read case.
       // Checked BEFORE the generic `asIndex` case just below.
@@ -8251,6 +8444,71 @@ import scala.annotation.tailrec
           nm -> td.member.l.flatMap(mm => arraySizeOf(mm.typeFullName, m.filename).map(mm.name -> _)).toMap
         }
         .filter { case (_, arrMembers) => arrMembers.nonEmpty }
+    // `010-reach-90pct-hole-free`: `t = knownAllocator(len);` -- see
+    // `ptrIrefAllocNames`'s own doc comment for the full reasoning. Requires
+    // EXACTLY one bare assignment to `t` anywhere in the method, the same
+    // single-assignment discipline `ptrIrefNames`'s own cases just below use
+    // (and for the identical reason: a name reassigned in mutually exclusive
+    // branches to two DIFFERENT allocator calls could legitimately hold either
+    // buffer, which this file's own established precedent -- `sqlite3PagerOpen`'s
+    // `zPathname`, `strCursorParams`'s own local computation -- already treats as
+    // disqualifying rather than guessed past).
+    //
+    // `010-reach-90pct-hole-free`: EXCLUDES a name ever used as the RECEIVER of a
+    // field access (`t->f`/`t.f`) anywhere in the method -- live-caught regression,
+    // this push: SQLite's OWN allocator functions (`sqlite3DbMallocZero`,
+    // `sqlite3_malloc64`, ...) are used for BOTH shapes this table cannot tell
+    // apart from the call site alone -- a byte buffer walked with a pointer
+    // (`sqlite3VdbeMemTranslate`'s own `zOut`, this push's real target) AND a
+    // brand-new STRUCT (`sqlite3SelectNew`'s own `pNew = sqlite3DbMallocZero(db,
+    // sizeof(*pNew)); pNew->pLeft = ...;` -- confirmed live, several `*New`/`*Dup`
+    // constructors follow exactly this idiom). Treating the second shape as a
+    // byte-array (`Val.iref _ (.idx 0)`) is a genuine semantic mismatch with its
+    // OWN later `pNew->field` accesses, which need `.fld` selectors, not `.idx`
+    // ones -- regressed `op:sizeOf:object`/`op:addressOf:field:pointer` on exactly
+    // these functions before this guard existed. A name used BOTH ways (unseen so
+    // far) would be excluded too, correctly: this mechanism only ever targets the
+    // pure byte-array-walk idiom, never struct allocation, which the EXISTING
+    // `boxedStructs`/`structCandidateDecls` machinery already owns.
+    //
+    // `010-reach-90pct-hole-free`: ALSO requires `t`'s own DECLARED type to be a
+    // byte/char pointer shape (`isCStringType`) -- a SECOND, live-caught
+    // regression after the field-access guard above: `sqlite3SelectNew`'s own
+    // `pSrc = sqlite3DbMallocZero(pParse->db, SZ_SRCLIST_1);` allocates an EMPTY
+    // `SrcList` struct (a real "zero tables" sentinel, sized by a macro summing
+    // several `sizeof`s) that is NEVER field-accessed in THIS function at all --
+    // it is immediately handed off whole (`pNew->pSrc = pSrc;`) for some OTHER
+    // function to eventually field-access. The within-this-function field-access
+    // guard cannot see that far, and treating `pSrc` as a byte array anyway would
+    // not just mis-count a hole here -- it would hand a LATER field read on
+    // `pNew->pSrc` a `Val.iref` backed by an integer-indexed `Obj`, which
+    // `Sel.fld` lookups silently miss to `.unit`, a genuine SILENT-WRONG-ANSWER
+    // risk, not merely an honest hole, if that later access ever happened to
+    // resolve enough to run. The type check closes this categorically rather
+    // than chasing more escape shapes one at a time: every real target for this
+    // mechanism (`sqlite3VdbeMemTranslate`'s `zOut`/`z`, `charFunc`'s `zOut`, the
+    // whole `malloc`-a-buffer-walk-it-with-a-pointer idiom this push exists for)
+    // is declared `char*`/`u8*`/`unsigned char*`, never a named struct pointer --
+    // SQLite's own convention already draws exactly the line this mechanism
+    // needs, more reliably than any local usage heuristic could.
+    ptrIrefAllocNames = if (moduleScope) Map.empty else {
+      val fieldAccessReceivers = m.body.ast.isCall.filter(c => fieldOps.contains(c.methodFullName)).l
+        .flatMap(c => kidsOf(c).headOption.flatMap(rawLocalOrParamName)).map(localName).toSet
+      val assigns = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+      val assignCounts = assigns.flatMap { a =>
+        kidsOf(a) match { case (t: Identifier) :: _ :: Nil => Some(t.name); case _ => None }
+      }.groupBy(identity).view.mapValues(_.size).toMap
+      assigns.flatMap { a =>
+        kidsOf(a) match {
+          case List(t: Identifier, call: Call)
+              if assignCounts.getOrElse(t.name, 0) == 1 && knownAllocators.contains(call.methodFullName) &&
+                 !fieldAccessReceivers.contains(localName(t.name)) &&
+                 localTypes.get(t.name).exists(isCStringType) =>
+            kidsOf(call).lift(knownAllocators(call.methodFullName)).map(lenArg => localName(t.name) -> lenArg)
+          case _ => None
+        }
+      }.toMap
+    }
     // `006-reduce-remaining-holes`, Story 5: plain pointer locals PROVABLY, for
     // their whole lifetime, holding an interior pointer VALUE -- `p = &a[i]`,
     // `p = &s.f` (mirroring `ptrAliases`'s own whole-function single-assignment
@@ -8313,7 +8571,80 @@ import scala.annotation.tailrec
         .filter(p => (closedIrefOutParam(m, p.index) ||
                       closedIrefOutParamsTransitive.contains((m.fullName, p.index))) &&
                      !boxedLocals.contains(localName(p.name)))
-        .map(p => localName(p.name)).toSet
+        .map(p => localName(p.name)).toSet ++
+      // `010-reach-90pct-hole-free`: `t = knownAllocator(...);` -- a fresh,
+      // runtime-sized buffer (`ptrIrefAllocNames`'s own doc comment has the full
+      // reasoning; `assignTo`'s bare-identifier dispatch is what actually special-
+      // cases the DEFINING assignment itself, this only needs `t` to be a member
+      // so its LATER `*t`/`t[i]`/`t++`/`*t = v` sites resolve).
+      ptrIrefAllocNames.keySet
+    }
+    // `010-reach-90pct-hole-free`: `z = zOut;`, `zOut` ALREADY a member of
+    // `ptrIrefNames` (a bare copy of an interior-pointer VALUE, not a fresh
+    // derivation -- `z` ends up pointing at the exact same heap object, same
+    // position, as `zOut` at the moment of the copy). Bounded fixed point
+    // (matching this file's own "bounded rather than recursive" precedent
+    // elsewhere, `closedOutParamsTransitive`/`strCursorParams`'s own local
+    // computation) because `zOut` may ITSELF only become a member during THIS
+    // same round (`ptrIrefAllocNames`-seeded, or another bare copy one hop
+    // earlier) -- confirmed live necessary in `sqlite3VdbeMemTranslate`: `z =
+    // zOut;` where `zOut = sqlite3DbMallocRaw(pMem->db, len);` are two SEPARATE
+    // statements, `zOut` only joining `ptrIrefNames` via `ptrIrefAllocNames`
+    // computed in the SAME pass just above -- a single, non-iterated pass over
+    // `m.local.l` in NAME order could miss this if `z`'s own assignment happened
+    // to be visited before establishing `zOut`'s membership; the round bound
+    // removes any dependence on iteration order. `z`'s own defining assignment
+    // needs NO special translation at all (unlike `ptrIrefAllocNames`'s own
+    // names) -- a bare read of `zOut` already evaluates to its current
+    // `Val.iref` value, and the ordinary `case i: Identifier => ...` assignment
+    // fallback copies whatever value an expression evaluates to, verbatim. */
+    if (!moduleScope) {
+      // `010-reach-90pct-hole-free`: hardened after a real, live-caught regression
+      // (`unistrFunc`/`jsonReturnFromBlob`/`createTableStmt`/`sqlite3Pragma`, this
+      // push) -- the first version built `bareCopies` via a plain `.toMap` over
+      // EVERY `t = src` assignment in the method, which SILENTLY KEEPS ONLY THE
+      // LAST entry for a name assigned more than once (`x = someInt;` in one
+      // branch, `x = y;` in another -- ordinary Scala `Map` construction, no
+      // "exactly one" check at all), exactly the `.find`-not-`.count` mistake
+      // `strCursorParams`'s own local computation was hardened against earlier
+      // this session for the identical reason (`sqlite3PagerOpen`'s `zPathname`).
+      // If THAT surviving entry happened to be the bare-copy one and its source
+      // was in `ptrIrefNames`, `x` was wrongly admitted even though its OTHER,
+      // discarded assignment could bind it to an ordinary integer -- confirmed
+      // live as the cause of new `op:postIncrement:value`/`op:preIncrement:value`
+      // holes on names that were never pointers at all. Fixed by requiring
+      // EXACTLY one bare-identifier-to-bare-identifier assignment to `t.name`
+      // anywhere in the method, counted explicitly rather than assumed from
+      // `Map` construction.
+      // `010-reach-90pct-hole-free`: ALSO recognizes `t = (inner = expr);` -- a C
+      // chained assignment -- as `t` copying whatever name `inner`'s OWN
+      // assignment binds, not just a bare `t = src;`. Live-caught gap: `zOut`'s
+      // OWN translation (`assignTo`'s matching chained-allocation case) correctly
+      // seeds `z` and copies it into `zOut`, but without this, `zOut` itself
+      // never actually JOINS `ptrIrefNames`'s membership SET at all -- there is
+      // no separate `zOut = z` node anywhere in the CPG for the plain-bare-copy
+      // pattern above to match (Joern nests `z = ...` inside `zOut = (...)` as
+      // ONE statement, not two) -- so every LATER use of `zOut` (`charFunc`'s own
+      // `*zOut++ = ...`) kept falling through to the generic hole regardless.
+      val allBareIdentAssigns = m.body.ast.isCall.filter(_.methodFullName == "<operator>.assignment").l
+        .flatMap(a => kidsOf(a) match {
+          case List(t: Identifier, src: Identifier) => Some(localName(t.name) -> localName(src.name))
+          case List(t: Identifier, inner: Call) if inner.methodFullName == "<operator>.assignment" =>
+            kidsOf(inner) match {
+              case List(innerLhs: Identifier, _) => Some(localName(t.name) -> localName(innerLhs.name))
+              case _ => None
+            }
+          case _ => None
+        })
+      val bareCopyCounts = allBareIdentAssigns.groupBy(_._1).view.mapValues(_.size).toMap
+      val bareCopies: Map[String, String] =
+        allBareIdentAssigns.filter { case (nm, _) => bareCopyCounts.getOrElse(nm, 0) == 1 }.toMap
+      for (_ <- 1 to 4) {
+        val newlyQualified = bareCopies.collect {
+          case (nm, src) if !ptrIrefNames.contains(nm) && ptrIrefNames.contains(src) => nm
+        }.toSet
+        ptrIrefNames = ptrIrefNames ++ newlyQualified
+      }
     }
     // `009-reduce-remaining-holes-4`: `const char *` parameters eligible for
     // byte-cursor tracking -- see `strCursorParams`'s own doc comment. Restricted to
@@ -8615,6 +8946,7 @@ import scala.annotation.tailrec
     boxedStructs = Map.empty
     boxedStructArrayMembers = Map.empty
     ptrIrefNames = Set.empty
+    ptrIrefAllocNames = Map.empty
     strCursorParams = Set.empty
     strCursorBase = Map.empty
     // `self` is stripped ONLY for a method of a class, where `applyFunc` binds the

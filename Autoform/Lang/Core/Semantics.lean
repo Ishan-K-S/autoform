@@ -1240,6 +1240,27 @@ def evalExpr (ctx : Ctx) : Nat → Heap → Env → Expr → Heap × EResult
           (h₂, .val (.ref r))
         | none => (h₁, .hole "boxFields:non-string-key")
       | (h₁, .inl res) => (h₁, res)
+  -- `010-reach-90pct-hole-free`: `Expr.boxArray` -- allocation of a fresh `Obj`
+  -- whose field count is a RUNTIME value. Evaluate the length expression ONCE (the
+  -- same single recursive `evalExpr` call `boxNew` above makes for its own one
+  -- sub-expression -- same fuel shape, same proof shape), then build the fields
+  -- list with a plain, non-fuel-consuming Lean function (`List.range`), never
+  -- touching `evalPairs`/per-element `Expr` evaluation at all: every field starts
+  -- `.unit`, so there is nothing to evaluate per element, only to COUNT. A negative
+  -- length is a hole, not a crash or a silently-empty allocation -- the exporter
+  -- never has a genuine reason to produce one (a `malloc`-shaped byte count is
+  -- never negative in well-defined C), so seeing one here means the length
+  -- expression itself was mistranslated, worth surfacing rather than masking.
+  | n+1, h, ρ, .boxArray e =>
+      match evalExpr ctx n h ρ e with
+      | (h₁, .val (.int len)) =>
+        if len < 0 then (h₁, .hole "boxArray:negative-length")
+        else
+          let fields := (List.range len.toNat).map (fun i => (toString i, Val.unit))
+          let (h₂, r) := h₁.alloc { cls := "<local>", fields := fields }
+          (h₂, .val (.ref r))
+      | (h₁, .val _) => (h₁, .hole "boxArray:non-int-length")
+      | (h₁, r) => (h₁, r)
   -- `006-reduce-remaining-holes`, Story 5: `&a[i]` once `a` is a boxed array --
   -- evaluate the receiver to `Val.ref r`, evaluate the index, produce
   -- `Val.iref r (.idx i)`. Anything else is a shape the exporter's own scope

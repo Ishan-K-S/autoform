@@ -127,6 +127,7 @@ def substE (σ : Impl) : Expr → Expr
   | .dstarred a    => .dstarred (substE σ a)
   | .boxNew a      => .boxNew (substE σ a)
   | .boxFields kvs => .boxFields (substEP σ kvs)
+  | .boxArray n    => .boxArray (substE σ n)
   | .irefIndex a i => .irefIndex (substE σ a) (substE σ i)
   | .irefField a f => .irefField (substE σ a) f
   | .derefIref a   => .derefIref (substE σ a)
@@ -216,6 +217,7 @@ theorem substE_nil : ∀ e : Expr, substE [] e = e
   | .inOp n a b    => by rw [substE, substE_nil a, substE_nil b]
   | .boxNew a      => by rw [substE, substE_nil a]
   | .boxFields kvs => by rw [substE, substEP_nil kvs]
+  | .boxArray n    => by rw [substE, substE_nil n]
   | .irefIndex a i => by rw [substE, substE_nil a, substE_nil i]
   | .irefField a f => by rw [substE, substE_nil a]
   | .derefIref a   => by rw [substE, substE_nil a]
