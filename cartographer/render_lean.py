@@ -144,9 +144,52 @@ def expr_shape(n):
     if k == "boxFields":
         pairs = [[{"k": "str", "v": key}, val] for key, val in f('fields')]
         return ".boxFields", [("ps", pairs)]
+    # `010-reach-90pct-hole-free` US1/US5: a plain, unit-filled numeric-range
+    # box (`export_ast.sc`'s own `boxRangeExpr` -- see its doc comment for the
+    # full argument and the live experiment that motivated this) -- rendered
+    # as a COMPUTED Lean list (`List.range n |>.map ...`) instead of unrolling
+    # `n` literal pairs the way `"boxFields"` above does. Evaluates to exactly
+    # the same `List (Expr × Expr)` value a literal `[("0", .unit), ("1",
+    # .unit), ...]` of length `n` would, so `Expr.boxFields`'s own semantics
+    # (`evalPairs`) are completely unaffected -- only the SOURCE TEXT spelling
+    # the argument differs, and it differs at CONSTANT size regardless of `n`,
+    # avoiding the elaboration-recursion-depth wall a literal list of this
+    # shape hits at real buffer sizes (confirmed: `ArrayRepExperiment.lean`).
+    if k == "boxFieldsRange":
+        n = f('n')
+        if not isinstance(n, int) or n < 0:
+            raise ValueError(f"boxFieldsRange node has invalid n: {n!r}")
+        atom = (f"((List.range {n}).map (fun i => "
+                f"(Expr.lit (Lit.str s!\"{{i}}\"), Expr.lit Lit.unit)))")
+        return ".boxFields", [("atom", atom)]
+    # `010-reach-90pct-hole-free`: `boxFieldsRange` above needs `n` known at EXPORT
+    # time (it bakes the literal into the generated source text) -- no help for a
+    # `malloc(len)`-shaped C allocation, whose size the exporter can never know
+    # until the program runs. `Expr.boxArray` (`Syntax.lean`) takes a LENGTH
+    # EXPRESSION instead of a literal count, evaluated once at runtime; this is
+    # the ordinary `("e", ...)` single-sub-expression shape every other
+    # one-argument constructor here already uses (`boxNew`, `derefIref`, ...), not
+    # a new rendering pattern.
+    if k == "boxArray": return ".boxArray", [("e", f('n'))]
     if k == "irefIndex": return ".irefIndex", [("e", f('a')), ("e", f('i'))]
     if k == "irefField": return ".irefField", [("e", f('a')), ("atom", lean_str(f('f')))]
     if k == "derefIref": return ".derefIref", [("e", f('p'))]
+    # `009-reduce-remaining-holes-4`: `*p`/`p[i]` on a `char*` byte-cursor -- read
+    # the byte at offset `b` of the base string `a`. See `Syntax.lean`'s own
+    # `Expr.strByte` doc comment for why this is a separate constructor from
+    # `.index` rather than a new case on it.
+    if k == "strByte": return ".strByte", [("e", f('a')), ("e", f('b'))]
+    # `009-reduce-remaining-holes-4`: the substring of `a` from offset `b`
+    # onward -- a byte cursor (`strByte`, above) handed WHOLE to another
+    # function partway through being walked. See `Syntax.lean`'s own
+    # `Expr.strFrom` doc comment. Missed on the first pass (found live: a real
+    # Colab run of the full, unbounded corpus hit `unknown expr node kind
+    # 'strFrom'` on `jim_strstr`, autosetup/jimsh0.c, the first real-corpus
+    # function to actually reach this shape) -- `strByte` alone was added here
+    # and verified via local fixtures, but `strFrom` was verified only via
+    # `lake env lean` fixtures and the exporter's own JSON output, never
+    # actually run through this renderer until a real corpus function used it.
+    if k == "strFrom": return ".strFrom", [("e", f('a')), ("e", f('b'))]
     # --- objects, containers, control ---
     if k == "field":  return ".field", [("e", f('a')), ("atom", lean_str(f('f')))]
     if k == "mcall":  return ".mcall", [("e", f('recv')), ("atom", lean_str(f('m'))), ("es", f('args'))]
@@ -188,6 +231,11 @@ def stmt_shape(n):
     if k == "seq":      return ".seq", [("s", f('a')), ("s", f('b'))]
     if k == "ifte":     return ".ifte", [("e", f('c')), ("s", f('t')), ("s", f('e'))]
     if k == "loop":     return ".loop", [("e", f('c')), ("s", f('body'))]
+    # `007-reduce-remaining-holes-2` US4: absorbs a `break` from `body` without also
+    # absorbing a `continue` (unlike `.loop`, which catches both) -- `switch` lowers to
+    # this wrapping its `ifte`-chain dispatch, so `break` inside a case ends only the
+    # switch, never an enclosing loop.
+    if k == "breakBlock": return ".breakBlock", [("s", f('body'))]
     # --- objects, iteration, exceptions ---
     if k == "setField": return ".setField", [("e", f('r')), ("atom", lean_str(f('f'))), ("e", f('v'))]
     if k == "setIndex": return ".setIndex", [("e", f('r')), ("e", f('i')), ("e", f('v'))]

@@ -429,6 +429,32 @@ inductive Expr where
   rather than a second, parallel list-evaluator needing its own proof. Any key that does
   not evaluate to a `Val.str` is a hole, never reached by anything the exporter emits. -/
   | boxFields : List (Expr × Expr) → Expr
+  /-- `010-reach-90pct-hole-free`: allocation of a fresh `Obj` whose FIELD COUNT is a
+  RUNTIME value, not a list of `(key, value)` pairs the exporter writes out one at a
+  time. `Expr.boxFields`' own list is a SYNTACTIC term embedded in the generated Lean
+  source -- its length is fixed at EXPORT time, which is exactly why a large
+  compile-time-sized array (SQLite's own I/O buffers run 512-8,192 elements) blows
+  the elaborator's recursion depth or exhausts memory (`research.md` §3, spec 010's
+  own Day-1 finding): the SOURCE FILE itself contains one nested list cell per
+  element.
+
+  `Expr.boxArray` sidesteps this by construction: it takes a single length
+  EXPRESSION, evaluates it ONCE at runtime to a `Val.int`, and the resulting `Obj`'s
+  fields (`"0" ↦ .unit, "1" ↦ .unit, ..., "n-1" ↦ .unit`, `List.range` under the
+  hood) are built by an ordinary, already-compiled Lean function operating on
+  whatever `Nat` the interpreter computes THEN -- no per-element syntax, so no
+  elaboration-time cost that scales with the array's size at all, compile-time-known
+  or not. This is what makes it usable for `malloc(len)`-shaped C allocations, whose
+  size the exporter can never know until the program runs: `zOut = malloc(n);` seeds
+  `zOut` as `Val.ref` to a fresh `n`-field `Obj`, `Val.iref` (`Sel.idx`, already
+  generic over the position) then walks and reads/writes it exactly like any other
+  boxed array -- `irefIndex`/`derefIref`/`setDerefIref`/pointer arithmetic on
+  `Val.iref` need no change at all, only a new way to OBTAIN a valid ref to something
+  shaped like one. Every field starts `.unit`, matching every other uninitialized
+  boxed local/array's own convention -- sound because the only real corpus idiom this
+  targets (`malloc` a buffer, walk it with a pointer, write every byte before ever
+  reading one back) never observes a field's `.unit` starting value at all. -/
+  | boxArray : Expr → Expr
   /-- `006-reduce-remaining-holes`, Story 5: `&a[i]` once `a` is a boxed array --
   evaluates the receiver to `Val.ref r`, evaluates the index, and produces
   `Val.iref r (.idx i)`. Takes a full sub-`Expr` for the index (not a literal), since
@@ -445,6 +471,43 @@ inductive Expr where
   unconditionally, to the unchanged `Heap.getField h r sel.key` -- no `Heap`-level
   change at all. -/
   | derefIref : Expr → Expr
+  /-- `009-reduce-remaining-holes-4`: read the byte at position `b` of the string `a`,
+  as an integer -- C's `*p`/`p[i]` on a `char*` walked as a byte cursor, which is
+  fundamentally NOT `Expr.index`'s existing meaning. `Expr.index` on a `.str` receiver
+  has no case in `evalExpr` at all today (confirmed by reading it directly): Python's
+  own `s[i]` returns a length-1 `Val.str` (matching CPython), but C's `*p` needs an
+  INTEGER byte value comparable via arithmetic (`*z == '"'`, `*z - '0'`) -- the two
+  languages want different return types from the identical `a[b]` syntax, so one
+  semantics cannot honestly serve both. Giving `Expr.index` a `.str` case that returns
+  an integer would silently mistranslate the (currently unsupported, so not yet relied
+  on by anything) Python shape; a separate constructor, emitted ONLY by the C-family
+  exporter path, keeps that choice explicit rather than baked into a single shared
+  node's semantics.
+
+  `Val.beq`/`applyBinop`/every existing `Val` match are untouched: the OPERAND and
+  RESULT are ordinary `Val.str`/`Val.int` values already known throughout Core, this
+  only adds one more way to produce an `Int` from a `Val.str`'s own content. Reads at
+  the string's own length (one past its last real character) yield `0`, matching C's
+  own implicit null terminator that a `Val.str` does not literally store; any other
+  out-of-range index is a hole, not a guessed value, since indexing past a C string's
+  terminator is undefined behaviour with no single well-defined answer to encode.
+  Indexes by Lean `String` codepoint, not raw UTF-8 byte -- identical for the ASCII
+  content this project's own string literals are built from, and stated here rather
+  than silently assumed. -/
+  | strByte : Expr → Expr → Expr
+  /-- `009-reduce-remaining-holes-4`: the substring of `a` starting at position `b`,
+  through its end -- Python's own `s[i:]`, and the value a C byte-cursor `char *z`
+  (`Expr.strByte`, just above) has to produce when it is passed WHOLE to another
+  function partway through being walked (`parseHhMmSs(zDate, p)` after `zDate` has
+  already advanced past the date portion -- SQLite's own dominant real shape for a
+  walked cursor, confirmed live: the great majority of `const char *` cursor
+  parameters are passed onward to a sub-parser at least once). Clamped like Lean's
+  own `List.drop`: a negative start is a hole (the exporter never has a genuine
+  reason to produce one -- a cursor only ever advances forward), but a start past
+  the string's own length is simply the empty string, exactly as `"abc"[10:]` is
+  `""` in Python and `s.drop 999` is `[]` in Lean -- no undefined behaviour to
+  guard against on that side, unlike `strByte`'s own out-of-range READ. -/
+  | strFrom : Expr → Expr → Expr
   deriving Repr, Inhabited
 
 /-- Statements. -/
@@ -464,6 +527,16 @@ inductive Stmt where
   | seq      : Stmt → Stmt → Stmt
   | ifte     : Expr → Stmt → Stmt → Stmt
   | loop     : Expr → Stmt → Stmt
+  /-- `007-reduce-remaining-holes-2` US4: absorbs a `break` from its inner statement
+  without absorbing a `continue` -- the one thing `Stmt.loop`/`Stmt.forIn` do NOT
+  provide on their own, since both of those catch `.cont` too (re-entering the loop),
+  which is correct for a loop but wrong for a `switch`: a `continue` written directly
+  in a `switch` case body (no loop of its own between it and an enclosing loop) must
+  keep propagating past the switch to that enclosing loop, unchanged. `switch` lowers
+  to a `Stmt.ifte` dispatch chain wrapped in this constructor, so a `break` inside a
+  case body ends only the switch's own dispatch, never an enclosing loop. See
+  `execStmt`'s case for the exact semantics. -/
+  | breakBlock : Stmt → Stmt
   /-- `for x in e: body` -/
   | forIn    : String → Expr → Stmt → Stmt
   | ret      : Expr → Stmt
@@ -565,6 +638,7 @@ def holes : Expr → List String
   | .dstarred a   => holes a
   | .boxNew a     => holes a
   | .boxFields kvs => holesP kvs
+  | .boxArray n    => holes n
   | .irefIndex a i => holes a ++ holes i
   | .irefField a _ => holes a
   | .derefIref a   => holes a
@@ -602,6 +676,7 @@ def size : Expr → Nat
   | .dstarred a   => 1 + size a
   | .boxNew a     => 1 + size a
   | .boxFields kvs => 1 + sizeP kvs
+  | .boxArray n    => 1 + size n
   | .irefIndex a i => 1 + size a + size i
   | .irefField a _ => 1 + size a
   | .derefIref a   => 1 + size a
@@ -633,6 +708,7 @@ def holes : Stmt → List String
   | .seq a b         => a.holes ++ b.holes
   | .ifte c a b      => c.holes ++ a.holes ++ b.holes
   | .loop c a        => c.holes ++ a.holes
+  | .breakBlock a    => a.holes
   | .forIn _ e b     => e.holes ++ b.holes
   | .ret e           => e.holes
   | .tryCatch b _ h  => b.holes ++ h.holes
@@ -651,6 +727,7 @@ def size : Stmt → Nat
   | .seq a b         => a.size + b.size
   | .ifte c a b      => 1 + c.size + a.size + b.size
   | .loop c a        => 1 + c.size + a.size
+  | .breakBlock a    => 1 + a.size
   | .forIn _ e b     => 1 + e.size + b.size
   | .ret e           => 1 + e.size
   | .tryCatch b _ h  => 1 + b.size + h.size

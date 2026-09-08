@@ -964,6 +964,44 @@ def evalExpr (ctx : Ctx) : Nat → Heap → Env → Expr → Heap × EResult
           | _, _ => (h₂, .hole "index:unsupported")
         | (h₂, r) => (h₂, r)
       | (h₁, r) => (h₁, r)
+  -- `009-reduce-remaining-holes-4`: `Expr.strByte a b` -- read the byte at position
+  -- `b` of string `a`, as an `Int`. See `Syntax.lean`'s own doc comment for why this
+  -- is a separate constructor from `.index` rather than a new case on it. `a`'s own
+  -- length is a valid index (C's own implicit null terminator, `0`); anything past it
+  -- is undefined behaviour in C with no single correct answer, so it is a hole rather
+  -- than a guess. A negative index is guarded explicitly: `Int.toNat` silently clamps
+  -- a negative `Int` to `0`, which would otherwise alias `strByte s (-1)` to the FIRST
+  -- character rather than reporting the honest problem.
+  | n+1, h, ρ, .strByte a b =>
+      match evalExpr ctx n h ρ a with
+      | (h₁, .val (.str s)) =>
+        match evalExpr ctx n h₁ ρ b with
+        | (h₂, .val (.int i)) =>
+            let cs := s.toList
+            if i < 0 then (h₂, .hole "strByte:negative-index")
+            else if hh : i.toNat < cs.length then (h₂, .val (.int (Int.ofNat (cs[i.toNat]).toNat)))
+            else if i.toNat == cs.length then (h₂, .val (.int 0))
+            else (h₂, .hole "strByte:out-of-bounds")
+        | (h₂, .val _) => (h₂, .hole "strByte:non-integer-index")
+        | (h₂, r) => (h₂, r)
+      | (h₁, .val _) => (h₁, .hole "strByte:non-string-receiver")
+      | (h₁, r) => (h₁, r)
+  -- `009-reduce-remaining-holes-4`: `Expr.strFrom a b` -- the substring of string `a`
+  -- from position `b` onward. See `Syntax.lean`'s own doc comment: clamped like
+  -- `List.drop` for a start past the string's own length (the empty string, not a
+  -- hole), but a negative start is a hole -- the exporter never has a genuine reason
+  -- to produce one.
+  | n+1, h, ρ, .strFrom a b =>
+      match evalExpr ctx n h ρ a with
+      | (h₁, .val (.str s)) =>
+        match evalExpr ctx n h₁ ρ b with
+        | (h₂, .val (.int i)) =>
+            if i < 0 then (h₂, .hole "strFrom:negative-index")
+            else (h₂, .val (.str (String.ofList (s.toList.drop i.toNat))))
+        | (h₂, .val _) => (h₂, .hole "strFrom:non-integer-index")
+        | (h₂, r) => (h₂, r)
+      | (h₁, .val _) => (h₁, .hole "strFrom:non-string-receiver")
+      | (h₁, r) => (h₁, r)
   | n+1, h, ρ, .field a f =>
       match evalExpr ctx n h ρ a with
       | (h₁, .val (.ref r)) =>
@@ -1202,6 +1240,27 @@ def evalExpr (ctx : Ctx) : Nat → Heap → Env → Expr → Heap × EResult
           (h₂, .val (.ref r))
         | none => (h₁, .hole "boxFields:non-string-key")
       | (h₁, .inl res) => (h₁, res)
+  -- `010-reach-90pct-hole-free`: `Expr.boxArray` -- allocation of a fresh `Obj`
+  -- whose field count is a RUNTIME value. Evaluate the length expression ONCE (the
+  -- same single recursive `evalExpr` call `boxNew` above makes for its own one
+  -- sub-expression -- same fuel shape, same proof shape), then build the fields
+  -- list with a plain, non-fuel-consuming Lean function (`List.range`), never
+  -- touching `evalPairs`/per-element `Expr` evaluation at all: every field starts
+  -- `.unit`, so there is nothing to evaluate per element, only to COUNT. A negative
+  -- length is a hole, not a crash or a silently-empty allocation -- the exporter
+  -- never has a genuine reason to produce one (a `malloc`-shaped byte count is
+  -- never negative in well-defined C), so seeing one here means the length
+  -- expression itself was mistranslated, worth surfacing rather than masking.
+  | n+1, h, ρ, .boxArray e =>
+      match evalExpr ctx n h ρ e with
+      | (h₁, .val (.int len)) =>
+        if len < 0 then (h₁, .hole "boxArray:negative-length")
+        else
+          let fields := (List.range len.toNat).map (fun i => (toString i, Val.unit))
+          let (h₂, r) := h₁.alloc { cls := "<local>", fields := fields }
+          (h₂, .val (.ref r))
+      | (h₁, .val _) => (h₁, .hole "boxArray:non-int-length")
+      | (h₁, r) => (h₁, r)
   -- `006-reduce-remaining-holes`, Story 5: `&a[i]` once `a` is a boxed array --
   -- evaluate the receiver to `Val.ref r`, evaluate the index, produce
   -- `Val.iref r (.idx i)`. Anything else is a shape the exporter's own scope
@@ -1494,6 +1553,15 @@ def execStmt (ctx : Ctx) : Nat → Heap → Env → Stmt → Heap × Ctl
       | (h₁, .exn v)     => (h₁, .exn v)
       | (h₁, .hole l)    => (h₁, .hole l)
       | (h₁, .outOfFuel) => (h₁, .outOfFuel)
+  -- `007-reduce-remaining-holes-2` US4: catches a `.brk` from its inner statement and
+  -- converts it to `.normal`, exactly once (no re-execution, unlike `.loop`) --
+  -- deliberately does NOT catch `.cont`, so a `continue` written directly in a
+  -- `switch` case body keeps propagating to whatever REAL loop encloses the switch,
+  -- unchanged. This is the one thing `.loop`/`.forIn` do not provide on their own.
+  | n+1, h, ρ, .breakBlock body =>
+      match execStmt ctx n h ρ body with
+      | (h₁, .brk ρ') => (h₁, .normal ρ')
+      | (h₁, r)       => (h₁, r)
   | n+1, h, ρ, .forIn x e body =>
       match evalExpr ctx n h ρ e with
       | (h₁, .val v) =>

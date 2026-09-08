@@ -51,6 +51,7 @@ def tfFreeS : Stmt → Bool
   | .seq a b         => tfFreeS a && tfFreeS b
   | .ifte _ t e      => tfFreeS t && tfFreeS e
   | .loop _ b        => tfFreeS b
+  | .breakBlock b    => tfFreeS b
   | .forIn _ _ b     => tfFreeS b
   | .tryCatch b _ hd => tfFreeS b && tfFreeS hd
   | _                => true
@@ -154,6 +155,17 @@ private theorem fuelStep : ∀ k, FuelStep k := by
                 cases r₁ <;> first
                   | (cases hy; exact absurd rfl hne)
                   | (rw [ihP _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
+        -- `010-reach-90pct-hole-free`: `Expr.boxArray` -- same shape as `boxNew`,
+        -- one recursive `evalExpr` call (for the length) with no further recursion;
+        -- `List.range`/`Heap.alloc` afterwards are fuel-free, exactly like
+        -- `Heap.alloc` after `boxNew`'s own single `evalExpr` call.
+        | boxArray a =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ <;> first
+              | (cases hy; exact absurd rfl hne)
+              | (rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
         -- `006-reduce-remaining-holes`, Story 5: `&a[i]` -- same shape as `index`,
         -- two sequential `evalExpr` calls with no further recursion afterwards.
         | irefIndex a i =>
@@ -195,6 +207,49 @@ private theorem fuelStep : ∀ k, FuelStep k := by
             cases r₁ <;> first
               | (cases hy; exact absurd rfl hne)
               | (rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy)
+        -- `009-reduce-remaining-holes-4`: `strByte a b` -- same shape as `irefIndex`:
+        -- discriminates on `a`'s own VALUE (only `.str` recurses into evaluating `b`)
+        -- before any further recursion, and the eventual byte-lookup is fuel-free.
+        | strByte a b =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ with
+            | exn v => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | hole l => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | outOfFuel => cases hy; exact absurd rfl hne
+            | val x =>
+                rw [ihE _ hctx _ _ _ _ _ hA (by simp)]
+                cases x
+                case str s =>
+                    dsimp only at hy ⊢
+                    rcases hB : evalExpr ctx k h₁ ρ b with ⟨h₂, r₂⟩
+                    rw [hB] at hy
+                    cases r₂ <;> first
+                      | (cases hy; exact absurd rfl hne)
+                      | (rw [ihE _ hctx _ _ _ _ _ hB (by simp)]; exact hy)
+                all_goals (dsimp only at hy ⊢; exact hy)
+        -- `009-reduce-remaining-holes-4`: `strFrom a b` -- identical shape to
+        -- `strByte` just above (same discrimination, same fuel-free tail).
+        | strFrom a b =>
+            simp only [evalExpr] at hy ⊢
+            rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
+            rw [hA] at hy
+            cases r₁ with
+            | exn v => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | hole l => rw [ihE _ hctx _ _ _ _ _ hA (by simp)]; exact hy
+            | outOfFuel => cases hy; exact absurd rfl hne
+            | val x =>
+                rw [ihE _ hctx _ _ _ _ _ hA (by simp)]
+                cases x
+                case str s =>
+                    dsimp only at hy ⊢
+                    rcases hB : evalExpr ctx k h₁ ρ b with ⟨h₂, r₂⟩
+                    rw [hB] at hy
+                    cases r₂ <;> first
+                      | (cases hy; exact absurd rfl hne)
+                      | (rw [ihE _ hctx _ _ _ _ _ hB (by simp)]; exact hy)
+                all_goals (dsimp only at hy ⊢; exact hy)
         | binop op a b =>
             simp only [evalExpr] at hy ⊢
             rcases hA : evalExpr ctx k h ρ a with ⟨h₁, r₁⟩
@@ -854,6 +909,14 @@ private theorem fuelStep : ∀ k, FuelStep k := by
                  first
                    | exact hy
                    | exact ihS _ hctx _ _ _ hfree.2 _ _ hy hne)
+        | breakBlock a =>
+            have hb : tfFreeS a = true := by simpa [tfFreeS] using hfree
+            simp only [execStmt] at hy ⊢
+            rcases hA : execStmt ctx k h ρ a with ⟨h₁, c₁⟩
+            rw [hA] at hy
+            cases c₁ <;> first
+              | (cases hy; exact absurd rfl hne)
+              | (rw [ihS _ hctx _ _ _ hb _ _ hA (by simp)]; exact hy)
         | tryCatch a x hd =>
             simp only [tfFreeS, Bool.and_eq_true] at hfree
             simp only [execStmt] at hy ⊢
