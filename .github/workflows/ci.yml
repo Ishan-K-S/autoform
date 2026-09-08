@@ -51,6 +51,24 @@ jobs:
           # silently passing -- but we would rather know here.
           lake env leanchecker --help >/dev/null 2>&1 || which leanchecker
 
+      # `Autoform/Generated/V8Base.lean` is a gitignored build product (the
+      # "track the AST, not the render" policy, commit dbb8181 / docs/integrity.md)
+      # -- but `Autoform.lean` has imported `Autoform.SpecsGen.V8Base` (which needs
+      # it) since commit e36b8f1, once splitting it into 73 parts made it actually
+      # elaborate. Nothing regenerated it in CI after that, so every run since has
+      # failed at `lake build` with "no such file or directory" on this exact file
+      # before a single module builds -- it only ever worked from a checkout that
+      # happened to have this file left over locally from a prior manual render.
+      # `render_lean.py` is a deterministic function of the tracked `ast-V8Base.json`
+      # (verified byte-identical across runs), so regenerating it here is the same
+      # artifact policy already relied on elsewhere, not a new trust assumption.
+      # Runs before the cache step so the source hash below actually reflects it.
+      - name: Regenerate Autoform/Generated/V8Base.lean from the tracked AST
+        run: |
+          set -euo pipefail
+          python3 cartographer/render_lean.py ast-V8Base.json Autoform/Generated/V8Base.lean V8Base
+          test -s Autoform/Generated/V8Base.lean
+
       - name: Cache .lake
         uses: actions/cache@v4
         with:
