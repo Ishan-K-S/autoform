@@ -1,0 +1,292 @@
+{
+  "call-closed": 2134,
+  "nodes": 1513464,
+  "module": "Sqlite",
+  "holesByLabel": [
+    {
+      "label": "cstr:address-compare",
+      "count": 1415
+    },
+    {
+      "label": "cstr:pointer-arith",
+      "count": 1338
+    },
+    {
+      "label": "assign:lhs:indirection",
+      "count": 1150
+    },
+    {
+      "label": "op:addressOf:element:scalar",
+      "count": 1121
+    },
+    {
+      "label": "op:cast:pointer:int-to-pointer",
+      "count": 952
+    },
+    {
+      "label": "op:indirection:pointer",
+      "count": 947
+    },
+    {
+      "label": "op:cast:opaque-type",
+      "count": 720
+    },
+    {
+      "label": "control:GOTO",
+      "count": 503
+    },
+    {
+      "label": "op:postIncrement:pointer",
+      "count": 492
+    },
+    {
+      "label": "stmt:UNKNOWN:CASTProblemDeclaration",
+      "count": 463
+    },
+    {
+      "label": "expr:BLOCK-impure",
+      "count": 462
+    },
+    {
+      "label": "op:sizeOf:object",
+      "count": 414
+    },
+    {
+      "label": "op:assignment",
+      "count": 402
+    },
+    {
+      "label": "op:shiftRight:unknown-signedness",
+      "count": 397
+    },
+    {
+      "label": "expr:BLOCK-prelude",
+      "count": 339
+    },
+    {
+      "label": "op:cast:scalar",
+      "count": 282
+    },
+    {
+      "label": "assign:aug-impure-target",
+      "count": 261
+    },
+    {
+      "label": "op:addressOf:field:unknown-type",
+      "count": 258
+    },
+    {
+      "label": "op:addressOf:element:unknown-type",
+      "count": 248
+    },
+    {
+      "label": "op:alloc:array-decl",
+      "count": 245
+    },
+    {
+      "label": "stmt:empty-ast-children",
+      "count": 226
+    },
+    {
+      "label": "op:arrayDecl:size",
+      "count": 209
+    },
+    {
+      "label": "op:indirection:unknown-type",
+      "count": 179
+    },
+    {
+      "label": "cstr:address-equality",
+      "count": 162
+    },
+    {
+      "label": "op:sizeOf:opaque-type",
+      "count": 135
+    },
+    {
+      "label": "op:addressOf:field:pointer",
+      "count": 87
+    },
+    {
+      "label": "op:indirection:scalar",
+      "count": 85
+    },
+    {
+      "label": "op:postIncrement:value",
+      "count": 81
+    },
+    {
+      "label": "op:addressOf:element:pointer",
+      "count": 77
+    },
+    {
+      "label": "op:pointerCall",
+      "count": 75
+    },
+    {
+      "label": "op:sizeOf:unknown-type",
+      "count": 68
+    },
+    {
+      "label": "op:plus",
+      "count": 56
+    },
+    {
+      "label": "op:postDecrement:value",
+      "count": 46
+    },
+    {
+      "label": "op:preIncrement:pointer",
+      "count": 39
+    },
+    {
+      "label": "control:FOR:elided-clause",
+      "count": 33
+    },
+    {
+      "label": "op:postIncrement:unsupported-target",
+      "count": 33
+    },
+    {
+      "label": "op:postDecrement:pointer",
+      "count": 30
+    },
+    {
+      "label": "op:sizeOf:pointer",
+      "count": 27
+    },
+    {
+      "label": "op:indirection:opaque-type",
+      "count": 24
+    },
+    {
+      "label": "op:indirection:object",
+      "count": 23
+    },
+    {
+      "label": "stmt:UNKNOWN:CASTFunctionDeclarator",
+      "count": 22
+    },
+    {
+      "label": "op:postIncrement:impure-target",
+      "count": 20
+    },
+    {
+      "label": "op:addressOf:element:opaque-type",
+      "count": 15
+    },
+    {
+      "label": "op:addressOf:field:scalar",
+      "count": 12
+    },
+    {
+      "label": "expr:CONTROL_STRUCTURE:IF",
+      "count": 12
+    },
+    {
+      "label": "op:arrayInitializer:zero-init",
+      "count": 9
+    },
+    {
+      "label": "op:addressOf:local:scalar",
+      "count": 7
+    },
+    {
+      "label": "op:preDecrement:value",
+      "count": 7
+    },
+    {
+      "label": "op:addressOf:element:object",
+      "count": 6
+    },
+    {
+      "label": "op:preIncrement:value",
+      "count": 5
+    },
+    {
+      "label": "op:preIncrement:unsupported-target",
+      "count": 5
+    },
+    {
+      "label": "op:addressOf:local:opaque-type",
+      "count": 4
+    },
+    {
+      "label": "op:postIncrement:impure-receiver",
+      "count": 4
+    },
+    {
+      "label": "op:preDecrement:impure-receiver",
+      "count": 3
+    },
+    {
+      "label": "op:addressOf:local:unknown-type",
+      "count": 3
+    },
+    {
+      "label": "lit:unquoted",
+      "count": 2
+    },
+    {
+      "label": "op:cast:object",
+      "count": 2
+    },
+    {
+      "label": "op:preIncrement:impure-receiver",
+      "count": 2
+    },
+    {
+      "label": "op:preDecrement:pointer",
+      "count": 2
+    },
+    {
+      "label": "op:preIncrement:impure-target",
+      "count": 2
+    },
+    {
+      "label": "assign:aug-impure-receiver",
+      "count": 2
+    },
+    {
+      "label": "op:addressOf:local:pointer",
+      "count": 2
+    },
+    {
+      "label": "op:arrayInitializer:mixed-designators",
+      "count": 1
+    },
+    {
+      "label": "op:assignmentPlus",
+      "count": 1
+    },
+    {
+      "label": "op:postDecrement:unsupported-target",
+      "count": 1
+    },
+    {
+      "label": "op:postDecrement:impure-target",
+      "count": 1
+    },
+    {
+      "label": "op:addressOf:field:opaque-type",
+      "count": 1
+    },
+    {
+      "label": "op:preDecrement:impure-target",
+      "count": 1
+    },
+    {
+      "label": "expr:CONTROL_STRUCTURE:SWITCH",
+      "count": 1
+    },
+    {
+      "label": "op:addressOf:call:scalar",
+      "count": 1
+    }
+  ],
+  "holes": 14260,
+  "holeFree": 5222,
+  "functions": 8602,
+  "dynamicHoleRisk": 216730,
+  "dialect": "c-like"
+}
