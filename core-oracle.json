@@ -1,7 +1,7 @@
 {
  "module": "Cachetools",
- "ast": "/Users/mbhatt/autoform/.claude/worktrees/wf_1d09ec09-18b-11/ast-Cachetools.json",
- "source_root": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/cachetools/src",
+ "ast": "/Users/anon/autoform/.claude/worktrees/wf_1d09ec09-18b-11/ast-Cachetools.json",
+ "source_root": "/private/tmp/claude-501/-Users-anon-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/cachetools/src",
  "fuel": 5000,
  "synthetic_inputs_per_function": 24,
  "claim": {

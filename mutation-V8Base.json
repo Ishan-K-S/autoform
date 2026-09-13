@@ -1,10 +1,10 @@
 {
-  "file": "/Users/mbhatt/autoform/.claude/worktrees/wf_1d09ec09-18b-9/Autoform/Generated/V8Base.lean",
+  "file": "/Users/anon/autoform/.claude/worktrees/wf_1d09ec09-18b-9/Autoform/Generated/V8Base.lean",
   "module": "Autoform.Generated.V8Base",
   "seed": 20260819,
   "status": "OK",
   "operators": "generated-ast",
-  "spec_file": "/Users/mbhatt/autoform/.claude/worktrees/wf_1d09ec09-18b-9/Autoform/Specs/V8Spec.lean",
+  "spec_file": "/Users/anon/autoform/.claude/worktrees/wf_1d09ec09-18b-9/Autoform/Specs/V8Spec.lean",
   "spec_module": "Autoform.Specs.V8Spec",
   "decls": [
     "f_v8_base_bits_SignedMod32_int32_t_int32_t_int32_t_"

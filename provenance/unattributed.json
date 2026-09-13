@@ -25,14 +25,14 @@
  "artifacts": {
   "ast-CMath.json": {
    "artifact_sha256": "3873b3f92341849324a5ae3f4e61337f59edbd14522773a620f89842919d7e1d",
-   "source_hint": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/ctest",
+   "source_hint": "/private/tmp/claude-501/-Users-anon-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/ctest",
    "reason": "scripts/reproduce_ast.py, Joern 4.0.606, committed export_ast.sc: DIFFERS. Same 6 functions, but every integer literal is \"v\": 0 here and \"v\": \"0\" in a fresh export -- the literal representation changed and this artifact predates it. 23 diff lines.",
    "reproduction_attempted": true,
    "reproduced": false
   },
   "ast-Cachetools.json": {
    "artifact_sha256": "368bf5615c24ea1fecdff4bafe94694340f1ce06a396f0afd32fbb89625f28fd",
-   "source_hint": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/cachetools",
+   "source_hint": "/private/tmp/claude-501/-Users-anon-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/cachetools",
    "reason": "Not reproduced: the source tree it was exported from is not identified anywhere in the repository, and the .cpg was not kept. Attribution requires re-exporting from a known tree with scripts/provenance.py record.",
    "reproduction_attempted": false,
    "reproduced": false
@@ -88,14 +88,14 @@
   },
   "ast-Sample.json": {
    "artifact_sha256": "06f5f57332569103002a35b05d60949c9606ecf1aca1aaef28a3a234082b95f7",
-   "source_hint": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/sample",
+   "source_hint": "/private/tmp/claude-501/-Users-anon-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/sample",
    "reason": "scripts/reproduce_ast.py, Joern 4.0.606, committed export_ast.sc: DIFFERS. Fresh export has 7 entries to the committed 5 -- the two module-initializer entries (`lib.py:<module>`, `<module-objects>:<module>`) postdate this artifact. 387 diff lines.",
    "reproduction_attempted": true,
    "reproduced": false
   },
   "ast-Stress.json": {
    "artifact_sha256": "ab50e9b0e8537b8b26ce1b0dc6e5635ade809addc03145296b61a7cf765409f6",
-   "source_hint": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/stress",
+   "source_hint": "/private/tmp/claude-501/-Users-anon-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/stress",
    "reason": "scripts/reproduce_ast.py, Joern 4.0.606, committed export_ast.sc: DIFFERS. Fresh export has 8 entries to the committed 6; the extra two are the module initializers `ops.py:<module>` and `<module-objects>:<module>`.",
    "reproduction_attempted": true,
    "reproduced": false
@@ -109,7 +109,7 @@
   },
   "ast-V8Numbers.json": {
    "artifact_sha256": "9742832f6f8eeff1b64102635129f4fe70926d0b724c0cc54fc6ae865a38564e",
-   "source_hint": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/v8/src/numbers (a git checkout; revision not recorded at export time)",
+   "source_hint": "/private/tmp/claude-501/-Users-anon-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/v8/src/numbers (a git checkout; revision not recorded at export time)",
    "reason": "Not reproduced: the source tree it was exported from is not identified anywhere in the repository, and the .cpg was not kept. Attribution requires re-exporting from a known tree with scripts/provenance.py record.",
    "reproduction_attempted": false,
    "reproduced": false

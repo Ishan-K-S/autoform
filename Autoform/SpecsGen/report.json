@@ -1,6 +1,6 @@
 {
  "module": "Cachetools",
- "corpus": "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/cachetools",
+ "corpus": "/private/tmp/claude-501/-Users-anon-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/cachetools",
  "functions": 208,
  "call_closed": 69,
  "artifacts": {
@@ -16,7 +16,7 @@
   "calls": 766,
   "in_core": 372,
   "tests": [
-   "/private/tmp/claude-501/-Users-mbhatt-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/cachetools/tests"
+   "/private/tmp/claude-501/-Users-anon-autoform/fe14c605-b751-436f-9e19-b975f87f18e5/scratchpad/cachetools/tests"
   ],
   "skipped": {
    "skip_varargs": 0,

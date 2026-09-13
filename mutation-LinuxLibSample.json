@@ -1,9 +1,9 @@
 {
-  "file": "/Users/mbhatt/autoform/.claude/worktrees/wf_1d09ec09-18b-8/Autoform/Generated/LinuxLib.lean",
+  "file": "/Users/anon/autoform/.claude/worktrees/wf_1d09ec09-18b-8/Autoform/Generated/LinuxLib.lean",
   "module": "Autoform.Generated.LinuxLib",
   "seed": 20260819,
   "operators": "generated-ast",
-  "spec_file": "/Users/mbhatt/autoform/.claude/worktrees/wf_1d09ec09-18b-8/Autoform/SpecsGen/LinuxLibSample.lean",
+  "spec_file": "/Users/anon/autoform/.claude/worktrees/wf_1d09ec09-18b-8/Autoform/SpecsGen/LinuxLibSample.lean",
   "spec_module": "Autoform.SpecsGen.LinuxLibSample",
   "decls": [
     "f_alloc_mod_tags_mem",

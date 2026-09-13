@@ -1,9 +1,9 @@
 {
-  "file": "/Users/mbhatt/autoform/Autoform/Generated/Cachetools.lean",
+  "file": "/Users/anon/autoform/Autoform/Generated/Cachetools.lean",
   "module": "Autoform.Generated.Cachetools",
   "seed": 20260819,
   "operators": "generated-ast",
-  "spec_file": "/Users/mbhatt/autoform/Autoform/Specs/CachetoolsSpec.lean",
+  "spec_file": "/Users/anon/autoform/Autoform/Specs/CachetoolsSpec.lean",
   "spec_module": "Autoform.Specs.CachetoolsSpec",
   "decls": [
     "f_cachetools___init___py__module__Cache___contains__",
